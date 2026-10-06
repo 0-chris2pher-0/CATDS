@@ -161,7 +161,7 @@ if st.session_state.claims_df is not None:
             new_start = changed_event["start"]
             new_end = changed_event["end"]
             
-            c_mask = st.session_state.claims_df["claim_id"] == cid
+            c_mask = st.session_state.claims_df["claim_id"].astype(str) == cid
             st.session_state.claims_df.loc[c_mask, "start_time"] = new_start
             st.session_state.claims_df.loc[c_mask, "end_time"] = new_end
             st.session_state.claims_df.loc[c_mask, "scheduled_date"] = new_start.split("T")[0]
@@ -238,56 +238,68 @@ if st.session_state.claims_df is not None:
     with col_right:
         st.subheader("🎯 Select Claim to Manage")
         claim_options = df["display_label"].tolist()
-        
-        default_index = 0
-        if "selected_claim_id" in st.session_state:
-            matching = [i for i, label in enumerate(claim_options) if label.startswith(str(st.session_state["selected_claim_id"]))]
-            if matching: default_index = matching[0]
 
-        selected_label = st.selectbox("Select Claim to Manage", claim_options, index=default_index)
+        # Initialize or update selectbox selection state
+        if "managed_claim_select" not in st.session_state or st.session_state["managed_claim_select"] not in claim_options:
+            st.session_state["managed_claim_select"] = claim_options[0]
+
+        # Handle button triggers from Recommendations
+        if "selected_claim_id" in st.session_state and st.session_state["selected_claim_id"]:
+            matching = [opt for opt in claim_options if opt.startswith(str(st.session_state["selected_claim_id"]) + " -")]
+            if matching:
+                st.session_state["managed_claim_select"] = matching[0]
+            del st.session_state["selected_claim_id"]
+
+        selected_label = st.selectbox(
+            "Select Claim to Manage",
+            claim_options,
+            key="managed_claim_select"
+        )
 
         if selected_label:
-            selected_claim_id = selected_label.split(" - ")[0]
-            claim_mask = st.session_state.claims_df["claim_id"] == selected_claim_id
-            current_claim = st.session_state.claims_df[claim_mask].iloc[0]
+            selected_claim_id = selected_label.split(" - ")[0].strip()
+            claim_mask = st.session_state.claims_df["claim_id"].astype(str) == selected_claim_id
             
-            st.write(f"**Claim Number:** `{current_claim['claim_id']}`")
-            st.write(f"**Insured Name:** {current_claim['insured_name']}")
-            st.write(f"**Address:** {current_claim['full_address']}")
-            st.write(f"**Current Status:** `{current_claim['status']}`")
-            
-            st.markdown("---")
-
-            if current_claim["status"] == "Scheduled":
-                if current_claim["scheduled_date"]:
-                    selected_target_date_str = str(current_claim["scheduled_date"])
-
-                if st.button("Remove from Schedule", type="primary"):
-                    st.session_state.claims_df.loc[claim_mask, "status"] = "Unscheduled"
-                    st.session_state.claims_df.loc[claim_mask, "start_time"] = None
-                    st.session_state.claims_df.loc[claim_mask, "end_time"] = None
-                    st.session_state.claims_df.loc[claim_mask, "scheduled_date"] = ""
-                    st.session_state.claims_df.loc[claim_mask, "inspection_time"] = ""
-                    st.rerun()
-
-            elif current_claim["status"] in ["Unscheduled", "Ignored"]:
-                unbooked_slots = [s for s in all_slots if not is_slot_conflicting(s, st.session_state.claims_df, current_claim_id=selected_claim_id)]
+            if claim_mask.any():
+                current_claim = st.session_state.claims_df[claim_mask].iloc[0]
                 
-                if unbooked_slots:
-                    slot_labels = [s["slot_label"] for s in unbooked_slots]
-                    selected_slot_label = st.selectbox("Choose Open Slot", slot_labels, index=0)
-                    chosen_slot = next(s for s in unbooked_slots if s["slot_label"] == selected_slot_label)
-                    selected_target_date_str = chosen_slot["date_str"]
-                    
-                    if st.button("Confirm & Lock Slot", type="primary"):
-                        st.session_state.claims_df.loc[claim_mask, "status"] = "Scheduled"
-                        st.session_state.claims_df.loc[claim_mask, "start_time"] = chosen_slot["start"]
-                        st.session_state.claims_df.loc[claim_mask, "end_time"] = chosen_slot["end"]
-                        st.session_state.claims_df.loc[claim_mask, "scheduled_date"] = chosen_slot["date_str"]
-                        
-                        start_dt = datetime.fromisoformat(chosen_slot["start"])
-                        st.session_state.claims_df.loc[claim_mask, "inspection_time"] = start_dt.strftime("%H:%M")
+                st.write(f"**Claim Number:** `{current_claim['claim_id']}`")
+                st.write(f"**Insured Name:** {current_claim['insured_name']}")
+                st.write(f"**Address:** {current_claim['full_address']}")
+                st.write(f"**Current Status:** `{current_claim['status']}`")
+                
+                st.markdown("---")
+
+                if current_claim["status"] == "Scheduled":
+                    if current_claim["scheduled_date"]:
+                        selected_target_date_str = str(current_claim["scheduled_date"])
+
+                    if st.button("Remove from Schedule", type="primary"):
+                        st.session_state.claims_df.loc[claim_mask, "status"] = "Unscheduled"
+                        st.session_state.claims_df.loc[claim_mask, "start_time"] = None
+                        st.session_state.claims_df.loc[claim_mask, "end_time"] = None
+                        st.session_state.claims_df.loc[claim_mask, "scheduled_date"] = ""
+                        st.session_state.claims_df.loc[claim_mask, "inspection_time"] = ""
                         st.rerun()
+
+                elif current_claim["status"] in ["Unscheduled", "Ignored"]:
+                    unbooked_slots = [s for s in all_slots if not is_slot_conflicting(s, st.session_state.claims_df, current_claim_id=selected_claim_id)]
+                    
+                    if unbooked_slots:
+                        slot_labels = [s["slot_label"] for s in unbooked_slots]
+                        selected_slot_label = st.selectbox("Choose Open Slot", slot_labels, index=0)
+                        chosen_slot = next(s for s in unbooked_slots if s["slot_label"] == selected_slot_label)
+                        selected_target_date_str = chosen_slot["date_str"]
+                        
+                        if st.button("Confirm & Lock Slot", type="primary"):
+                            st.session_state.claims_df.loc[claim_mask, "status"] = "Scheduled"
+                            st.session_state.claims_df.loc[claim_mask, "start_time"] = chosen_slot["start"]
+                            st.session_state.claims_df.loc[claim_mask, "end_time"] = chosen_slot["end"]
+                            st.session_state.claims_df.loc[claim_mask, "scheduled_date"] = chosen_slot["date_str"]
+                            
+                            start_dt = datetime.fromisoformat(chosen_slot["start"])
+                            st.session_state.claims_df.loc[claim_mask, "inspection_time"] = start_dt.strftime("%H:%M")
+                            st.rerun()
 
     # --- RECOMMENDATIONS ---
     st.markdown("---")
