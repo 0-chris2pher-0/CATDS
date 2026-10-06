@@ -361,20 +361,213 @@ def census_batch_geocode(parsed_addresses: List[Tuple[int, str, str, str, str]])
     return results
 
 
-@st.cache_data(show_spinner=False)
-def _census_oneline(address: str) -> Optional[Tuple[float, float, str]]:
-    """Census single-line lookup. Network errors raise (so they aren't cached)."""
+# --- Free Census reference files: ZIP and city center points ---
+# Downloaded once per app start from the Census "Gazetteer" files (about 1 MB each)
+# and kept in memory, so ZIP/city fallbacks are instant instead of online lookups.
+
+_GAZETTEER_YEARS = [2025, 2024, 2023, 2022, 2021, 2020]
+
+
+def _normalize_place_name(name: Any) -> str:
+    s = str(name or "").lower()
+    s = re.sub(r"[.\'’]", "", s)
+    s = re.sub(r"\bsaint\b", "st", s)
+    s = re.sub(r"\bfort\b", "ft", s)
+    s = re.sub(r"\bmount\b", "mt", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+_PLACE_SUFFIX = re.compile(
+    r"\s+(?:city and borough|consolidated government.*|metropolitan government.*|unified government.*|"
+    r"urban county|city|town|village|cdp|borough|municipality|comunidad|zona urbana)(?:\s*\(balance\))?$",
+    re.IGNORECASE
+)
+
+
+@st.cache_resource(show_spinner=False)
+def _load_gazetteer(kind: str) -> Dict[Any, Tuple[float, float]]:
+    """kind = 'zcta' (ZIP codes) or 'place' (cities/towns). Raises if unavailable (not cached)."""
+    import zipfile
+    for year in _GAZETTEER_YEARS:
+        url = (f"https://www2.census.gov/geo/docs/maps-data/data/gazetteer/"
+               f"{year}_Gazetteer/{year}_Gaz_{kind}_national.zip")
+        try:
+            resp = requests.get(url, timeout=45)
+            if resp.status_code != 200:
+                continue
+            with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+                txt_name = next(n for n in zf.namelist() if n.lower().endswith(".txt"))
+                with zf.open(txt_name) as fh:
+                    gdf = pd.read_csv(fh, sep="\t", dtype=str, encoding="latin-1")
+            gdf.columns = [c.strip() for c in gdf.columns]
+            out = {}
+            for _, r in gdf.iterrows():
+                try:
+                    lat, lon = float(r["INTPTLAT"]), float(str(r["INTPTLONG"]).strip())
+                except (ValueError, KeyError):
+                    continue
+                if kind == "zcta":
+                    out[str(r["GEOID"]).strip().zfill(5)] = (lat, lon)
+                else:
+                    key = (str(r["USPS"]).strip().upper(),
+                           _normalize_place_name(_PLACE_SUFFIX.sub("", str(r["NAME"]).strip())))
+                    out.setdefault(key, (lat, lon))
+            if out:
+                return out
+        except Exception:
+            continue
+    raise LookupError(f"Census {kind} reference file unavailable")
+
+
+def _gazetteer(kind: str) -> Dict[Any, Tuple[float, float]]:
+    try:
+        return _load_gazetteer(kind)
+    except Exception:
+        return {}
+
+
+# --- Census single-address lookups (safe to run in parallel) ---
+
+_ONELINE_CACHE: Dict[str, Optional[Tuple[float, float, str]]] = {}
+
+# Rural road names the Census often stores spelled out
+_ROAD_EXPANSIONS = [
+    (r"\bFM\b", "Farm to Market Road"),
+    (r"\bRM\b", "Ranch to Market Road"),
+    (r"\bRR\b", "Ranch Road"),
+    (r"\bCR\b", "County Road"),
+    (r"\bSH\b", "State Highway"),
+    (r"\bHWY\b", "Highway"),
+]
+
+
+def _street_variants(street: str) -> List[str]:
+    variants = [street]
+    expanded = street
+    for pattern, replacement in _ROAD_EXPANSIONS:
+        expanded = re.sub(pattern, replacement, expanded, flags=re.IGNORECASE)
+    if expanded != street:
+        variants.append(expanded)
+    return variants
+
+
+def _census_oneline_raw(address: str) -> Optional[Tuple[float, float, str]]:
+    """No Streamlit calls in here, so it can run in worker threads."""
+    if address in _ONELINE_CACHE:
+        return _ONELINE_CACHE[address]
     resp = requests.get(
         "https://geocoding.geo.census.gov/geocoder/locations/onelineaddress",
         params={"address": address, "benchmark": "Public_AR_Current", "format": "json"},
-        timeout=10
+        timeout=12
     )
     resp.raise_for_status()
     matches = resp.json().get("result", {}).get("addressMatches", [])
-    if not matches:
+    result = None
+    if matches:
+        c = matches[0]["coordinates"]
+        result = (float(c["y"]), float(c["x"]), GEO_CENSUS_APPROX if len(matches) > 1 else GEO_EXACT)
+    _ONELINE_CACHE[address] = result
+    return result
+
+
+def _census_retry(address: str, state: str) -> Optional[Tuple[float, float, str]]:
+    """Census single-line lookup, also trying spelled-out rural road names."""
+    street, city, st_abbr, zip_code = parse_us_address(address, fallback_state=state)
+    if not street:
         return None
-    c = matches[0]["coordinates"]
-    return float(c["y"]), float(c["x"]), GEO_CENSUS_APPROX if len(matches) > 1 else GEO_EXACT
+    tail = ", ".join(p for p in [city, f"{st_abbr} {zip_code}".strip()] if p)
+    for variant in _street_variants(street):
+        query = f"{variant}, {tail}" if tail else variant
+        try:
+            hit = _census_oneline_raw(query)
+        except Exception:
+            hit = None
+        if hit:
+            return hit
+    return None
+
+
+def _centroid_fallback(address: str, state: str) -> Tuple[Optional[float], Optional[float], str]:
+    """Instant ZIP-area, then city-area location from the Census reference files."""
+    _, city, st_abbr, zip_code = parse_us_address(address, fallback_state=state)
+    if zip_code:
+        hit = _gazetteer("zcta").get(zip_code)
+        if hit:
+            return hit[0], hit[1], GEO_ZIP
+    if city and st_abbr:
+        hit = _gazetteer("place").get((st_abbr, _normalize_place_name(city)))
+        if hit:
+            return hit[0], hit[1], GEO_CITY
+    return None, None, GEO_NOT_FOUND
+
+
+def batch_geocode_addresses(address_state_list: List[Tuple[str, Optional[str]]]) -> List[Tuple[Optional[float], Optional[float], str]]:
+    """
+    Fast geocoding for imports:
+      1. Census batch (one request for everything)
+      2. Census single-line retries for misses, run in parallel (incl. rural road spellings)
+      3. Instant ZIP-area / city-area location from Census reference files (flagged for review)
+    OpenStreetMap is NOT used here; it's slow (1 request/second), so it runs only when
+    the rep asks for it (see improve_with_openstreetmap).
+    Returns (lat, lon, quality) per item; lat/lon are None when nothing was found.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    total = len(address_state_list)
+    if total == 0:
+        return []
+
+    progress_bar = st.progress(0.05, text="Looking up addresses with the US Census...")
+
+    items = []
+    for item in address_state_list:
+        addr, st_val = item if isinstance(item, tuple) else (item, "")
+        items.append((str(addr) if addr is not None else "", st_val or ""))
+
+    parsed = [(idx, *parse_us_address(addr, fallback_state=st_val)) for idx, (addr, st_val) in enumerate(items)]
+    results: Dict[int, Tuple[Optional[float], Optional[float], str]] = dict(census_batch_geocode(parsed))
+
+    misses = [i for i in range(total) if i not in results]
+    if misses:
+        progress_bar.progress(0.55, text=f"Retrying {len(misses)} addresses the Census batch couldn't match...")
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            retry_hits = list(pool.map(lambda i: _census_retry(*items[i]), misses))
+        for i, hit in zip(misses, retry_hits):
+            if hit:
+                results[i] = hit
+
+    still_missing = [i for i in range(total) if i not in results]
+    if still_missing:
+        progress_bar.progress(0.85, text=f"Placing {len(still_missing)} addresses by ZIP code or city...")
+        for i in still_missing:
+            results[i] = _centroid_fallback(*items[i])
+
+    progress_bar.empty()
+    return [results[i] for i in range(total)]
+
+
+def improve_with_openstreetmap(address_state_list: List[Tuple[str, Optional[str]]]) -> List[Optional[Tuple[float, float, str]]]:
+    """
+    Optional slower pass for pins that are approximate or missing. Tries OpenStreetMap
+    (structured fields, then the full address). About 1-2 seconds per address because of
+    OpenStreetMap's 1-request-per-second limit. Returns a better (lat, lon, quality) or None.
+    """
+    out = []
+    total = len(address_state_list)
+    progress_bar = st.progress(0.0, text="Checking OpenStreetMap...")
+    for n, (addr, st_val) in enumerate(address_state_list, start=1):
+        progress_bar.progress(n / max(total, 1), text=f"Checking OpenStreetMap: {n} of {total}")
+        street, city, st_abbr, zip_code = parse_us_address(addr, fallback_state=st_val or "")
+        hit = None
+        if street and (city or zip_code):
+            fields = [("street", street), ("city", city), ("state", st_abbr), ("postalcode", zip_code)]
+            hit = _try(_nominatim, tuple((k, v) for k, v in fields if v))
+        if not hit and street:
+            oneline = ", ".join(p for p in [street, city, f"{st_abbr} {zip_code}".strip()] if p)
+            hit = _try(_nominatim, (("q", oneline),))
+        out.append((hit[0], hit[1], GEO_OSM) if hit else None)
+    progress_bar.empty()
+    return out
 
 
 @st.cache_data(show_spinner=False)
@@ -397,81 +590,6 @@ def _try(fn, *args):
         return fn(*args)
     except Exception:
         return None
-
-
-def geocode_single_address(address: str, state: str = "") -> Tuple[Optional[float], Optional[float], str]:
-    """
-    Runs the fallback chain for one address that the Census batch missed.
-    Returns (lat, lon, quality); lat/lon are None if nothing was found.
-    """
-    street, city, st_abbr, zip_code = parse_us_address(address, fallback_state=state)
-    oneline = ", ".join(p for p in [street, city, f"{st_abbr} {zip_code}".strip()] if p)
-
-    if oneline:
-        hit = _try(_census_oneline, oneline)
-        if hit:
-            return hit
-
-    if street and (city or zip_code):
-        fields = [("street", street), ("city", city), ("state", st_abbr), ("postalcode", zip_code)]
-        hit = _try(_nominatim, tuple((k, v) for k, v in fields if v))
-        if hit:
-            return hit[0], hit[1], GEO_OSM
-
-    if oneline:
-        hit = _try(_nominatim, (("q", oneline),))
-        if hit:
-            return hit[0], hit[1], GEO_OSM
-
-    if zip_code:
-        hit = _try(_nominatim, (("postalcode", zip_code),))
-        if hit:
-            return hit[0], hit[1], GEO_ZIP
-
-    if city:
-        fields = [("city", city), ("state", st_abbr)]
-        hit = _try(_nominatim, tuple((k, v) for k, v in fields if v))
-        if hit:
-            return hit[0], hit[1], GEO_CITY
-
-    return None, None, GEO_NOT_FOUND
-
-
-def batch_geocode_addresses(address_state_list: List[Tuple[str, Optional[str]]]) -> List[Tuple[Optional[float], Optional[float], str]]:
-    """
-    Geocodes a list of (address, state) pairs. Returns (lat, lon, quality) per item;
-    lat/lon are None when an address couldn't be found (no random placeholder pins).
-    """
-    total = len(address_state_list)
-    if total == 0:
-        return []
-
-    progress_bar = st.progress(0.0, text="Looking up addresses with the US Census...")
-
-    items = []
-    for item in address_state_list:
-        addr, st_val = item if isinstance(item, tuple) else (item, "")
-        items.append((addr, st_val or ""))
-
-    parsed = [(idx, *parse_us_address(addr, fallback_state=st_val)) for idx, (addr, st_val) in enumerate(items)]
-    census_results = census_batch_geocode(parsed)
-
-    misses = [i for i in range(total) if i not in census_results]
-    final = []
-    done_misses = 0
-    for idx, (addr, st_val) in enumerate(items):
-        if idx in census_results:
-            final.append(census_results[idx])
-        else:
-            done_misses += 1
-            progress_bar.progress(
-                min(0.3 + 0.7 * done_misses / max(len(misses), 1), 1.0),
-                text=f"Retrying {done_misses} of {len(misses)} addresses the Census couldn't match..."
-            )
-            final.append(geocode_single_address(addr, st_val))
-
-    progress_bar.empty()
-    return final
 
 
 def parse_coordinates(text: Any) -> Optional[Tuple[float, float]]:
