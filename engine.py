@@ -18,16 +18,12 @@ def parse_us_address(address_str: str, fallback_state: str = "") -> Tuple[str, s
     if not clean_addr or clean_addr.lower() == "nan":
         return "", "", fallback_state, ""
 
-    # Check for standard 'Street, City, ST Zip' or 'Street, City, ST'
     parts = [p.strip() for p in clean_addr.split(",") if p.strip()]
-    
     street, city, state, zip_code = "", "", fallback_state, ""
 
     if len(parts) >= 3:
         street = parts[0]
         city = parts[1]
-        
-        # Last part usually contains State and Zip (e.g. 'TX 78201' or 'TX')
         state_zip_part = parts[2].split()
         if len(state_zip_part) >= 1:
             state = state_zip_part[0]
@@ -54,10 +50,8 @@ def census_batch_geocode(parsed_addresses: List[Tuple[int, str, str, str, str]])
     if not parsed_addresses:
         return {}
 
-    # Format required by Census Batch CSV: UniqueID, Street, City, State, Zip
     csv_buffer = io.StringIO()
     for row_id, street, city, state, zip_code in parsed_addresses:
-        # Escape double quotes
         s_clean = street.replace('"', '')
         c_clean = city.replace('"', '')
         st_clean = state.replace('"', '')
@@ -85,10 +79,10 @@ def census_batch_geocode(parsed_addresses: List[Tuple[int, str, str, str, str]])
                 parts = [p.strip('"') for p in line.split('","')]
                 if len(parts) >= 6:
                     row_id_str = parts[0].strip('"')
-                    match_status = parts[2].strip('"')  # Match or No_Match
+                    match_status = parts[2].strip('"')
                     
                     if match_status == "Match" and len(parts) >= 6:
-                        coords_str = parts[5].strip('"')  # "lon,lat"
+                        coords_str = parts[5].strip('"')
                         if "," in coords_str:
                             lon_str, lat_str = coords_str.split(",")
                             try:
@@ -131,7 +125,6 @@ def geocode_single_address_fallback(address: str, state: str = None) -> Tuple[fl
     except Exception:
         pass
 
-    # Jitter near San Antonio center if all lookups fail
     return 29.4241 + np.random.uniform(-0.02, 0.02), -98.4936 + np.random.uniform(-0.02, 0.02)
 
 
@@ -145,7 +138,6 @@ def batch_geocode_addresses(address_state_list: List[Tuple[str, Optional[str]]])
 
     progress_bar = st.progress(0, text="Standardizing & geocoding addresses via US Census API...")
 
-    # Step 1: Parse addresses
     parsed_items = []
     for idx, item in enumerate(address_state_list):
         if isinstance(item, tuple):
@@ -156,11 +148,9 @@ def batch_geocode_addresses(address_state_list: List[Tuple[str, Optional[str]]])
         street, city, state, zip_code = parse_us_address(addr, fallback_state=st_val or "")
         parsed_items.append((idx, street, city, state, zip_code))
 
-    # Step 2: Batch geocode via US Census Bureau
     census_results = census_batch_geocode(parsed_items)
     progress_bar.progress(0.7, text="Processing Census matches & executing fallbacks...")
 
-    # Step 3: Assign results, using Nominatim fallback for missed matches
     final_coords = []
     for idx, item in enumerate(address_state_list):
         if idx in census_results:
@@ -170,7 +160,7 @@ def batch_geocode_addresses(address_state_list: List[Tuple[str, Optional[str]]])
             st_val = item[1] if isinstance(item, tuple) else None
             coords = geocode_single_address_fallback(addr, state=st_val)
             final_coords.append(coords)
-            time.sleep(1.0)  # Rate limit fallback requests
+            time.sleep(1.0)
 
     progress_bar.empty()
     return final_coords
@@ -196,8 +186,7 @@ def get_osrm_route(start_lat: float, start_lon: float, end_lat: float, end_lon: 
     except Exception:
         pass
 
-    # Fallback: Haversine distance estimate
-    R = 3958.8  # Earth radius in miles
+    R = 3958.8
     dlat = np.radians(end_lat - start_lat)
     dlon = np.radians(end_lon - start_lon)
     a = np.sin(dlat / 2)**2 + np.cos(np.radians(start_lat)) * np.cos(np.radians(end_lat)) * np.sin(dlon / 2)**2
@@ -211,7 +200,7 @@ def get_osrm_route(start_lat: float, start_lon: float, end_lat: float, end_lon: 
 
 def process_imported_table(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Processes imported CSV/Excel dataframe by detecting formatted claim IDs (e.g. ABC1234-001),
+    Processes imported CSV/Excel dataframe by detecting formatted claim IDs,
     insured names, and full addresses.
     """
     col_map = {str(c).strip().lower(): c for c in df.columns}
@@ -223,8 +212,8 @@ def process_imported_table(df: pd.DataFrame) -> pd.DataFrame:
     state_col = None
     zip_col = None
     full_addr_col = None
+    priority_col = None
 
-    # Step 1: Detect Claim ID Column by pattern inspection (ABC1234-001 / XXX1111-001 pattern)
     claim_pattern = re.compile(r'^[A-Za-z]{2,5}\d+[\-\_]?\d*$', re.IGNORECASE)
     
     for c in df.columns:
@@ -233,20 +222,17 @@ def process_imported_table(df: pd.DataFrame) -> pd.DataFrame:
             claim_col = c
             break
 
-    # Fallback to column header matching
     if not claim_col:
         for low_c, orig_c in col_map.items():
             if any(k in low_c for k in ["claim", "file", "policy"]):
                 claim_col = orig_c
                 break
 
-    # Step 2: Check for explicit single Full Address column
     for low_c, orig_c in col_map.items():
         if any(k == low_c for k in ["full address", "full_address", "loss address", "property address", "location address", "site address", "address"]):
             full_addr_col = orig_c
             break
 
-    # Step 3: Flexible matching for remaining metadata
     for low_c, orig_c in col_map.items():
         if not insured_col and any(k in low_c for k in ["insured", "customer", "policyholder", "client", "name"]):
             insured_col = orig_c
@@ -259,6 +245,8 @@ def process_imported_table(df: pd.DataFrame) -> pd.DataFrame:
             state_col = orig_c
         elif not zip_col and any(k in low_c for k in ["zip", "postal", "zipcode", "zip_code"]):
             zip_col = orig_c
+        elif not priority_col and any(k in low_c for k in ["priority", "rank", "prio"]):
+            priority_col = orig_c
 
     address_list = []
     metadata = []
@@ -273,7 +261,14 @@ def process_imported_table(df: pd.DataFrame) -> pd.DataFrame:
         insured = str(row[insured_col]).strip() if insured_col and pd.notna(row[insured_col]) else f"Policyholder {idx + 1}"
         state_val = str(row[state_col]).strip() if state_col and pd.notna(row[state_col]) else ""
 
-        # Assemble address
+        # Priority parsing (default to 3 if missing or invalid)
+        prio_val = 3
+        if priority_col and pd.notna(row[priority_col]):
+            try:
+                prio_val = int(float(row[priority_col]))
+            except ValueError:
+                prio_val = 3
+
         if full_addr_col and pd.notna(row[full_addr_col]) and str(row[full_addr_col]).strip() != "":
             full_address = str(row[full_addr_col]).strip()
         else:
@@ -300,7 +295,7 @@ def process_imported_table(df: pd.DataFrame) -> pd.DataFrame:
             "display_label": f"{claim_num} - {insured}",
             "full_address": full_address,
             "state": state_val,
-            "priority": 3,
+            "priority": prio_val,
             "status": "Unscheduled",
             "start_time": None,
             "end_time": None,
@@ -423,7 +418,11 @@ def get_recommendations_for_day(claims_df: pd.DataFrame, target_date_str: str) -
     unscheduled["drive_time_mins"] = mins_list
     unscheduled["anchor_type"] = anchor_type
 
-    unscheduled = unscheduled.sort_values(by=["drive_time_mins", "priority"], ascending=[True, True])
+    # Ensure priority is numeric (defaulting to 3 if invalid)
+    unscheduled["priority"] = pd.to_numeric(unscheduled["priority"], errors="coerce").fillna(3)
+
+    # Sort FIRST by Priority (1 is highest), SECOND by Drive Time (shortest first)
+    unscheduled = unscheduled.sort_values(by=["priority", "drive_time_mins"], ascending=[True, True])
     return unscheduled
 
 
