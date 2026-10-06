@@ -8,7 +8,7 @@ import streamlit as st
 from datetime import datetime, date, timedelta
 from typing import List, Dict, Any, Optional, Tuple
 
-# --- US CENSUS BATCH & STRUCTURED GEOCODING UTILITIES ---
+# --- OPTION 4: US CENSUS BATCH & STRUCTURED GEOCODING UTILITIES ---
 
 def parse_us_address(address_str: str, fallback_state: str = "") -> Tuple[str, str, str, str]:
     """
@@ -261,7 +261,7 @@ def process_imported_table(df: pd.DataFrame) -> pd.DataFrame:
         insured = str(row[insured_col]).strip() if insured_col and pd.notna(row[insured_col]) else f"Policyholder {idx + 1}"
         state_val = str(row[state_col]).strip() if state_col and pd.notna(row[state_col]) else ""
 
-        # Leave priority blank (None) on ingestion if missing/invalid
+        # Priority parsing: default to None (blank) if missing or invalid
         prio_val = None
         if priority_col and pd.notna(row[priority_col]):
             val_str = str(row[priority_col]).strip()
@@ -396,6 +396,7 @@ def get_recommendations_for_day(
 ) -> Optional[pd.DataFrame]:
     """
     Returns prioritized recommendations filtered by status ('Unscheduled' or 'Scheduled').
+    1 is treated as the highest priority, followed by 2, 3, etc., and blanks at the end.
     """
     if claims_df is None or claims_df.empty:
         return None
