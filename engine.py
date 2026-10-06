@@ -201,7 +201,7 @@ def get_osrm_route(start_lat: float, start_lon: float, end_lat: float, end_lon: 
 def process_imported_table(df: pd.DataFrame) -> pd.DataFrame:
     """
     Processes imported CSV/Excel dataframe by detecting formatted claim IDs,
-    insured names, and full addresses.
+    insured names, full addresses, and priority ranks (leaving blank if unspecified).
     """
     col_map = {str(c).strip().lower(): c for c in df.columns}
     
@@ -261,13 +261,15 @@ def process_imported_table(df: pd.DataFrame) -> pd.DataFrame:
         insured = str(row[insured_col]).strip() if insured_col and pd.notna(row[insured_col]) else f"Policyholder {idx + 1}"
         state_val = str(row[state_col]).strip() if state_col and pd.notna(row[state_col]) else ""
 
-        # Priority parsing (default to 3 if missing or invalid)
-        prio_val = 3
+        # Priority parsing: default to None (blank) if not specified or invalid
+        prio_val = None
         if priority_col and pd.notna(row[priority_col]):
-            try:
-                prio_val = int(float(row[priority_col]))
-            except ValueError:
-                prio_val = 3
+            val_str = str(row[priority_col]).strip()
+            if val_str and val_str.lower() != "nan":
+                try:
+                    prio_val = int(float(val_str))
+                except ValueError:
+                    prio_val = None
 
         if full_addr_col and pd.notna(row[full_addr_col]) and str(row[full_addr_col]).strip() != "":
             full_address = str(row[full_addr_col]).strip()
@@ -418,11 +420,22 @@ def get_recommendations_for_day(claims_df: pd.DataFrame, target_date_str: str) -
     unscheduled["drive_time_mins"] = mins_list
     unscheduled["anchor_type"] = anchor_type
 
-    # Ensure priority is numeric (defaulting to 3 if invalid)
-    unscheduled["priority"] = pd.to_numeric(unscheduled["priority"], errors="coerce").fillna(3)
+    # Convert priority column to numeric, using float('inf') for blank/None values
+    # so ranked priorities (1, 2, 3...) always sort ahead of unranked claims
+    def clean_prio(val):
+        if pd.isna(val) or val is None or str(val).strip() in ["", "nan", "None"]:
+            return float("inf")
+        try:
+            return float(val)
+        except ValueError:
+            return float("inf")
 
-    # Sort FIRST by Priority (1 is highest), SECOND by Drive Time (shortest first)
-    unscheduled = unscheduled.sort_values(by=["priority", "drive_time_mins"], ascending=[True, True])
+    unscheduled["prio_sort_key"] = unscheduled["priority"].apply(clean_prio)
+
+    # Sort FIRST by priority rank (1 -> 2 -> ... -> inf), SECOND by drive time
+    unscheduled = unscheduled.sort_values(by=["prio_sort_key", "drive_time_mins"], ascending=[True, True])
+    unscheduled = unscheduled.drop(columns=["prio_sort_key"])
+
     return unscheduled
 
 
