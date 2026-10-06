@@ -1,5 +1,7 @@
 import html
 import math
+import calendar as pycal
+from collections import defaultdict
 import streamlit as st
 import pandas as pd
 import folium
@@ -13,7 +15,6 @@ from engine import (
     export_claims_to_ics,
     is_slot_conflicting,
     batch_geocode_addresses,
-    improve_with_openstreetmap,
     normalize_priority,
     geocode_hotel_address,
     detect_deployment_timezone,
@@ -23,6 +24,8 @@ from engine import (
     build_navigation_links,
     US_TIMEZONES,
     GEO_MANUAL,
+    GEO_CONFIRMED,
+    GEO_REP_VERIFIED,
     GEO_UNKNOWN,
     GEO_NEEDS_REVIEW,
 )
@@ -112,6 +115,19 @@ st.markdown(f"""
 }}
 .cat-stat-value {{ font-size: 1.7rem; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1.2; }}
 .cat-stat-label {{ font-size: 0.85rem; opacity: 0.72; }}
+
+/* Month slot picker: keep the 7-day grid side by side, even on phones */
+[class*="st-key-slotpicker"] [data-testid="stHorizontalBlock"] {{ flex-wrap: nowrap !important; gap: 0.25rem !important; }}
+[class*="st-key-slotpicker"] [data-testid="stColumn"], [class*="st-key-slotpicker"] [data-testid="column"] {{
+    min-width: 0 !important; width: auto !important; flex: 1 1 0 !important;
+}}
+[class*="st-key-slotpicker"] button {{ padding: 0.2rem 0 !important; min-height: 2.1rem; font-variant-numeric: tabular-nums; }}
+[class*="st-key-slotpicker"] .stCaption, [class*="st-key-slotpicker"] [data-testid="stCaptionContainer"] {{ text-align: center; }}
+[class*="st-key-pd_open"] [data-testid="stBaseButton-secondary"] {{ background: rgba(34, 160, 90, 0.16); border-color: rgba(34, 160, 90, 0.5); }}
+[class*="st-key-pd_few"] [data-testid="stBaseButton-secondary"] {{ background: rgba(232, 163, 23, 0.18); border-color: rgba(232, 163, 23, 0.55); }}
+[class*="st-key-pd_full"] button {{ background: repeating-linear-gradient(45deg, rgba(128, 140, 155, 0.16) 0 4px, transparent 4px 8px) !important; }}
+[class*="st-key-pd_off"] button {{ opacity: 0.35; }}
+[class*="st-key-pt_open"] [data-testid="stBaseButton-secondary"] {{ border-color: rgba(34, 160, 90, 0.55); }}
 
 /* Next-up and selected-block cards */
 .cat-card {{ border-left: 4px solid {AMBER}; padding: 0.1rem 0 0.1rem 0.85rem; margin-bottom: 0.6rem; }}
@@ -205,9 +221,165 @@ def save_manual_pin(claim_id, lat, lon):
     st.toast(f"Pin saved for {claim_id}")
 
 
+def confirm_pin(claim_id):
+    """Marks the current pin as correct without moving it."""
+    mask = st.session_state.claims_df["claim_id"].astype(str) == str(claim_id)
+    st.session_state.claims_df.loc[mask, "geo_quality"] = GEO_CONFIRMED
+    st.session_state.map_nonce += 1
+    st.session_state.editor_version += 1
+    st.toast(f"Location confirmed for {claim_id}")
+
+
+def queue_next_pin_to_fix(current_claim_id):
+    """After a fix, jump the 'Claim to fix' picker to the next claim that still needs checking."""
+    cdf = st.session_state.claims_df
+    flagged = [str(c) for c, q in zip(cdf["claim_id"], cdf["geo_quality"])
+               if q in GEO_NEEDS_REVIEW and str(c) != str(current_claim_id)]
+    if flagged:
+        ids = [str(c) for c in cdf["claim_id"]]
+        cur_pos = ids.index(str(current_claim_id)) if str(current_claim_id) in ids else -1
+        after = [c for c in flagged if ids.index(c) > cur_pos]
+        st.session_state["pending_fix_claim_id"] = (after or flagged)[0]
+    else:
+        st.session_state["pending_fix_claim_id"] = None
+        st.session_state["all_pins_checked"] = True
+
+
+def render_slot_picker(claim_id, slots, claims_df, now, current_start=None):
+    """
+    Shows the next open slot, with an optional month calendar to pick a different
+    day and time. Days are colored by availability (based on the schedule settings
+    and already-booked inspections). Returns the chosen slot, or None if nothing is open.
+    """
+    cid = str(claim_id)
+
+    # Other claims' booked times
+    others = []
+    for _, r in claims_df[(claims_df["status"] == "Scheduled") & (claims_df["claim_id"].astype(str) != cid)].iterrows():
+        s, e = parse_wallclock(r["start_time"]), parse_wallclock(r["end_time"])
+        if s and e:
+            others.append((s, e, f"{r['claim_id']} - {r['insured_name']}"))
+
+    info = []
+    for s in slots:
+        s_start, s_end = parse_wallclock(s["start"]), parse_wallclock(s["end"])
+        occupant = next((who for (o_s, o_e, who) in others if max(s_start, o_s) < min(s_end, o_e)), None)
+        if current_start and s["start"] == str(current_start):
+            status = "current"
+        elif s_start <= now:
+            status = "past"
+        elif occupant:
+            status = "booked"
+        else:
+            status = "open"
+        info.append({**s, "status": status, "occupant": occupant, "_start": s_start, "_end": s_end})
+
+    open_slots = [x for x in info if x["status"] == "open"]
+    if not open_slots:
+        st.info("No open slots in the current date range. Extend the end date or add inspections per day in the sidebar.")
+        return None
+
+    sel_key, day_key, month_key = f"pick_slot_{cid}", f"pick_day_{cid}", f"pick_month_{cid}"
+    open_starts = {x["start"] for x in open_slots}
+    if st.session_state.get(sel_key) not in open_starts:
+        st.session_state[sel_key] = open_slots[0]["start"]
+    chosen = next(x for x in open_slots if x["start"] == st.session_state[sel_key])
+
+    def time_range(x):
+        return f"{x['_start'].strftime('%I:%M %p').lstrip('0')} - {x['_end'].strftime('%I:%M %p').lstrip('0')}"
+
+    heading = "Next open slot" if chosen is open_slots[0] else "Selected slot"
+    st.markdown(f"**{heading}:** {chosen['_start'].strftime('%a %b %d')}, {time_range(chosen)}")
+
+    if not st.toggle("📅 Pick from calendar", key=f"pick_cal_{cid}"):
+        return chosen
+
+    by_day = defaultdict(list)
+    for x in info:
+        by_day[x["date_str"]].append(x)
+
+    if st.session_state.get(day_key) not in by_day:
+        st.session_state[day_key] = chosen["date_str"]
+    sel_day = st.session_state[day_key]
+
+    # Months covered by the inspection date range
+    all_days = sorted(by_day.keys())
+    first_d, last_d = date.fromisoformat(all_days[0]), date.fromisoformat(all_days[-1])
+    months = []
+    y, mo = first_d.year, first_d.month
+    while (y, mo) <= (last_d.year, last_d.month):
+        months.append((y, mo))
+        y, mo = (y + 1, 1) if mo == 12 else (y, mo + 1)
+    if st.session_state.get(month_key) not in months:
+        d0 = date.fromisoformat(sel_day)
+        st.session_state[month_key] = (d0.year, d0.month) if (d0.year, d0.month) in months else months[0]
+    y, mo = st.session_state[month_key]
+    m_idx = months.index((y, mo))
+
+    with st.container(key=f"slotpicker_{cid}"):
+        n1, n2, n3 = st.columns([1, 3, 1], vertical_alignment="center")
+        if n1.button("◀", key=f"pm_prev_{cid}", disabled=m_idx == 0, use_container_width=True):
+            st.session_state[month_key] = months[m_idx - 1]
+            st.rerun()
+        n2.markdown(f"<div style='text-align:center;font-weight:600'>{pycal.month_name[mo]} {y}</div>",
+                    unsafe_allow_html=True)
+        if n3.button("▶", key=f"pm_next_{cid}", disabled=m_idx == len(months) - 1, use_container_width=True):
+            st.session_state[month_key] = months[m_idx + 1]
+            st.rerun()
+
+        for col, wd in zip(st.columns(7), ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"]):
+            col.caption(wd)
+
+        for week in pycal.Calendar(firstweekday=6).monthdatescalendar(y, mo):
+            for col, d in zip(st.columns(7), week):
+                if d.month != mo:
+                    col.markdown("&nbsp;", unsafe_allow_html=True)
+                    continue
+                ds = d.isoformat()
+                items = by_day.get(ds, [])
+                n_open = sum(1 for x in items if x["status"] == "open")
+                n_booked = sum(1 for x in items if x["status"] in ("booked", "current"))
+                if not items:
+                    state, tip = "off", "No inspections this day"
+                elif n_open == 0:
+                    state = "full"
+                    tip = "Fully booked" if n_booked else "No open times left"
+                elif n_open == 1 and len(items) > 1:
+                    state, tip = "few", f"1 of {len(items)} open"
+                else:
+                    state, tip = "open", f"{n_open} of {len(items)} open"
+                if col.button(str(d.day), key=f"pd_{state}_{cid}_{ds}", help=tip,
+                              disabled=(n_open == 0), use_container_width=True,
+                              type="primary" if ds == sel_day else "secondary"):
+                    st.session_state[day_key] = ds
+                    st.session_state[sel_key] = next(x["start"] for x in items if x["status"] == "open")
+                    st.rerun()
+
+        st.caption("Green: open. Amber: one time left. Hatched: full. Faded: not an inspection day.")
+
+        # Times for the selected day
+        day_items = by_day.get(sel_day, [])
+        st.markdown(f"**{date.fromisoformat(sel_day).strftime('%A, %b %d')}**")
+        for i in range(0, len(day_items), 2):
+            for col, x in zip(st.columns(2), day_items[i:i + 2]):
+                label = time_range(x)
+                if x["status"] == "open":
+                    if col.button(label, key=f"pt_open_{cid}_{x['start']}", use_container_width=True,
+                                  type="primary" if x["start"] == st.session_state[sel_key] else "secondary"):
+                        st.session_state[sel_key] = x["start"]
+                        st.rerun()
+                else:
+                    tag = {"booked": "booked", "current": "current", "past": "past"}[x["status"]]
+                    tip = f"Booked: {x['occupant']}" if x["status"] == "booked" else None
+                    col.button(f"{label} · {tag}", key=f"pt_{tag}_{cid}_{x['start']}", disabled=True,
+                               help=tip, use_container_width=True)
+
+    return chosen
+
+
 def render_nav_buttons(address, lat, lon, geo_quality=None):
     """Shows 'Google Maps' and 'Apple Maps' directions buttons side by side."""
-    links = build_navigation_links(address, lat, lon, prefer_coords=(geo_quality == GEO_MANUAL))
+    links = build_navigation_links(address, lat, lon, prefer_coords=(geo_quality in GEO_REP_VERIFIED))
     if not links:
         return
     b1, b2 = st.columns(2)
@@ -294,11 +466,11 @@ st.sidebar.subheader("Map & saved progress")
 
 if st.session_state.claims_df is not None:
     if st.sidebar.button("🔄 Re-check all addresses", type="secondary",
-                         help="Looks up every address again. Pins you placed by hand are kept."):
+                         help="Looks up every address again. Pins you placed or confirmed are kept."):
         cdf = st.session_state.claims_df
         if "geo_quality" not in cdf.columns:
             cdf["geo_quality"] = GEO_UNKNOWN
-        redo_idx = cdf.index[cdf["geo_quality"] != GEO_MANUAL].tolist()
+        redo_idx = cdf.index[~cdf["geo_quality"].isin(GEO_REP_VERIFIED)].tolist()
         with st.spinner("Re-checking addresses..."):
             addrs = [(cdf.at[i, "full_address"], cdf.at[i, "state"] if "state" in cdf.columns else "") for i in redo_idx]
             results = batch_geocode_addresses(addrs)
@@ -410,31 +582,8 @@ if st.session_state.claims_df is not None:
     )
 
     if review_mask.any():
-        n_review = int(review_mask.sum())
-        wc1, wc2 = st.columns([3, 1.2], vertical_alignment="center")
-        with wc1:
-            st.warning(f"{n_review} claim(s) have an approximate or missing location. Try a deeper lookup, "
-                       "or turn on **Fix pin locations** in the Map tab to place them yourself.")
-        with wc2:
-            if st.button(f"🔎 Deeper lookup for {n_review} (about {max(1, round(n_review * 2 / 60))} min)",
-                         use_container_width=True,
-                         help="Checks OpenStreetMap for these addresses. It's slower because OpenStreetMap "
-                              "allows one lookup per second. Pins you placed by hand aren't touched."):
-                idxs = df.index[review_mask].tolist()
-                addrs = [(df.at[i, "full_address"], df.at[i, "state"] if "state" in df.columns else "") for i in idxs]
-                better = improve_with_openstreetmap(addrs)
-                improved = 0
-                for i, hit in zip(idxs, better):
-                    if hit:
-                        st.session_state.claims_df.at[i, "lat"] = hit[0]
-                        st.session_state.claims_df.at[i, "lon"] = hit[1]
-                        st.session_state.claims_df.at[i, "geo_quality"] = hit[2]
-                        improved += 1
-                st.session_state.map_nonce += 1
-                st.session_state.editor_version += 1
-                st.toast(f"Improved {improved} of {n_review} pins" if improved else
-                         "OpenStreetMap couldn't improve these. Place them in the Map tab.")
-                st.rerun()
+        st.warning(f"{int(review_mask.sum())} claim(s) have an approximate or missing location. "
+                   "Turn on **Fix pin locations** in the Map tab to confirm or move them.")
 
     st.markdown("---")
 
@@ -725,6 +874,15 @@ if st.session_state.claims_df is not None:
             for _, r in fix_order.iterrows():
                 flag = "⚠️ " if r["geo_quality"] in GEO_NEEDS_REVIEW else ""
                 fix_map[f"{flag}{r['claim_id']} - {r['insured_name']} ({r['geo_quality']})"] = str(r["claim_id"])
+            pending = st.session_state.pop("pending_fix_claim_id", None)
+            if pending:
+                pending_label = next((lbl for lbl, cid in fix_map.items() if cid == pending), None)
+                if pending_label:
+                    st.session_state["pin_fix_claim"] = pending_label
+            if st.session_state.get("pin_fix_claim") not in fix_map:
+                st.session_state.pop("pin_fix_claim", None)
+            if st.session_state.pop("all_pins_checked", False):
+                st.success("All flagged locations are checked.")
             fix_label = st.selectbox("Claim to fix", list(fix_map.keys()), key="pin_fix_claim")
             fix_id = fix_map[fix_label]
             fix_row = mdf[mdf["claim_id"].astype(str) == fix_id].iloc[0]
@@ -781,7 +939,7 @@ if st.session_state.claims_df is not None:
                 marker_color = date_color_map.get(row.get("scheduled_date"), "blue")
                 icon_type = "exclamation-sign" if needs_review else "ok-sign"
 
-            nav = build_navigation_links(row["full_address"], lat, lon, prefer_coords=(row["geo_quality"] == GEO_MANUAL))
+            nav = build_navigation_links(row["full_address"], lat, lon, prefer_coords=(row["geo_quality"] in GEO_REP_VERIFIED))
             links_html = " &nbsp; ".join(
                 f'<a href="{url}" target="_blank" rel="noopener">{name}</a>'
                 for name, url in [("Google Maps", nav.get("google")), ("Apple Maps", nav.get("apple"))] if url
@@ -843,13 +1001,23 @@ if st.session_state.claims_df is not None:
                    "A **!** means the location is approximate and should be checked.")
 
         if fix_mode and fix_row is not None:
+            has_pin = pd.notna(fix_row["lat"]) and pd.notna(fix_row["lon"])
+            if has_pin and fix_row["geo_quality"] not in GEO_REP_VERIFIED:
+                if st.button("✓ Pin is correct", type="primary", key=f"confirm_pin_{fix_row['claim_id']}",
+                             help="Keeps the pin where it is and marks the location as checked."):
+                    confirm_pin(fix_row["claim_id"])
+                    queue_next_pin_to_fix(fix_row["claim_id"])
+                    st.rerun()
+            elif fix_row["geo_quality"] in GEO_REP_VERIFIED:
+                st.caption(f"✓ {fix_row['geo_quality']}. You can still move it below.")
             fc1, fc2 = st.columns(2)
             with fc1:
                 clicked_pt = map_state.get("last_clicked")
                 if clicked_pt:
                     st.markdown(f"Selected spot  \n`{clicked_pt['lat']:.6f}, {clicked_pt['lng']:.6f}`")
-                    if st.button(f"Move {fix_row['claim_id']} pin here", type="primary"):
+                    if st.button(f"Move {fix_row['claim_id']} pin here"):
                         save_manual_pin(fix_row["claim_id"], clicked_pt["lat"], clicked_pt["lng"])
+                        queue_next_pin_to_fix(fix_row["claim_id"])
                         st.rerun()
                 else:
                     st.caption("Click the map to choose the spot for this claim.")
@@ -861,6 +1029,7 @@ if st.session_state.claims_df is not None:
                     coords = parse_coordinates(pasted)
                     if coords:
                         save_manual_pin(fix_row["claim_id"], coords[0], coords[1])
+                        queue_next_pin_to_fix(fix_row["claim_id"])
                         st.rerun()
                     else:
                         st.error("No coordinates found. Paste something like 29.4241, -98.4936 "
@@ -1003,16 +1172,10 @@ if st.session_state.claims_df is not None:
 
                     st.write(f"**Currently:** {fmt_dt(parse_wallclock(current_claim['start_time'])) or 'no time set'}")
 
-                    move_slots = [
-                        s for s in all_slots
-                        if parse_wallclock(s["start"]) > now_local
-                        and not is_slot_conflicting(s, st.session_state.claims_df, current_claim_id=selected_claim_id)
-                        and s["start"] != str(current_claim["start_time"])
-                    ]
-                    if move_slots:
-                        move_label = st.selectbox("Move to an open slot", [s["slot_label"] for s in move_slots], key="move_slot_select")
-                        move_slot = next(s for s in move_slots if s["slot_label"] == move_label)
-                        if st.button("🔁 Move to this slot"):
+                    move_slot = render_slot_picker(selected_claim_id, all_slots, st.session_state.claims_df,
+                                                   now_local, current_start=current_claim["start_time"])
+                    if move_slot:
+                        if st.button("🔁 Move to this slot", type="primary"):
                             book_claim_into_slot(claim_mask, move_slot)
                             st.rerun()
 
@@ -1026,14 +1189,9 @@ if st.session_state.claims_df is not None:
                         st.rerun()
 
                 elif current_claim["status"] in ["Unscheduled", "Ignored"]:
-                    unbooked_slots = [s for s in all_slots if parse_wallclock(s["start"]) > now_local and not is_slot_conflicting(s, st.session_state.claims_df, current_claim_id=selected_claim_id)]
-                    
-                    if unbooked_slots:
-                        slot_labels = [s["slot_label"] for s in unbooked_slots]
-                        selected_slot_label = st.selectbox("Open slot", slot_labels, index=0, key="book_slot_select")
-                        chosen_slot = next(s for s in unbooked_slots if s["slot_label"] == selected_slot_label)
+                    chosen_slot = render_slot_picker(selected_claim_id, all_slots, st.session_state.claims_df, now_local)
+                    if chosen_slot:
                         selected_target_date_str = chosen_slot["date_str"]
-                        
                         if st.button("Book this slot", type="primary"):
                             book_claim_into_slot(claim_mask, chosen_slot)
                             st.rerun()
