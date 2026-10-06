@@ -1,6 +1,6 @@
 import re
 import time
-import random
+import io
 import requests
 import pandas as pd
 import numpy as np
@@ -8,17 +8,108 @@ import streamlit as st
 from datetime import datetime, date, timedelta
 from typing import List, Dict, Any, Optional, Tuple
 
-# --- COMPLIANT & STATE-BOUNDED GEOCODING UTILITIES ---
+# --- OPTION 4: US CENSUS BATCH & STRUCTURED GEOCODING UTILITIES ---
+
+def parse_us_address(address_str: str, fallback_state: str = "") -> Tuple[str, str, str, str]:
+    """
+    Parses a raw address string into (Street, City, State, Zip) components.
+    """
+    clean_addr = str(address_str).strip()
+    if not clean_addr or clean_addr.lower() == "nan":
+        return "", "", fallback_state, ""
+
+    # Check for standard 'Street, City, ST Zip' or 'Street, City, ST'
+    parts = [p.strip() for p in clean_addr.split(",") if p.strip()]
+    
+    street, city, state, zip_code = "", "", fallback_state, ""
+
+    if len(parts) >= 3:
+        street = parts[0]
+        city = parts[1]
+        
+        # Last part usually contains State and Zip (e.g. 'TX 78201' or 'TX')
+        state_zip_part = parts[2].split()
+        if len(state_zip_part) >= 1:
+            state = state_zip_part[0]
+        if len(state_zip_part) >= 2:
+            zip_code = state_zip_part[1]
+    elif len(parts) == 2:
+        street = parts[0]
+        city_st = parts[1].split()
+        if len(city_st) >= 1:
+            city = city_st[0]
+        if len(city_st) >= 2:
+            state = city_st[1]
+    else:
+        street = clean_addr
+
+    return street, city, state, zip_code
+
+
+def census_batch_geocode(parsed_addresses: List[Tuple[int, str, str, str, str]]) -> Dict[int, Tuple[float, float]]:
+    """
+    Sends structured addresses to the US Census Bureau Batch Geocoder in a single request.
+    Returns a mapping of row_index -> (lat, lon).
+    """
+    if not parsed_addresses:
+        return {}
+
+    # Format required by Census Batch CSV: UniqueID, Street, City, State, Zip
+    csv_buffer = io.StringIO()
+    for row_id, street, city, state, zip_code in parsed_addresses:
+        # Escape double quotes
+        s_clean = street.replace('"', '')
+        c_clean = city.replace('"', '')
+        st_clean = state.replace('"', '')
+        z_clean = zip_code.replace('"', '')
+        csv_buffer.write(f'"{row_id}","{s_clean}","{c_clean}","{st_clean}","{z_clean}"\n')
+
+    csv_buffer.seek(0)
+
+    results = {}
+    try:
+        url = "https://geocoding.geo.census.gov/geocoder/locations/addressbatch"
+        files = {
+            'addressFile': ('addresses.csv', csv_buffer.getvalue(), 'text/csv')
+        }
+        data = {
+            'benchmark': 'Public_AR_Current',
+            'vintage': 'Current_Current'
+        }
+        
+        response = requests.post(url, files=files, data=data, timeout=30)
+        
+        if response.status_code == 200:
+            lines = response.text.strip().split("\n")
+            for line in lines:
+                parts = [p.strip('"') for p in line.split('","')]
+                if len(parts) >= 6:
+                    row_id_str = parts[0].strip('"')
+                    match_status = parts[2].strip('"')  # Match or No_Match
+                    
+                    if match_status == "Match" and len(parts) >= 6:
+                        coords_str = parts[5].strip('"')  # "lon,lat"
+                        if "," in coords_str:
+                            lon_str, lat_str = coords_str.split(",")
+                            try:
+                                row_id = int(row_id_str)
+                                results[row_id] = (float(lat_str), float(lon_str))
+                            except ValueError:
+                                pass
+    except Exception as e:
+        st.warning(f"US Census Batch API request failed: {e}")
+
+    return results
+
 
 @st.cache_data(show_spinner=False)
-def geocode_single_address(address: str, state: str = None) -> Tuple[float, float]:
+def geocode_single_address_fallback(address: str, state: str = None) -> Tuple[float, float]:
     """
-    Geocodes a single address string using Nominatim with strict rate-limiting compliance,
-    dynamically bounded by the state parameter if provided.
+    Fallback single-address lookup using Nominatim for rows missed by Census batch.
     """
     clean_addr = str(address).strip()
     if not clean_addr or clean_addr.lower() == "nan":
-        return 29.4241 + random.uniform(-0.02, 0.02), -98.4936 + random.uniform(-0.02, 0.02)
+        return 29.4241 + np.random.uniform(-0.02, 0.02), -98.4936 + np.random.uniform(-0.02, 0.02)
 
     try:
         url = "https://nominatim.openstreetmap.org/search"
@@ -28,53 +119,61 @@ def geocode_single_address(address: str, state: str = None) -> Tuple[float, floa
             "limit": 1,
             "countrycodes": "us"
         }
-        
-        # Dynamically restrict search scope if state is provided
         if state and str(state).strip() and str(state).lower() != "nan":
             params["state"] = str(state).strip()
 
-        headers = {
-            "User-Agent": "CATClaimsSchedulerApp/3.0 (contact@example.com)"
-        }
+        headers = {"User-Agent": "CATClaimsSchedulerApp/4.0 (contact@example.com)"}
         resp = requests.get(url, params=params, headers=headers, timeout=6)
         if resp.status_code == 200:
             data = resp.json()
             if data and len(data) > 0:
                 return float(data[0]["lat"]), float(data[0]["lon"])
-        elif resp.status_code == 429:
-            st.warning(f"Rate limited by Nominatim for address: {clean_addr}")
     except Exception:
         pass
 
-    # Jitter fallback near center if lookup fails or times out
-    return 29.4241 + random.uniform(-0.02, 0.02), -98.4936 + random.uniform(-0.02, 0.02)
+    # Jitter near San Antonio center if all lookups fail
+    return 29.4241 + np.random.uniform(-0.02, 0.02), -98.4936 + np.random.uniform(-0.02, 0.02)
 
 
 def batch_geocode_addresses(address_state_list: List[Tuple[str, Optional[str]]]) -> List[Tuple[float, float]]:
     """
-    Geocodes (address, state) tuples sequentially with a 1.0s delay to respect Nominatim policy.
+    Fast, hybrid geocoding: US Census Batch API (instant) with single-address fallbacks.
     """
-    results = []
-    progress_bar = st.progress(0, text="Geocoding addresses...")
     total = len(address_state_list)
+    if total == 0:
+        return []
 
-    for i, item in enumerate(address_state_list):
+    progress_bar = st.progress(0, text="Standardizing & geocoding addresses via US Census API...")
+
+    # Step 1: Parse addresses
+    parsed_items = []
+    for idx, item in enumerate(address_state_list):
         if isinstance(item, tuple):
             addr, st_val = item
         else:
-            addr, st_val = item, None
+            addr, st_val = item, ""
+        
+        street, city, state, zip_code = parse_us_address(addr, fallback_state=st_val or "")
+        parsed_items.append((idx, street, city, state, zip_code))
 
-        coords = geocode_single_address(addr, state=st_val)
-        results.append(coords)
-        
-        # Respect OpenStreetMap 1 req/sec rate limit policy
-        time.sleep(1.0)
-        
-        if total > 0:
-            progress_bar.progress((i + 1) / total, text=f"Geocoding address {i + 1} of {total}...")
+    # Step 2: Batch geocode via US Census Bureau
+    census_results = census_batch_geocode(parsed_items)
+    progress_bar.progress(0.7, text="Processing Census matches & executing fallbacks...")
+
+    # Step 3: Assign results, using Nominatim fallback for missed matches
+    final_coords = []
+    for idx, item in enumerate(address_state_list):
+        if idx in census_results:
+            final_coords.append(census_results[idx])
+        else:
+            addr = item[0] if isinstance(item, tuple) else item
+            st_val = item[1] if isinstance(item, tuple) else None
+            coords = geocode_single_address_fallback(addr, state=st_val)
+            final_coords.append(coords)
+            time.sleep(1.0)  # Rate limit fallback requests
 
     progress_bar.empty()
-    return results
+    return final_coords
 
 
 def get_osrm_route(start_lat: float, start_lon: float, end_lat: float, end_lon: float) -> Tuple[float, float]:
@@ -113,7 +212,7 @@ def get_osrm_route(start_lat: float, start_lon: float, end_lat: float, end_lon: 
 def process_imported_table(df: pd.DataFrame) -> pd.DataFrame:
     """
     Processes imported CSV/Excel dataframe by detecting formatted claim IDs (e.g. ABC1234-001),
-    insured names, and full addresses. Passes state context to batch geocoding.
+    insured names, and full addresses.
     """
     col_map = {str(c).strip().lower(): c for c in df.columns}
     
@@ -165,7 +264,6 @@ def process_imported_table(df: pd.DataFrame) -> pd.DataFrame:
     metadata = []
 
     for idx, row in df.iterrows():
-        # Preserve exact claim identifier string formatting
         if claim_col and pd.notna(row[claim_col]) and str(row[claim_col]).strip() != "":
             raw_claim = str(row[claim_col]).strip()
             claim_num = raw_claim[:-2] if raw_claim.endswith(".0") else raw_claim
@@ -191,7 +289,6 @@ def process_imported_table(df: pd.DataFrame) -> pd.DataFrame:
             else:
                 full_address = ", ".join([str(v).strip() for v in row.values if pd.notna(v) and str(v).strip() != ""])
 
-        # Check for pre-existing coordinates
         has_coords = "lat" in df.columns and "lon" in df.columns and pd.notna(row["lat"]) and pd.notna(row["lon"])
         pre_lat = float(row["lat"]) if has_coords else None
         pre_lon = float(row["lon"]) if has_coords else None
@@ -213,7 +310,6 @@ def process_imported_table(df: pd.DataFrame) -> pd.DataFrame:
             "pre_lon": pre_lon
         })
 
-    # Prepare address and state pairs for non-geocoded rows
     addrs_to_geocode = [
         (m["full_address"], m["state"]) for m in metadata if m["pre_lat"] is None
     ]
@@ -248,9 +344,6 @@ def generate_available_slots(
     start_time_input: Any,
     window_hrs: float
 ) -> List[Dict[str, Any]]:
-    """
-    Generates available time slots based on rep schedule preferences.
-    """
     day_map = {0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri", 5: "Sat", 6: "Sun"}
     slots = []
     
@@ -278,9 +371,6 @@ def generate_available_slots(
 
 
 def is_slot_conflicting(slot: Dict[str, Any], claims_df: pd.DataFrame, current_claim_id: str) -> bool:
-    """
-    Checks whether a slot overlaps with an already scheduled claim.
-    """
     if claims_df is None or claims_df.empty:
         return False
         
@@ -303,9 +393,6 @@ def is_slot_conflicting(slot: Dict[str, Any], claims_df: pd.DataFrame, current_c
 # --- RECOMMENDATION ENGINE ---
 
 def get_recommendations_for_day(claims_df: pd.DataFrame, target_date_str: str) -> Optional[pd.DataFrame]:
-    """
-    Calculates geographic proximity and drive times to recommend unscheduled claims.
-    """
     if claims_df is None or claims_df.empty:
         return None
 
@@ -343,9 +430,6 @@ def get_recommendations_for_day(claims_df: pd.DataFrame, target_date_str: str) -
 # --- ICS CALENDAR EXPORT ---
 
 def export_claims_to_ics(claims_df: pd.DataFrame) -> str:
-    """
-    Exports scheduled claims to iCalendar (.ics) format.
-    """
     ics_lines = [
         "BEGIN:VCALENDAR",
         "VERSION:2.0",
