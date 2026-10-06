@@ -1,321 +1,195 @@
 import streamlit as st
 import pandas as pd
 import folium
+from folium.plugins import MarkerCluster
 from streamlit_folium import st_folium
-from datetime import datetime, date, timedelta
-from streamlit_calendar import calendar
+from datetime import datetime, time, timedelta, date
+
 from engine import (
     process_imported_table,
     generate_available_slots,
-    get_recommendations_for_day,
-    export_claims_to_ics,
     is_slot_conflicting,
-    batch_geocode_addresses
+    get_recommendations_for_day,
+    export_claims_to_ics
 )
 
-st.set_page_config(page_title="CAT Claims Dynamic Scheduler MVP", layout="wide")
+st.set_page_config(page_title="CAT Claims Field Scheduler", layout="wide")
 
+st.title("📌 CAT Dynamic Scheduler")
+
+# --- INITIALIZE SESSION STATE ---
 if "claims_df" not in st.session_state:
-    st.session_state.claims_df = None
+    st.session_state["claims_df"] = None
 
-st.title("CAT Dynamic Scheduling")
+# --- SIDEBAR: DATA IMPORT & CONFIGURATION ---
+st.sidebar.header("1. Data Import")
+uploaded_file = st.sidebar.file_uploader("Upload Claims CSV or Excel", type=["csv", "xlsx"])
 
-# --- SIDEBAR PREFERENCES ---
-st.sidebar.header("🗓️ Rep Schedule Parameters")
-hotel_address = st.sidebar.text_input("Hotel or Base Location", "1100 San Pedro Ave, San Antonio, TX")
+if uploaded_file is not None:
+    if st.sidebar.button("Process & Geocode File"):
+        try:
+            if uploaded_file.name.endswith(".csv"):
+                raw_df = pd.read_csv(uploaded_file)
+            else:
+                raw_df = pd.read_excel(uploaded_file)
 
-col_d1, col_d2 = st.sidebar.columns(2)
-with col_d1:
-    start_date = st.sidebar.date_input("Inspection Start", date.today())
-with col_d2:
-    end_date = st.sidebar.date_input("Inspection End", date.today() + timedelta(days=5))
+            with st.spinner("Parsing file and geocoding addresses..."):
+                processed_df = process_imported_table(raw_df)
+                st.session_state["claims_df"] = processed_df
+                st.success(f"Successfully processed {len(processed_df)} claims!")
+        except Exception as e:
+            st.error(f"Error processing file: {e}")
 
-active_days = st.sidebar.multiselect(
-    "Active Inspection Days",
-    ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
-    default=["Mon", "Tue", "Wed", "Thu", "Fri"]
-)
+st.sidebar.header("2. Scheduling Controls")
+start_date = st.sidebar.date_input("Start Date", value=date.today())
+end_date = st.sidebar.date_input("End Date", value=date.today() + timedelta(days=5))
+active_days = st.sidebar.multiselect("Working Days", ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"], default=["Mon", "Tue", "Wed", "Thu", "Fri"])
+inspections_per_day = st.sidebar.number_input("Inspections Per Day", min_value=1, max_value=10, value=4)
+start_time_val = st.sidebar.time_input("Day Start Time", value=time(8, 0))
+window_hours = st.sidebar.number_input("Slot Window (Hours)", min_value=0.5, max_value=4.0, value=2.0, step=0.5)
 
-inspections_per_day = st.sidebar.slider("Inspections / Day", 1, 8, 3)
+# Actions Block
+st.sidebar.subheader("Actions")
+if st.sidebar.button("🔄 Refresh & Sync Data Edits"):
+    st.rerun()
 
-window_hrs = st.sidebar.number_input(
-    "Window Duration (Hours)",
-    min_value=0.25,
-    max_value=8.00,
-    value=2.50,
-    step=0.25
-)
+# --- MAIN CONTENT AREA ---
+if st.session_state["claims_df"] is not None:
+    claims_df = st.session_state["claims_df"]
 
-start_time_input = st.sidebar.time_input("Day Start Time", value=datetime.strptime("08:00", "%H:%M").time())
+    # --- TABBED MAIN NAVIGATION ---
+    tab_editor, tab_map, tab_recommend, tab_export = st.tabs([
+        "📋 Claims Table & Editor",
+        "🗺️ Interactive Map & Calendar",
+        "💡 Route Recommendations",
+        "📅 Export Calendar"
+    ])
 
-all_slots = generate_available_slots(
-    start_date, end_date, active_days, inspections_per_day, start_time_input, window_hrs
-)
-
-# --- MANUAL GEOMAP REFRESH & STATE MANAGEMENT ---
-st.sidebar.markdown("---")
-st.sidebar.subheader("🗺️ Map Tools & State")
-
-if st.session_state.claims_df is not None:
-    if st.sidebar.button("🔄 Force Re-Geocode & Map Refresh", type="secondary"):
-        with st.spinner("Re-geocoding all claim addresses sequentially..."):
-            addrs = list(zip(
-                st.session_state.claims_df["full_address"].tolist(),
-                st.session_state.claims_df.get("state", pd.Series([""] * len(st.session_state.claims_df))).tolist()
-            ))
-            new_coords = batch_geocode_addresses(addrs)
-            st.session_state.claims_df["lat"] = [c[0] for c in new_coords]
-            st.session_state.claims_df["lon"] = [c[1] for c in new_coords]
-            st.sidebar.success("Map re-geocoded successfully!")
-            st.rerun()
-
-    st.sidebar.markdown(" ")
-    csv_bytes = st.session_state.claims_df.to_csv(index=False).encode('utf-8')
-    st.sidebar.download_button(
-        label="📥 Save Progress (Download State)",
-        data=csv_bytes,
-        file_name=f"cat_scheduler_state_{date.today().strftime('%Y%m%d')}.csv",
-        mime="text/csv"
-    )
-
-saved_file = st.sidebar.file_uploader("📂 Load Saved State CSV", type=["csv"], key="load_state_csv")
-if saved_file is not None:
-    try:
-        loaded_df = pd.read_csv(saved_file)
-        st.session_state.claims_df = loaded_df
-        st.sidebar.success("Progress restored!")
-    except Exception as e:
-        st.sidebar.error(f"Error loading state: {e}")
-
-# --- INGESTION ---
-st.subheader("1. Ingest Claims List")
-uploaded_file = st.file_uploader("Upload CSV or Excel file", type=["csv", "xlsx"])
-
-if uploaded_file is not None and st.session_state.claims_df is None:
-    try:
-        with st.spinner("Parsing table and batch-geocoding addresses..."):
-            raw_df = pd.read_csv(uploaded_file) if uploaded_file.name.endswith(".csv") else pd.read_excel(uploaded_file)
-            st.session_state.claims_df = process_imported_table(raw_df)
-            st.success(f"Successfully imported and mapped {len(st.session_state.claims_df)} claims!")
-            st.rerun()
-    except Exception as e:
-        st.error(f"Error parsing table: {e}")
-
-# --- DASHBOARD ---
-if st.session_state.claims_df is not None:
-    for required_col in ["scheduled_date", "inspection_time", "start_time", "end_time"]:
-        if required_col not in st.session_state.claims_df.columns:
-            st.session_state.claims_df[required_col] = ""
-
-    df = st.session_state.claims_df
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total Claims", len(df))
-    c2.metric("Unscheduled", len(df[df["status"] == "Unscheduled"]))
-    scheduled_count = len(df[df["status"] == "Scheduled"])
-    c3.metric("Scheduled / Confirmed", scheduled_count)
-    c4.metric("Ignored / Archived", len(df[df["status"] == "Ignored"]))
-
-    st.markdown("---")
-
-    if scheduled_count > 0:
-        ics_data = export_claims_to_ics(df)
-        st.download_button(
-            label=f"📅 Export {scheduled_count} Scheduled Inspection(s) to Outlook (.ics)",
-            data=ics_data,
-            file_name="cat_inspection_schedule.ics",
-            mime="text/calendar"
-        )
-        st.markdown(" ")
-
-    tab_cal, tab_map = st.tabs(["📅 CALENDAR VIEW", "🛰 SATELLITE MAP VIEW"])
-
-    with tab_cal:
-        calendar_events = []
-        scheduled_claims = df[df["status"] == "Scheduled"]
-        
-        for idx, row in scheduled_claims.iterrows():
-            if pd.notna(row["start_time"]) and pd.notna(row["end_time"]) and str(row["start_time"]) != "":
-                calendar_events.append({
-                    "id": str(row["claim_id"]),
-                    "title": f"[{row['claim_id']}] {row['insured_name']}",
-                    "start": str(row["start_time"]),
-                    "end": str(row["end_time"]),
-                    "backgroundColor": "#2563EB",
-                    "borderColor": "#1D4ED8"
-                })
-
-        calendar_options = {
-            "headerToolbar": {"left": "prev,next today", "center": "title", "right": "timeGridWeek,timeGridDay,dayGridMonth"},
-            "initialView": "timeGridWeek",
-            "initialDate": start_date.strftime("%Y-%m-%d"),
-            "slotMinTime": start_time_input.strftime("%H:%M:%S"),
-            "slotMaxTime": "21:00:00",
-            "editable": True,
-            "selectable": True,
-            "slotEventOverlap": True
-        }
-
-        cal_event = calendar(events=calendar_events, options=calendar_options, key="claims_calendar")
-        
-        if cal_event.get("eventChange"):
-            changed_event = cal_event["eventChange"]["event"]
-            cid = str(changed_event["id"])
-            new_start = changed_event["start"]
-            new_end = changed_event["end"]
-            
-            c_mask = st.session_state.claims_df["claim_id"].astype(str) == cid
-            st.session_state.claims_df.loc[c_mask, "start_time"] = new_start
-            st.session_state.claims_df.loc[c_mask, "end_time"] = new_end
-            st.session_state.claims_df.loc[c_mask, "scheduled_date"] = new_start.split("T")[0]
-            st.toast(f"Updated time for claim {cid}!")
-            st.rerun()
-
-    with tab_map:
-        valid_coords_df = df[(df["status"] != "Ignored") & (df["lat"].notna()) & (df["lon"].notna())]
-
-        if not valid_coords_df.empty:
-            avg_lat = valid_coords_df["lat"].mean()
-            avg_lon = valid_coords_df["lon"].mean()
-        else:
-            avg_lat, avg_lon = 29.4241, -98.4936
-
-        m = folium.Map(location=[avg_lat, avg_lon], zoom_start=10, tiles="OpenStreetMap")
-        
-        esri_satellite_url = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
-        folium.TileLayer(
-            tiles=esri_satellite_url,
-            attr="Esri World Imagery",
-            name="ESRI Satellite"
-        ).add_to(m)
-
-        day_colors = ["blue", "green", "purple", "orange", "darkred", "cadetblue", "darkgreen", "pink"]
-        scheduled_dates = sorted([d for d in df[df["status"] == "Scheduled"]["scheduled_date"].unique() if d])
-        date_color_map = {d: day_colors[i % len(day_colors)] for i, d in enumerate(scheduled_dates)}
-
-        bounds = []
-        for idx, row in df.iterrows():
-            if row["status"] == "Ignored" or pd.isna(row["lat"]) or pd.isna(row["lon"]):
-                continue
-
-            lat = float(row["lat"])
-            lon = float(row["lon"])
-
-            marker_color = "red" if row["status"] == "Unscheduled" else date_color_map.get(row.get("scheduled_date"), "blue")
-            icon_type = "exclamation-sign" if row["status"] == "Unscheduled" else "ok-sign"
-
-            folium.Marker(
-                location=[lat, lon],
-                popup=f"<b>{row['claim_id']}</b><br>{row['insured_name']}<br>{row['full_address']}",
-                tooltip=f"{row['claim_id']} - {row['insured_name']}",
-                icon=folium.Icon(color=marker_color, icon=icon_type)
-            ).add_to(m)
-
-            bounds.append([lat, lon])
-
-        if bounds:
-            m.fit_bounds(bounds, padding=(30, 30))
-
-        folium.LayerControl().add_to(m)
-        st_folium(m, width=1100, height=520, key="claims_map")
-
-    st.markdown("---")
-
-    # --- MANAGEMENT & CLAIMS POOL ---
-    col_left, col_right = st.columns([1.5, 1])
-
-    with col_left:
-        st.subheader("📋 Active Claims Pool")
-        show_status = st.multiselect("Filter Status View", ["Unscheduled", "Scheduled", "Ignored"], default=["Unscheduled", "Scheduled"])
-        filtered_df = df[df["status"].isin(show_status)].copy()
+    # 1. CLAIMS EDITOR TAB
+    with tab_editor:
+        st.subheader("Interactive Claims Master Table")
+        st.caption("You can edit priorities (1 = Highest), update statuses, or adjust coordinates directly below. Click '🔄 Refresh & Sync Data Edits' in the sidebar to sync changes.")
         
         edited_df = st.data_editor(
-            filtered_df[["claim_id", "insured_name", "full_address", "priority", "status", "scheduled_date", "inspection_time"]],
-            key="claims_editor",
-            disabled=["claim_id", "insured_name", "full_address"],
-            use_container_width=True
+            claims_df,
+            num_rows="dynamic",
+            use_container_width=True,
+            key="claims_editor"
         )
+        # Update session state with edits
+        st.session_state["claims_df"] = edited_df
 
-    selected_target_date_str = start_date.strftime("%Y-%m-%d")
+    # 2. MAP & CALENDAR TAB
+    with tab_map:
+        col_map, col_sched = st.columns([3, 2])
 
-    with col_right:
-        st.subheader("🎯 Select Claim to Manage")
-        claim_options = df["display_label"].tolist()
-
-        if "managed_claim_select" not in st.session_state or st.session_state["managed_claim_select"] not in claim_options:
-            st.session_state["managed_claim_select"] = claim_options[0]
-
-        if "selected_claim_id" in st.session_state and st.session_state["selected_claim_id"]:
-            matching = [opt for opt in claim_options if opt.startswith(str(st.session_state["selected_claim_id"]) + " -")]
-            if matching:
-                st.session_state["managed_claim_select"] = matching[0]
-            del st.session_state["selected_claim_id"]
-
-        selected_label = st.selectbox(
-            "Select Claim to Manage",
-            claim_options,
-            key="managed_claim_select"
-        )
-
-        if selected_label:
-            selected_claim_id = selected_label.split(" - ")[0].strip()
-            claim_mask = st.session_state.claims_df["claim_id"].astype(str) == selected_claim_id
-            
-            if claim_mask.any():
-                current_claim = st.session_state.claims_df[claim_mask].iloc[0]
+        with col_map:
+            st.subheader("Claims Map View")
+            if not claims_df.empty:
+                avg_lat = claims_df["lat"].mean()
+                avg_lon = claims_df["lon"].mean()
+                m = folium.Map(location=[avg_lat, avg_lon], zoom_start=11)
                 
-                st.write(f"**Claim Number:** `{current_claim['claim_id']}`")
-                st.write(f"**Insured Name:** {current_claim['insured_name']}")
-                st.write(f"**Address:** {current_claim['full_address']}")
-                st.write(f"**Current Status:** `{current_claim['status']}`")
-                
-                st.markdown("---")
+                marker_cluster = MarkerCluster().add_to(m)
 
-                if current_claim["status"] == "Scheduled":
-                    if current_claim["scheduled_date"]:
-                        selected_target_date_str = str(current_claim["scheduled_date"])
-
-                    if st.button("Remove from Schedule", type="primary"):
-                        st.session_state.claims_df.loc[claim_mask, "status"] = "Unscheduled"
-                        st.session_state.claims_df.loc[claim_mask, "start_time"] = None
-                        st.session_state.claims_df.loc[claim_mask, "end_time"] = None
-                        st.session_state.claims_df.loc[claim_mask, "scheduled_date"] = ""
-                        st.session_state.claims_df.loc[claim_mask, "inspection_time"] = ""
-                        st.rerun()
-
-                elif current_claim["status"] in ["Unscheduled", "Ignored"]:
-                    unbooked_slots = [s for s in all_slots if not is_slot_conflicting(s, st.session_state.claims_df, current_claim_id=selected_claim_id)]
+                for _, row in claims_df.iterrows():
+                    color = "green" if row["status"] == "Scheduled" else "red"
+                    popup_text = f"<b>{row['claim_id']}</b><br>{row['insured_name']}<br>Status: {row['status']}<br>Priority: {row['priority'] or 'Unassigned'}"
                     
-                    if unbooked_slots:
-                        slot_labels = [s["slot_label"] for s in unbooked_slots]
-                        selected_slot_label = st.selectbox("Choose Open Slot", slot_labels, index=0)
-                        chosen_slot = next(s for s in unbooked_slots if s["slot_label"] == selected_slot_label)
-                        selected_target_date_str = chosen_slot["date_str"]
-                        
-                        if st.button("Confirm & Lock Slot", type="primary"):
-                            st.session_state.claims_df.loc[claim_mask, "status"] = "Scheduled"
-                            st.session_state.claims_df.loc[claim_mask, "start_time"] = chosen_slot["start"]
-                            st.session_state.claims_df.loc[claim_mask, "end_time"] = chosen_slot["end"]
-                            st.session_state.claims_df.loc[claim_mask, "scheduled_date"] = chosen_slot["date_str"]
-                            
-                            start_dt = datetime.fromisoformat(chosen_slot["start"])
-                            st.session_state.claims_df.loc[claim_mask, "inspection_time"] = start_dt.strftime("%H:%M")
-                            st.rerun()
+                    folium.Marker(
+                        location=[row["lat"], row["lon"]],
+                        popup=popup_text,
+                        tooltip=f"{row['claim_id']} - {row['insured_name']}",
+                        icon=folium.Icon(color=color, icon="info-sign")
+                    ).add_to(marker_cluster)
 
-    # --- RECOMMENDATIONS ---
-    st.markdown("---")
-    st.subheader(f"💡 Recommended Next Claims for {selected_target_date_str}")
-    
-    recs = get_recommendations_for_day(st.session_state.claims_df, target_date_str=selected_target_date_str)
-    
-    if recs is not None and not recs.empty:
-        for idx, rec_row in recs.head(5).reset_index(drop=True).iterrows():
-            col_rec1, col_rec2 = st.columns([3, 1])
-            with col_rec1:
-                anchor_label = "anchor claim" if rec_row.get("anchor_type") == "anchor_claim" else "hotel base"
-                st.markdown(f"**[{rec_row['claim_id']}] {rec_row['insured_name']}** — *{rec_row['full_address']}* (⏱️ `{rec_row['drive_time_mins']} mins` from {anchor_label})")
-            with col_rec2:
-                unique_key = f"btn_rec_{idx}_{rec_row['claim_id']}"
-                if st.button("Select to Manage", key=unique_key):
-                    st.session_state["selected_claim_id"] = str(rec_row["claim_id"])
+                st_folium(m, width=700, height=500)
+
+        with col_sched:
+            st.subheader("Manual Slot Scheduling")
+            
+            available_slots = generate_available_slots(
+                start_date, end_date, active_days, inspections_per_day, start_time_val, window_hours
+            )
+
+            claim_options = claims_df["claim_id"].tolist()
+            selected_claim_id = st.selectbox("Select Claim to Schedule", claim_options)
+
+            if available_slots:
+                slot_labels = [s["slot_label"] for s in available_slots]
+                selected_slot_label = st.selectbox("Select Inspection Slot", slot_labels)
+
+                selected_slot = next(s for s in available_slots if s["slot_label"] == selected_slot_label)
+                
+                is_conflict = is_slot_conflicting(selected_slot, claims_df, selected_claim_id)
+                if is_conflict:
+                    st.warning("⚠️ Conflict Detected! Another claim is scheduled during this time slot.")
+
+                if st.button("Confirm Schedule"):
+                    idx = claims_df[claims_df["claim_id"] == selected_claim_id].index[0]
+                    claims_df.at[idx, "status"] = "Scheduled"
+                    claims_df.at[idx, "scheduled_date"] = selected_slot["date_str"]
+                    claims_df.at[idx, "start_time"] = selected_slot["start"]
+                    claims_df.at[idx, "end_time"] = selected_slot["end"]
+                    claims_df.at[idx, "inspection_time"] = selected_slot_label.split("|")[1].strip()
+                    
+                    st.session_state["claims_df"] = claims_df
+                    st.success(f"Successfully scheduled claim {selected_claim_id}!")
                     st.rerun()
+
+    # 3. RECOMMENDATIONS TAB (Unscheduled & Scheduled Tabs)
+    with tab_recommend:
+        st.subheader("Route & Priority Recommendations")
+        
+        target_date_str = st.date_input("Target Date for Route Optimization", value=start_date).strftime("%Y-%m-%d")
+
+        rec_tab_unscheduled, rec_tab_scheduled = st.tabs([
+            "📋 Unscheduled Claims", 
+            "📅 Scheduled Claims (Rescheduling View)"
+        ])
+
+        with rec_tab_unscheduled:
+            st.caption("Prioritized unscheduled claims based on Priority Rank (1 = Highest) and Drive Time proximity.")
+            rec_unscheduled = get_recommendations_for_day(
+                st.session_state["claims_df"], 
+                target_date_str=target_date_str, 
+                status_filter="Unscheduled"
+            )
+            if rec_unscheduled is not None and not rec_unscheduled.empty:
+                display_cols = ["priority", "claim_id", "insured_name", "drive_miles", "drive_time_mins", "full_address"]
+                st.dataframe(rec_unscheduled[display_cols], use_container_width=True)
+            else:
+                st.info("No unscheduled claims found.")
+
+        with rec_tab_scheduled:
+            st.caption("Currently scheduled claims sorted by Priority Rank and Drive Time to help identify candidates for bumping up after cancellations.")
+            rec_scheduled = get_recommendations_for_day(
+                st.session_state["claims_df"], 
+                target_date_str=target_date_str, 
+                status_filter="Scheduled"
+            )
+            if rec_scheduled is not None and not rec_scheduled.empty:
+                display_cols = ["priority", "claim_id", "insured_name", "scheduled_date", "inspection_time", "drive_miles", "drive_time_mins", "full_address"]
+                st.dataframe(rec_scheduled[display_cols], use_container_width=True)
+            else:
+                st.info("No scheduled claims found for this date.")
+
+    # 4. EXPORT TAB
+    with tab_export:
+        st.subheader("Export Calendar Appointments")
+        st.write("Export all currently scheduled claims to an iCalendar (.ics) file compatible with Outlook, Google Calendar, and Apple Calendar.")
+
+        scheduled_count = len(claims_df[claims_df["status"] == "Scheduled"])
+        st.info(f"Total Scheduled Inspections: {scheduled_count}")
+
+        if scheduled_count > 0:
+            ics_data = export_claims_to_ics(claims_df)
+            st.download_button(
+                label="📥 Download .ics Calendar File",
+                data=ics_data,
+                file_name="cat_inspections_schedule.ics",
+                mime="text/calendar"
+            )
+
+else:
+    st.info("Please upload and process a claims dataset using the sidebar to get started.")
