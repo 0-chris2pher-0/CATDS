@@ -91,8 +91,8 @@ def get_osrm_route(start_lat: float, start_lon: float, end_lat: float, end_lon: 
 
 def process_imported_table(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Processes imported CSV/Excel dataframe by assembling addresses split across
-    multiple columns (Street, Town/City, State, Zip) and batch-geocoding them concurrently.
+    Processes imported CSV/Excel dataframe by detecting claim IDs, insured names, and full addresses.
+    Preserves exact string identifiers (e.g. ABC1234-001).
     """
     col_map = {str(c).strip().lower(): c for c in df.columns}
     
@@ -104,23 +104,30 @@ def process_imported_table(df: pd.DataFrame) -> pd.DataFrame:
     zip_col = None
     full_addr_col = None
 
-    # Step 1: Check for explicit single Full Address column first
+    # Step 1: Detect Claim ID Column (supports 'claim', 'claim_id', 'file #', 'claim #', 'policy #', etc.)
     for low_c, orig_c in col_map.items():
-        if any(k == low_c for k in ["full address", "full_address", "loss address", "property address", "location address", "site address"]):
+        if any(k == low_c for k in ["claim_id", "claim #", "claim_num", "claim number", "claim", "file #", "file_num", "policy_num"]):
+            claim_col = orig_c
+            break
+    if not claim_col:
+        for low_c, orig_c in col_map.items():
+            if any(k in low_c for k in ["claim", "file", "policy"]):
+                claim_col = orig_c
+                break
+
+    # Step 2: Check for explicit single Full Address column
+    for low_c, orig_c in col_map.items():
+        if any(k == low_c for k in ["full address", "full_address", "loss address", "property address", "location address", "site address", "address"]):
             full_addr_col = orig_c
             break
 
-    # Step 2: Flexible matching for split address columns
+    # Step 3: Flexible matching for remaining metadata
     for low_c, orig_c in col_map.items():
-        if not claim_col and any(k in low_c for k in ["claim", "file #", "file_num", "claim_id", "policy_num", "number"]):
-            claim_col = orig_c
-        elif not insured_col and any(k in low_c for k in ["insured", "customer", "policyholder", "client", "name"]):
+        if not insured_col and any(k in low_c for k in ["insured", "customer", "policyholder", "client", "name"]):
             insured_col = orig_c
         elif not street_col and any(k in low_c for k in ["street", "address 1", "addr1", "address_line_1", "loss_street", "property_street", "location", "site"]):
             if "state" not in low_c and low_c != "st":
                 street_col = orig_c
-        elif not street_col and not full_addr_col and "address" in low_c and "state" not in low_c:
-            street_col = orig_c
         elif not city_col and any(k in low_c for k in ["town", "city", "municipality", "village"]):
             city_col = orig_c
         elif not state_col and (low_c in ["state", "st", "province"] or "state" in low_c):
@@ -132,7 +139,14 @@ def process_imported_table(df: pd.DataFrame) -> pd.DataFrame:
     metadata = []
 
     for idx, row in df.iterrows():
-        claim_num = str(row[claim_col]).strip() if claim_col and pd.notna(row[claim_col]) else f"CLM-{idx + 1001}"
+        # Preserve original string formatting without converting to numeric floats/ints
+        if claim_col and pd.notna(row[claim_col]) and str(row[claim_col]).strip() != "":
+            raw_claim = str(row[claim_col]).strip()
+            # Clean floating point artifact strings (e.g., "425.0" -> "425")
+            claim_num = raw_claim[:-2] if raw_claim.endswith(".0") else raw_claim
+        else:
+            claim_num = f"CLM-{idx + 1001}"
+
         insured = str(row[insured_col]).strip() if insured_col and pd.notna(row[insured_col]) else f"Policyholder {idx + 1}"
         
         # Assemble address
