@@ -219,11 +219,16 @@ GEO_ZIP = "ZIP area (approx.)"
 GEO_CITY = "City area (approx.)"
 GEO_NOT_FOUND = "Not found"
 GEO_MANUAL = "Set by rep"
+GEO_CONFIRMED = "Confirmed by rep"
 GEO_IMPORTED = "From import file"
 GEO_UNKNOWN = "Unknown"
 
 # Pins a rep should double-check or place by hand
 GEO_NEEDS_REVIEW = {GEO_ZIP, GEO_CITY, GEO_NOT_FOUND}
+
+# Pins a rep has checked: never flagged, never overwritten by a re-check,
+# and used for directions instead of the street address.
+GEO_REP_VERIFIED = {GEO_MANUAL, GEO_CONFIRMED}
 
 # Nominatim's usage policy asks for a real contact. Set NOMINATIM_CONTACT in
 # Streamlit secrets (Manage app > Settings > Secrets), or edit the fallback below.
@@ -507,8 +512,6 @@ def batch_geocode_addresses(address_state_list: List[Tuple[str, Optional[str]]])
       1. Census batch (one request for everything)
       2. Census single-line retries for misses, run in parallel (incl. rural road spellings)
       3. Instant ZIP-area / city-area location from Census reference files (flagged for review)
-    OpenStreetMap is NOT used here; it's slow (1 request/second), so it runs only when
-    the rep asks for it (see improve_with_openstreetmap).
     Returns (lat, lon, quality) per item; lat/lon are None when nothing was found.
     """
     from concurrent.futures import ThreadPoolExecutor
@@ -544,52 +547,6 @@ def batch_geocode_addresses(address_state_list: List[Tuple[str, Optional[str]]])
 
     progress_bar.empty()
     return [results[i] for i in range(total)]
-
-
-def improve_with_openstreetmap(address_state_list: List[Tuple[str, Optional[str]]]) -> List[Optional[Tuple[float, float, str]]]:
-    """
-    Optional slower pass for pins that are approximate or missing. Tries OpenStreetMap
-    (structured fields, then the full address). About 1-2 seconds per address because of
-    OpenStreetMap's 1-request-per-second limit. Returns a better (lat, lon, quality) or None.
-    """
-    out = []
-    total = len(address_state_list)
-    progress_bar = st.progress(0.0, text="Checking OpenStreetMap...")
-    for n, (addr, st_val) in enumerate(address_state_list, start=1):
-        progress_bar.progress(n / max(total, 1), text=f"Checking OpenStreetMap: {n} of {total}")
-        street, city, st_abbr, zip_code = parse_us_address(addr, fallback_state=st_val or "")
-        hit = None
-        if street and (city or zip_code):
-            fields = [("street", street), ("city", city), ("state", st_abbr), ("postalcode", zip_code)]
-            hit = _try(_nominatim, tuple((k, v) for k, v in fields if v))
-        if not hit and street:
-            oneline = ", ".join(p for p in [street, city, f"{st_abbr} {zip_code}".strip()] if p)
-            hit = _try(_nominatim, (("q", oneline),))
-        out.append((hit[0], hit[1], GEO_OSM) if hit else None)
-    progress_bar.empty()
-    return out
-
-
-@st.cache_data(show_spinner=False)
-def _nominatim(params_items: Tuple[Tuple[str, str], ...]) -> Optional[Tuple[float, float]]:
-    """Nominatim lookup. Free-text (q) and structured fields are never mixed."""
-    _nominatim_throttle()
-    params = dict(params_items)
-    params.update({"format": "json", "limit": "1", "countrycodes": "us"})
-    resp = requests.get("https://nominatim.openstreetmap.org/search",
-                        params=params, headers=_nominatim_headers(), timeout=8)
-    resp.raise_for_status()
-    data = resp.json()
-    if not data:
-        return None
-    return float(data[0]["lat"]), float(data[0]["lon"])
-
-
-def _try(fn, *args):
-    try:
-        return fn(*args)
-    except Exception:
-        return None
 
 
 def parse_coordinates(text: Any) -> Optional[Tuple[float, float]]:
@@ -1044,4 +1001,3 @@ def export_claims_to_ics(claims_df: pd.DataFrame, tz_name: Optional[str]) -> str
 
     ics_lines.append("END:VCALENDAR")
     return "\r\n".join(ics_lines) + "\r\n"
-
