@@ -8,7 +8,7 @@ import streamlit as st
 from datetime import datetime, date, timedelta
 from typing import List, Dict, Any, Optional, Tuple
 
-# --- OPTION 4: US CENSUS BATCH & STRUCTURED GEOCODING UTILITIES ---
+# --- US CENSUS BATCH & STRUCTURED GEOCODING UTILITIES ---
 
 def parse_us_address(address_str: str, fallback_state: str = "") -> Tuple[str, str, str, str]:
     """
@@ -201,7 +201,7 @@ def get_osrm_route(start_lat: float, start_lon: float, end_lat: float, end_lon: 
 def process_imported_table(df: pd.DataFrame) -> pd.DataFrame:
     """
     Processes imported CSV/Excel dataframe by detecting formatted claim IDs,
-    insured names, full addresses, and priority ranks (leaving blank if unspecified).
+    insured names, full addresses, and priority ranks (leaving blank/None if unspecified).
     """
     col_map = {str(c).strip().lower(): c for c in df.columns}
     
@@ -261,7 +261,7 @@ def process_imported_table(df: pd.DataFrame) -> pd.DataFrame:
         insured = str(row[insured_col]).strip() if insured_col and pd.notna(row[insured_col]) else f"Policyholder {idx + 1}"
         state_val = str(row[state_col]).strip() if state_col and pd.notna(row[state_col]) else ""
 
-        # Priority parsing: default to None (blank) if not specified or invalid
+        # Leave priority blank (None) on ingestion if missing/invalid
         prio_val = None
         if priority_col and pd.notna(row[priority_col]):
             val_str = str(row[priority_col]).strip()
@@ -389,12 +389,19 @@ def is_slot_conflicting(slot: Dict[str, Any], claims_df: pd.DataFrame, current_c
 
 # --- RECOMMENDATION ENGINE ---
 
-def get_recommendations_for_day(claims_df: pd.DataFrame, target_date_str: str) -> Optional[pd.DataFrame]:
+def get_recommendations_for_day(
+    claims_df: pd.DataFrame, 
+    target_date_str: str, 
+    status_filter: str = "Unscheduled"
+) -> Optional[pd.DataFrame]:
+    """
+    Returns prioritized recommendations filtered by status ('Unscheduled' or 'Scheduled').
+    """
     if claims_df is None or claims_df.empty:
         return None
 
-    unscheduled = claims_df[claims_df["status"] == "Unscheduled"].copy()
-    if unscheduled.empty:
+    filtered_claims = claims_df[claims_df["status"] == status_filter].copy()
+    if filtered_claims.empty:
         return None
 
     scheduled_day = claims_df[(claims_df["status"] == "Scheduled") & (claims_df["scheduled_date"] == target_date_str)]
@@ -411,17 +418,15 @@ def get_recommendations_for_day(claims_df: pd.DataFrame, target_date_str: str) -
     miles_list = []
     mins_list = []
 
-    for _, row in unscheduled.iterrows():
+    for _, row in filtered_claims.iterrows():
         miles, mins = get_osrm_route(anchor_lat, anchor_lon, row["lat"], row["lon"])
         miles_list.append(miles)
         mins_list.append(mins)
 
-    unscheduled["drive_miles"] = miles_list
-    unscheduled["drive_time_mins"] = mins_list
-    unscheduled["anchor_type"] = anchor_type
+    filtered_claims["drive_miles"] = miles_list
+    filtered_claims["drive_time_mins"] = mins_list
+    filtered_claims["anchor_type"] = anchor_type
 
-    # Convert priority column to numeric, using float('inf') for blank/None values
-    # so ranked priorities (1, 2, 3...) always sort ahead of unranked claims
     def clean_prio(val):
         if pd.isna(val) or val is None or str(val).strip() in ["", "nan", "None"]:
             return float("inf")
@@ -430,13 +435,13 @@ def get_recommendations_for_day(claims_df: pd.DataFrame, target_date_str: str) -
         except ValueError:
             return float("inf")
 
-    unscheduled["prio_sort_key"] = unscheduled["priority"].apply(clean_prio)
+    filtered_claims["prio_sort_key"] = filtered_claims["priority"].apply(clean_prio)
 
     # Sort FIRST by priority rank (1 -> 2 -> ... -> inf), SECOND by drive time
-    unscheduled = unscheduled.sort_values(by=["prio_sort_key", "drive_time_mins"], ascending=[True, True])
-    unscheduled = unscheduled.drop(columns=["prio_sort_key"])
+    filtered_claims = filtered_claims.sort_values(by=["prio_sort_key", "drive_time_mins"], ascending=[True, True])
+    filtered_claims = filtered_claims.drop(columns=["prio_sort_key"])
 
-    return unscheduled
+    return filtered_claims
 
 
 # --- ICS CALENDAR EXPORT ---
