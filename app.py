@@ -22,11 +22,35 @@ st.set_page_config(
 
 st.title("⚡ CAT Claims Inspection Scheduler")
 
-# --- SESSION STATE INITIALIZATION ---
+# --- INITIALIZE SESSION STATE ---
 if "claims_df" not in st.session_state:
     st.session_state["claims_df"] = None
 
-# --- MAIN PAGE FILE INGESTION (RESTORED) ---
+# --- SIDEBAR: REP PREFERENCES & CONFIGURATION ---
+st.sidebar.header("👤 Adjuster / Rep Preferences")
+
+rep_name = st.sidebar.text_input("Adjuster Name", value="Field Rep 1")
+rep_base_address = st.sidebar.text_input("Base / Hotel Address", value="San Antonio, TX")
+max_drive_miles = st.sidebar.number_input("Max Daily Drive Radius (Miles)", min_value=10, max_value=500, value=150, step=10)
+
+st.sidebar.markdown("---")
+st.sidebar.header("⚙️ Working Window Settings")
+
+working_days = st.sidebar.multiselect(
+    "Active Work Days",
+    ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
+    default=["Mon", "Tue", "Wed", "Thu", "Fri"]
+)
+
+inspections_per_day = st.sidebar.number_input("Max Inspections / Day", min_value=1, max_value=10, value=4)
+start_time_input = st.sidebar.time_input("First Slot Start Time", value=time(8, 0))
+window_hrs = st.sidebar.number_input("Inspection Window (Hours)", min_value=0.5, max_value=8.0, value=2.0, step=0.5)
+
+st.sidebar.markdown("---")
+if st.sidebar.button("🔄 Refresh Data & Sync", use_container_width=True):
+    st.rerun()
+
+# --- MAIN PAGE SECTION 1: FILE INGESTION ---
 st.subheader("1. File Ingestion")
 uploaded_file = st.file_uploader("Upload Claims File (CSV or Excel)", type=["csv", "xlsx", "xls"])
 
@@ -41,28 +65,15 @@ if uploaded_file is not None:
                 
                 processed_df = process_imported_table(raw_df)
                 st.session_state["claims_df"] = processed_df
-                st.success(f"Successfully loaded and geocoded {len(processed_df)} claims!")
+                st.success(f"Successfully loaded and geocoded {len(processed_df)} claims for {rep_name}!")
             except Exception as e:
                 st.error(f"Error processing file: {e}")
 
 st.markdown("---")
 
+# --- MAIN WORKFLOW (RUNS WHEN DATA IS LOADED) ---
 if st.session_state["claims_df"] is not None:
     df = st.session_state["claims_df"]
-
-    # --- SIDEBAR: SCHEDULING SETTINGS ONLY ---
-    st.sidebar.header("Working Window Settings")
-    working_days = st.sidebar.multiselect(
-        "Active Work Days",
-        ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
-        default=["Mon", "Tue", "Wed", "Thu", "Fri"]
-    )
-    inspections_per_day = st.sidebar.number_input("Inspections / Day", min_value=1, max_value=10, value=4)
-    start_time_input = st.sidebar.time_input("First Slot Start Time", value=time(8, 0))
-    window_hrs = st.sidebar.number_input("Inspection Window (Hours)", min_value=0.5, max_value=8.0, value=2.0, step=0.5)
-
-    if st.sidebar.button("🔄 Refresh Data & Priorities", use_container_width=True):
-        st.rerun()
 
     # --- MAIN PAGE SECTION 2: CLAIMS MASTER TABLE (DATA EDITOR) ---
     st.subheader("2. Claims Master List & Priority Rank")
@@ -73,7 +84,7 @@ if st.session_state["claims_df"] is not None:
         column_config={
             "priority": st.column_config.NumberColumn(
                 "Priority Rank",
-                help="1 = Highest priority. Blanks sort after all numerical ranks.",
+                help="1 = Highest priority. Blanks sort after numerical ranks.",
                 min_value=1,
                 max_value=100,
                 step=1,
@@ -153,7 +164,7 @@ if st.session_state["claims_df"] is not None:
                 st.session_state["claims_df"].at[idx, "end_time"] = chosen_slot["end"]
                 st.session_state["claims_df"].at[idx, "scheduled_date"] = chosen_slot["date_str"]
                 st.session_state["claims_df"].at[idx, "inspection_time"] = chosen_slot["slot_label"].split("|")[1].strip()
-                st.success(f"Scheduled {selected_claim['claim_id']}!")
+                st.success(f"Scheduled {selected_claim['claim_id']} for {rep_name}!")
                 st.rerun()
 
     st.markdown("---")
@@ -165,20 +176,25 @@ if st.session_state["claims_df"] is not None:
 
     rec_unscheduled = get_recommendations_for_day(df, target_date_str=rec_date_str, status_filter="Unscheduled")
     if rec_unscheduled is not None and not rec_unscheduled.empty:
-        st.dataframe(
-            rec_unscheduled[["priority", "claim_id", "insured_name", "drive_miles", "drive_time_mins", "full_address"]],
-            hide_index=True,
-            use_container_width=True
-        )
+        # Filter out recommendations exceeding the rep's max daily drive radius preference
+        within_radius = rec_unscheduled[rec_unscheduled["drive_miles"] <= max_drive_miles]
+        
+        if not within_radius.empty:
+            st.dataframe(
+                within_radius[["priority", "claim_id", "insured_name", "drive_miles", "drive_time_mins", "full_address"]],
+                hide_index=True,
+                use_container_width=True
+            )
+        else:
+            st.warning(f"No claims found within the configured {max_drive_miles}-mile radius.")
     else:
         st.info("No unscheduled claims found.")
 
     st.markdown("---")
 
-    # --- MAIN PAGE SECTION 5: INTERACTIVE CALENDAR & EXPORT (RESTORED) ---
-    st.subheader("5. Inspection Calendar")
+    # --- MAIN PAGE SECTION 5: INTERACTIVE CALENDAR & EXPORT ---
+    st.subheader(f"5. Inspection Calendar ({rep_name})")
     
-    # Build events for streamlit-calendar
     calendar_events = []
     scheduled_claims = df[df["status"] == "Scheduled"]
 
@@ -204,14 +220,13 @@ if st.session_state["claims_df"] is not None:
 
     calendar(events=calendar_events, options=calendar_options, key="inspection_calendar")
 
-    # Calendar Export
     st.subheader("Export Schedule")
     if not scheduled_claims.empty:
         ics_data = export_claims_to_ics(df)
         st.download_button(
             label="📥 Download .ics Calendar File",
             data=ics_data,
-            file_name=f"cat_inspection_schedule_{datetime.now().strftime('%Y%m%d')}.ics",
+            file_name=f"{rep_name.lower().replace(' ', '_')}_schedule_{datetime.now().strftime('%Y%m%d')}.ics",
             mime="text/calendar"
         )
     else:
