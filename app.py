@@ -14,37 +14,6 @@ from engine import (
 
 st.set_page_config(page_title="CAT Claims Dynamic Scheduler MVP", layout="wide")
 
-st.markdown("""
-    <style>
-        .stTabs [data-baseweb="tab-list"] {
-            gap: 12px;
-            background-color: #F1F5F9;
-            padding: 8px 12px;
-            border-radius: 12px;
-            border: 2px solid #CBD5E1;
-            margin-bottom: 20px;
-        }
-
-        .stTabs [data-baseweb="tab"] {
-            height: 48px;
-            font-weight: 700;
-            font-size: 1.05rem;
-            color: #334155;
-            border-radius: 8px;
-            padding: 0px 20px;
-            background-color: #FFFFFF;
-            border: 1px solid #E2E8F0;
-        }
-
-        .stTabs [aria-selected="true"] {
-            color: #FFFFFF !important;
-            background-color: #2563EB !important;
-            border-color: #1D4ED8 !important;
-            box-shadow: 0 4px 6px -1px rgba(37, 99, 235, 0.2);
-        }
-    </style>
-""", unsafe_allow_html=True)
-
 if "claims_df" not in st.session_state:
     st.session_state.claims_df = None
 
@@ -74,7 +43,7 @@ window_hrs = st.sidebar.number_input(
     max_value=8.00,
     value=2.50,
     step=0.25,
-    help="Adjustable by 15-minute increments (e.g. 1.25 = 1 hr 15 min, 2.50 = 2 hr 30 min)"
+    help="Adjustable by 15-minute increments"
 )
 
 start_time_input = st.sidebar.time_input("Day Start Time", value=datetime.strptime("08:00", "%H:%M").time())
@@ -83,11 +52,30 @@ all_slots = generate_available_slots(
     start_date, end_date, active_days, inspections_per_day, start_time_input, window_hrs
 )
 
+# --- SESSION SAVE / LOAD PROGRESS ---
 st.sidebar.markdown("---")
+st.sidebar.subheader("💾 Save / Resume Progress")
+if st.session_state.claims_df is not None:
+    csv_bytes = st.session_state.claims_df.to_csv(index=False).encode('utf-8')
+    st.sidebar.download_button(
+        label="📥 Save Progress (Download State)",
+        data=csv_bytes,
+        file_name=f"cat_scheduler_state_{date.today().strftime('%Y%m%d')}.csv",
+        mime="text/csv"
+    )
+
+saved_file = st.sidebar.file_uploader("📂 Load Saved State CSV", type=["csv"], key="load_state_csv")
+if saved_file is not None:
+    try:
+        loaded_df = pd.read_csv(saved_file)
+        st.session_state.claims_df = loaded_df
+        st.sidebar.success("Progress restored!")
+    except Exception as e:
+        st.sidebar.error(f"Error loading state: {e}")
 
 # --- INGESTION ---
 st.subheader("1. Ingest Claims List")
-uploaded_file = st.file_uploader("Upload CSV or Excel file (Header names auto-detected)", type=["csv", "xlsx"])
+uploaded_file = st.file_uploader("Upload CSV or Excel file", type=["csv", "xlsx"])
 
 if uploaded_file is not None and st.session_state.claims_df is None:
     try:
@@ -126,23 +114,24 @@ if st.session_state.claims_df is not None:
         )
         st.markdown(" ")
 
-    tab_cal, tab_map = st.tabs(["📅 CALENDAR VIEW", "🛰️ SATELLITE MAP VIEW"])
+    tab_cal, tab_map = st.tabs(["📅 CALENDAR VIEW", "🛰️️ SATELLITE MAP VIEW"])
 
     with tab_cal:
-        st.caption("Click any scheduled claim event to select it for management below.")
+        st.caption("Drag/drop or resize blocks to update inspection times. Overlapping appointments are enabled.")
         
         calendar_events = []
         scheduled_claims = df[df["status"] == "Scheduled"]
         
         for idx, row in scheduled_claims.iterrows():
-            calendar_events.append({
-                "id": str(row["claim_id"]),
-                "title": f"[{row['claim_id']}] {row['insured_name']}",
-                "start": str(row["start_time"]),
-                "end": str(row["end_time"]),
-                "backgroundColor": "#2563EB",
-                "borderColor": "#1D4ED8"
-            })
+            if pd.notna(row["start_time"]) and pd.notna(row["end_time"]):
+                calendar_events.append({
+                    "id": str(row["claim_id"]),
+                    "title": f"[{row['claim_id']}] {row['insured_name']}",
+                    "start": str(row["start_time"]),
+                    "end": str(row["end_time"]),
+                    "backgroundColor": "#2563EB",
+                    "borderColor": "#1D4ED8"
+                })
 
         calendar_options = {
             "headerToolbar": {
@@ -153,29 +142,51 @@ if st.session_state.claims_df is not None:
             "initialView": "timeGridWeek",
             "initialDate": start_date.strftime("%Y-%m-%d"),
             "slotMinTime": start_time_input.strftime("%H:%M:%S"),
-            "slotMaxTime": "20:00:00",
+            "slotMaxTime": "21:00:00",
             "editable": True,
+            "selectable": True,
+            "slotEventOverlap": True
         }
 
         cal_event = calendar(events=calendar_events, options=calendar_options, key="claims_calendar")
         
+        # Drag/Drop & Resize Sync Handler
+        if cal_event.get("eventChange"):
+            changed_event = cal_event["eventChange"]["event"]
+            cid = str(changed_event["id"])
+            new_start = changed_event["start"]
+            new_end = changed_event["end"]
+            
+            c_mask = st.session_state.claims_df["claim_id"] == cid
+            st.session_state.claims_df.loc[c_mask, "start_time"] = new_start
+            st.session_state.claims_df.loc[c_mask, "end_time"] = new_end
+            st.session_state.claims_df.loc[c_mask, "scheduled_date"] = new_start.split("T")[0]
+            st.toast(f"Updated time for claim {cid}!")
+            st.rerun()
+
         if cal_event.get("eventClick"):
             clicked_id = cal_event["eventClick"]["event"]["id"]
             st.info(f"Selected claim from calendar: **{clicked_id}**")
             st.session_state["selected_claim_id"] = clicked_id
 
     with tab_map:
-        st.caption("🔴 Red markers = Unscheduled Claims | 🎨 Colored markers = Scheduled on same date")
+        st.caption("🔴 Red markers = Unscheduled Claims | 🎨 Colored markers = Scheduled on same date (Default: ESRI Satellite)")
         
         esri_satellite_url = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
         
+        # Center map on average lat/lon of claims
+        avg_lat = df["lat"].mean() if not df.empty else 29.4241
+        avg_lon = df["lon"].mean() if not df.empty else -98.4936
+
         m = folium.Map(
-            location=[29.4241, -98.4936],
+            location=[avg_lat, avg_lon],
             zoom_start=11,
             tiles=esri_satellite_url,
-            attr="Esri, Maxar, Earthstar Geographics"
+            attr="Esri, Maxar, Earthstar Geographics",
+            name="ESRI Satellite"
         )
         
+        # Keep OpenStreetMap as a secondary toggle option
         folium.TileLayer('OpenStreetMap', name='Street View').add_to(m)
         
         day_colors = ["blue", "green", "purple", "orange", "darkred", "cadetblue", "darkgreen", "pink"]
@@ -215,27 +226,47 @@ if st.session_state.claims_df is not None:
         st.subheader("📋 Active Claims Pool")
         
         show_status = st.multiselect("Filter Status View", ["Unscheduled", "Scheduled", "Ignored"], default=["Unscheduled", "Scheduled"])
-        filtered_df = df[df["status"].isin(show_status)]
+        filtered_df = df[df["status"].isin(show_status)].copy()
         
-        st.caption("Double-click the 'priority' column (1=Urgent, 5=Low) to adjust precedence directly.")
+        st.caption("Manually enter 'scheduled_date' (YYYY-MM-DD) and 'inspection_time' (HH:MM) to directly schedule from table.")
         
         edited_df = st.data_editor(
-            filtered_df[["claim_id", "insured_name", "full_address", "priority", "status"]],
+            filtered_df[["claim_id", "insured_name", "full_address", "priority", "status", "scheduled_date", "inspection_time"]],
             key="claims_editor",
-            disabled=["claim_id", "insured_name", "full_address", "status"],
+            disabled=["claim_id", "insured_name", "full_address"],
             use_container_width=True
         )
         
-        priority_changed = False
+        table_updated = False
         for idx, row in edited_df.iterrows():
             cid = row["claim_id"]
-            current_val = st.session_state.claims_df.loc[st.session_state.claims_df["claim_id"] == cid, "priority"].values[0]
-            if current_val != row["priority"]:
-                st.session_state.claims_df.loc[st.session_state.claims_df["claim_id"] == cid, "priority"] = row["priority"]
-                priority_changed = True
+            c_mask = st.session_state.claims_df["claim_id"] == cid
+            
+            # Sync priority
+            orig_prio = st.session_state.claims_df.loc[c_mask, "priority"].values[0]
+            if orig_prio != row["priority"]:
+                st.session_state.claims_df.loc[c_mask, "priority"] = row["priority"]
+                table_updated = True
 
-        if priority_changed:
-            st.toast("Priorities updated!")
+            # Sync manual Date / Time entry
+            new_date = str(row["scheduled_date"]) if pd.notna(row["scheduled_date"]) else ""
+            new_time = str(row["inspection_time"]) if pd.notna(row["inspection_time"]) else ""
+            
+            if new_date and new_time and (new_date != "None") and (new_time != "None"):
+                try:
+                    s_dt = datetime.strptime(f"{new_date} {new_time}", "%Y-%m-%d %H:%M")
+                    e_dt = s_dt + timedelta(hours=window_hrs)
+                    
+                    st.session_state.claims_df.loc[c_mask, "status"] = "Scheduled"
+                    st.session_state.claims_df.loc[c_mask, "scheduled_date"] = new_date
+                    st.session_state.claims_df.loc[c_mask, "start_time"] = s_dt.isoformat()
+                    st.session_state.claims_df.loc[c_mask, "end_time"] = e_dt.isoformat()
+                    table_updated = True
+                except ValueError:
+                    pass
+
+        if table_updated:
+            st.toast("Active Claims Pool updated!")
             st.rerun()
 
     selected_target_date_str = start_date.strftime("%Y-%m-%d")
@@ -270,24 +301,26 @@ if st.session_state.claims_df is not None:
                 st.warning("⚠️ Claim assigned to slot. Unassign before deleting or archiving.")
                 
                 if current_claim["scheduled_date"]:
-                    selected_target_date_str = current_claim["scheduled_date"]
+                    selected_target_date_str = str(current_claim["scheduled_date"])
 
                 if st.button("Remove from Schedule", type="primary"):
                     st.session_state.claims_df.loc[claim_mask, "status"] = "Unscheduled"
                     st.session_state.claims_df.loc[claim_mask, "start_time"] = None
                     st.session_state.claims_df.loc[claim_mask, "end_time"] = None
                     st.session_state.claims_df.loc[claim_mask, "scheduled_date"] = None
+                    st.session_state.claims_df.loc[claim_mask, "inspection_time"] = ""
                     st.success("Claim removed from slot!")
                     st.rerun()
 
             elif current_claim["status"] in ["Unscheduled", "Ignored"]:
                 st.markdown("#### Assign to Calendar Slot Window")
                 
+                # Dynamic slot calculation based on calendar state
                 unbooked_slots = [s for s in all_slots if not is_slot_conflicting(s, st.session_state.claims_df, current_claim_id=selected_claim_id)]
                 
                 if unbooked_slots:
                     slot_labels = [s["slot_label"] for s in unbooked_slots]
-                    selected_slot_label = st.selectbox("Choose Open Inspection Slot", slot_labels)
+                    selected_slot_label = st.selectbox("Choose Open Slot (Defaults to Next Available)", slot_labels, index=0)
                     
                     chosen_slot = next(s for s in unbooked_slots if s["slot_label"] == selected_slot_label)
                     selected_target_date_str = chosen_slot["date_str"]
@@ -297,6 +330,10 @@ if st.session_state.claims_df is not None:
                         st.session_state.claims_df.loc[claim_mask, "start_time"] = chosen_slot["start"]
                         st.session_state.claims_df.loc[claim_mask, "end_time"] = chosen_slot["end"]
                         st.session_state.claims_df.loc[claim_mask, "scheduled_date"] = chosen_slot["date_str"]
+                        
+                        start_dt = datetime.fromisoformat(chosen_slot["start"])
+                        st.session_state.claims_df.loc[claim_mask, "inspection_time"] = start_dt.strftime("%H:%M")
+                        
                         st.success(f"Locked {selected_claim_id} into {selected_slot_label}")
                         st.rerun()
                 else:
