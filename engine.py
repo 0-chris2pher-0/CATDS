@@ -811,6 +811,121 @@ def generate_available_slots(
     return slots
 
 
+# --- FLEXIBLE AVAILABILITY ---
+# Each inspection day is a working window (day start time + inspections per day x window
+# length). Open time is whatever the actual bookings leave free, so shortening or moving
+# an inspection immediately opens earlier time. Starts snap to 15-minute steps.
+
+STEP_MINUTES = 15
+_DAY_ABBR = {0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri", 5: "Sat", 6: "Sun"}
+
+
+def round_up_to_step(dt: datetime, step_min: int = STEP_MINUTES) -> datetime:
+    dt = dt.replace(second=0, microsecond=0)
+    extra = dt.minute % step_min
+    return dt + timedelta(minutes=step_min - extra) if extra else dt
+
+
+def day_window(day: date, day_start_time: Any, inspections_per_day: int, window_hrs: float,
+               latest_end: Any = None) -> Tuple[datetime, datetime]:
+    """
+    The usual working day: start time + inspections per day x window length,
+    never later than latest_end (e.g. 7 PM). Suggested openings stay inside it.
+    Reps can still book later by hand.
+    """
+    start = datetime.combine(day, day_start_time)
+    end = start + timedelta(hours=inspections_per_day * window_hrs)
+    if latest_end is not None:
+        end = min(end, datetime.combine(day, latest_end))
+    return start, max(start, end)
+
+
+def get_busy_intervals(claims_df: Optional[pd.DataFrame], exclude_claim_id: Any = None) -> List[Dict[str, Any]]:
+    """Booked inspections as {start, end, claim_id, label}, optionally leaving one claim out."""
+    busy = []
+    if claims_df is None or claims_df.empty or "status" not in claims_df.columns:
+        return busy
+    for _, r in claims_df[claims_df["status"] == "Scheduled"].iterrows():
+        if exclude_claim_id is not None and str(r["claim_id"]) == str(exclude_claim_id):
+            continue
+        s, e = parse_wallclock(r.get("start_time")), parse_wallclock(r.get("end_time"))
+        if s and e and e > s:
+            busy.append({"start": s, "end": e, "claim_id": str(r["claim_id"]),
+                         "label": f"{r['claim_id']} - {r.get('insured_name', '')}"})
+    return busy
+
+
+def compute_day_gaps(day: date, day_start_time: Any, inspections_per_day: int, window_hrs: float,
+                     busy: List[Dict[str, Any]], now: Optional[datetime] = None,
+                     latest_end: Any = None) -> List[Tuple[datetime, datetime]]:
+    """Free time inside the day's working window, after bookings and (today) the current time."""
+    ws, we = day_window(day, day_start_time, inspections_per_day, window_hrs, latest_end)
+    cursor = ws
+    if now and now > cursor:
+        cursor = round_up_to_step(now)
+    if cursor >= we:
+        return []
+    blocks = sorted((max(b["start"], ws), min(b["end"], we)) for b in busy if b["start"] < we and b["end"] > ws)
+    gaps = []
+    for s, e in blocks:
+        if s > cursor:
+            gaps.append((cursor, s))
+        cursor = max(cursor, e)
+    if cursor < we:
+        gaps.append((cursor, we))
+    out = []
+    for g0, g1 in gaps:
+        g0 = round_up_to_step(g0)
+        if g1 - g0 >= timedelta(minutes=STEP_MINUTES):
+            out.append((g0, g1))
+    return out
+
+
+def _slot_dict(s_dt: datetime, e_dt: datetime) -> Dict[str, Any]:
+    date_str = s_dt.strftime("%Y-%m-%d")
+    time_label = f"{s_dt.strftime('%I:%M %p')} - {e_dt.strftime('%I:%M %p')}"
+    return {
+        "slot_label": f"{date_str} ({_DAY_ABBR[s_dt.weekday()]}) | {time_label}",
+        "date_str": date_str,
+        "start": s_dt.isoformat(),
+        "end": e_dt.isoformat(),
+    }
+
+
+def compute_openings(start_date: date, end_date: date, active_days: List[str], day_start_time: Any,
+                     inspections_per_day: int, window_hrs: float, claims_df: Optional[pd.DataFrame],
+                     now: Optional[datetime] = None, exclude_claim_id: Any = None,
+                     latest_end: Any = None) -> List[Dict[str, Any]]:
+    """
+    Suggested openings: inside each free gap, back-to-back blocks of the default window
+    length, starting at the earliest free time. Example: day 8:00-3:30, 2.5 h windows,
+    an inspection shortened to 8:00-9:30 -> openings at 9:30 and 12:00.
+    Same shape as generate_available_slots, so the rest of the app can use either.
+    """
+    busy = get_busy_intervals(claims_df, exclude_claim_id)
+    duration = timedelta(hours=window_hrs)
+    openings = []
+    day = start_date
+    while day <= end_date:
+        if _DAY_ABBR[day.weekday()] in active_days:
+            for g0, g1 in compute_day_gaps(day, day_start_time, inspections_per_day, window_hrs, busy, now, latest_end):
+                t = g0
+                while t + duration <= g1:
+                    openings.append(_slot_dict(t, t + duration))
+                    t += duration
+        day += timedelta(days=1)
+    return openings
+
+
+def make_slot(start_dt: datetime, duration_hrs: float) -> Dict[str, Any]:
+    """A custom booking at any start time and length."""
+    return _slot_dict(start_dt, start_dt + timedelta(hours=duration_hrs))
+
+
+def find_overlap(start_dt: datetime, end_dt: datetime, busy: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    return next((b for b in busy if max(start_dt, b["start"]) < min(end_dt, b["end"])), None)
+
+
 def is_slot_conflicting(slot: Dict[str, Any], claims_df: pd.DataFrame, current_claim_id: str) -> bool:
     if claims_df is None or claims_df.empty:
         return False
