@@ -31,7 +31,6 @@ st.sidebar.header("👤 Adjuster / Rep Preferences")
 
 rep_name = st.sidebar.text_input("Adjuster Name", value="Field Rep 1")
 rep_base_address = st.sidebar.text_input("Base / Hotel Address", value="San Antonio, TX")
-max_drive_miles = st.sidebar.number_input("Max Daily Drive Radius (Miles)", min_value=10, max_value=500, value=150, step=10)
 
 st.sidebar.markdown("---")
 st.sidebar.header("⚙️ Working Window Settings")
@@ -176,17 +175,11 @@ if st.session_state["claims_df"] is not None:
 
     rec_unscheduled = get_recommendations_for_day(df, target_date_str=rec_date_str, status_filter="Unscheduled")
     if rec_unscheduled is not None and not rec_unscheduled.empty:
-        # Filter out recommendations exceeding the rep's max daily drive radius preference
-        within_radius = rec_unscheduled[rec_unscheduled["drive_miles"] <= max_drive_miles]
-        
-        if not within_radius.empty:
-            st.dataframe(
-                within_radius[["priority", "claim_id", "insured_name", "drive_miles", "drive_time_mins", "full_address"]],
-                hide_index=True,
-                use_container_width=True
-            )
-        else:
-            st.warning(f"No claims found within the configured {max_drive_miles}-mile radius.")
+        st.dataframe(
+            rec_unscheduled[["priority", "claim_id", "insured_name", "drive_miles", "drive_time_mins", "full_address"]],
+            hide_index=True,
+            use_container_width=True
+        )
     else:
         st.info("No unscheduled claims found.")
 
