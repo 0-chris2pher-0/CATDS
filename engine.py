@@ -1,474 +1,322 @@
-import re
-import time
-import io
-import requests
-import pandas as pd
-import numpy as np
 import streamlit as st
+import pandas as pd
+import folium
+from streamlit_folium import st_folium
 from datetime import datetime, date, timedelta
-from typing import List, Dict, Any, Optional, Tuple
+from streamlit_calendar import calendar
+from engine import (
+    process_imported_table,
+    generate_available_slots,
+    get_recommendations_for_day,
+    export_claims_to_ics,
+    is_slot_conflicting,
+    batch_geocode_addresses
+)
 
-# --- OPTION 4: US CENSUS BATCH & STRUCTURED GEOCODING UTILITIES ---
+st.set_page_config(page_title="CAT Claims Dynamic Scheduler MVP", layout="wide")
 
-def parse_us_address(address_str: str, fallback_state: str = "") -> Tuple[str, str, str, str]:
-    """
-    Parses a raw address string into (Street, City, State, Zip) components.
-    """
-    clean_addr = str(address_str).strip()
-    if not clean_addr or clean_addr.lower() == "nan":
-        return "", "", fallback_state, ""
+if "claims_df" not in st.session_state:
+    st.session_state.claims_df = None
 
-    parts = [p.strip() for p in clean_addr.split(",") if p.strip()]
-    street, city, state, zip_code = "", "", fallback_state, ""
+st.title("CAT Dynamic Scheduling")
 
-    if len(parts) >= 3:
-        street = parts[0]
-        city = parts[1]
-        state_zip_part = parts[2].split()
-        if len(state_zip_part) >= 1:
-            state = state_zip_part[0]
-        if len(state_zip_part) >= 2:
-            zip_code = state_zip_part[1]
-    elif len(parts) == 2:
-        street = parts[0]
-        city_st = parts[1].split()
-        if len(city_st) >= 1:
-            city = city_st[0]
-        if len(city_st) >= 2:
-            state = city_st[1]
-    else:
-        street = clean_addr
+# --- SIDEBAR PREFERENCES ---
+st.sidebar.header("🗓️ Rep Schedule Parameters")
+hotel_address = st.sidebar.text_input("Hotel Base Location", "1100 San Pedro Ave, San Antonio, TX")
 
-    return street, city, state, zip_code
+col_d1, col_d2 = st.sidebar.columns(2)
+with col_d1:
+    start_date = st.sidebar.date_input("Inspection Start", date.today())
+with col_d2:
+    end_date = st.sidebar.date_input("Inspection End", date.today() + timedelta(days=5))
 
+active_days = st.sidebar.multiselect(
+    "Active Inspection Days",
+    ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
+    default=["Mon", "Tue", "Wed", "Thu", "Fri"]
+)
 
-def census_batch_geocode(parsed_addresses: List[Tuple[int, str, str, str, str]]) -> Dict[int, Tuple[float, float]]:
-    """
-    Sends structured addresses to the US Census Bureau Batch Geocoder in a single request.
-    Returns a mapping of row_index -> (lat, lon).
-    """
-    if not parsed_addresses:
-        return {}
+inspections_per_day = st.sidebar.slider("Inspections / Day", 1, 8, 3)
 
-    csv_buffer = io.StringIO()
-    for row_id, street, city, state, zip_code in parsed_addresses:
-        s_clean = street.replace('"', '')
-        c_clean = city.replace('"', '')
-        st_clean = state.replace('"', '')
-        z_clean = zip_code.replace('"', '')
-        csv_buffer.write(f'"{row_id}","{s_clean}","{c_clean}","{st_clean}","{z_clean}"\n')
+window_hrs = st.sidebar.number_input(
+    "Window Duration (Hours)",
+    min_value=0.25,
+    max_value=8.00,
+    value=2.50,
+    step=0.25
+)
 
-    csv_buffer.seek(0)
+start_time_input = st.sidebar.time_input("Day Start Time", value=datetime.strptime("08:00", "%H:%M").time())
 
-    results = {}
+all_slots = generate_available_slots(
+    start_date, end_date, active_days, inspections_per_day, start_time_input, window_hrs
+)
+
+# --- MANUAL GEOMAP REFRESH & STATE MANAGEMENT ---
+st.sidebar.markdown("---")
+st.sidebar.subheader("🗺️ Map Tools & State")
+
+if st.session_state.claims_df is not None:
+    if st.sidebar.button("🔄 Force Re-Geocode & Map Refresh", type="secondary"):
+        with st.spinner("Re-geocoding all claim addresses sequentially..."):
+            addrs = list(zip(
+                st.session_state.claims_df["full_address"].tolist(),
+                st.session_state.claims_df.get("state", pd.Series([""] * len(st.session_state.claims_df))).tolist()
+            ))
+            new_coords = batch_geocode_addresses(addrs)
+            st.session_state.claims_df["lat"] = [c[0] for c in new_coords]
+            st.session_state.claims_df["lon"] = [c[1] for c in new_coords]
+            st.sidebar.success("Map re-geocoded successfully!")
+            st.rerun()
+
+    st.sidebar.markdown(" ")
+    csv_bytes = st.session_state.claims_df.to_csv(index=False).encode('utf-8')
+    st.sidebar.download_button(
+        label="📥 Save Progress (Download State)",
+        data=csv_bytes,
+        file_name=f"cat_scheduler_state_{date.today().strftime('%Y%m%d')}.csv",
+        mime="text/csv"
+    )
+
+saved_file = st.sidebar.file_uploader("📂 Load Saved State CSV", type=["csv"], key="load_state_csv")
+if saved_file is not None:
     try:
-        url = "https://geocoding.geo.census.gov/geocoder/locations/addressbatch"
-        files = {
-            'addressFile': ('addresses.csv', csv_buffer.getvalue(), 'text/csv')
-        }
-        data = {
-            'benchmark': 'Public_AR_Current',
-            'vintage': 'Current_Current'
-        }
-        
-        response = requests.post(url, files=files, data=data, timeout=30)
-        
-        if response.status_code == 200:
-            lines = response.text.strip().split("\n")
-            for line in lines:
-                parts = [p.strip('"') for p in line.split('","')]
-                if len(parts) >= 6:
-                    row_id_str = parts[0].strip('"')
-                    match_status = parts[2].strip('"')
-                    
-                    if match_status == "Match" and len(parts) >= 6:
-                        coords_str = parts[5].strip('"')
-                        if "," in coords_str:
-                            lon_str, lat_str = coords_str.split(",")
-                            try:
-                                row_id = int(row_id_str)
-                                results[row_id] = (float(lat_str), float(lon_str))
-                            except ValueError:
-                                pass
+        loaded_df = pd.read_csv(saved_file)
+        st.session_state.claims_df = loaded_df
+        st.sidebar.success("Progress restored!")
     except Exception as e:
-        st.warning(f"US Census Batch API request failed: {e}")
+        st.sidebar.error(f"Error loading state: {e}")
 
-    return results
+# --- INGESTION ---
+st.subheader("1. Ingest Claims List")
+uploaded_file = st.file_uploader("Upload CSV or Excel file", type=["csv", "xlsx"])
 
-
-@st.cache_data(show_spinner=False)
-def geocode_single_address_fallback(address: str, state: str = None) -> Tuple[float, float]:
-    """
-    Fallback single-address lookup using Nominatim for rows missed by Census batch.
-    """
-    clean_addr = str(address).strip()
-    if not clean_addr or clean_addr.lower() == "nan":
-        return 29.4241 + np.random.uniform(-0.02, 0.02), -98.4936 + np.random.uniform(-0.02, 0.02)
-
+if uploaded_file is not None and st.session_state.claims_df is None:
     try:
-        url = "https://nominatim.openstreetmap.org/search"
-        params = {
-            "q": clean_addr,
-            "format": "json",
-            "limit": 1,
-            "countrycodes": "us"
-        }
-        if state and str(state).strip() and str(state).lower() != "nan":
-            params["state"] = str(state).strip()
+        with st.spinner("Parsing table and batch-geocoding addresses..."):
+            raw_df = pd.read_csv(uploaded_file) if uploaded_file.name.endswith(".csv") else pd.read_excel(uploaded_file)
+            st.session_state.claims_df = process_imported_table(raw_df)
+            st.success(f"Successfully imported and mapped {len(st.session_state.claims_df)} claims!")
+            st.rerun()
+    except Exception as e:
+        st.error(f"Error parsing table: {e}")
 
-        headers = {"User-Agent": "CATClaimsSchedulerApp/4.0 (contact@example.com)"}
-        resp = requests.get(url, params=params, headers=headers, timeout=6)
-        if resp.status_code == 200:
-            data = resp.json()
-            if data and len(data) > 0:
-                return float(data[0]["lat"]), float(data[0]["lon"])
-    except Exception:
-        pass
+# --- DASHBOARD ---
+if st.session_state.claims_df is not None:
+    for required_col in ["scheduled_date", "inspection_time", "start_time", "end_time"]:
+        if required_col not in st.session_state.claims_df.columns:
+            st.session_state.claims_df[required_col] = ""
 
-    return 29.4241 + np.random.uniform(-0.02, 0.02), -98.4936 + np.random.uniform(-0.02, 0.02)
+    df = st.session_state.claims_df
 
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Claims", len(df))
+    c2.metric("Unscheduled", len(df[df["status"] == "Unscheduled"]))
+    scheduled_count = len(df[df["status"] == "Scheduled"])
+    c3.metric("Scheduled / Confirmed", scheduled_count)
+    c4.metric("Ignored / Archived", len(df[df["status"] == "Ignored"]))
 
-def batch_geocode_addresses(address_state_list: List[Tuple[str, Optional[str]]]) -> List[Tuple[float, float]]:
-    """
-    Fast, hybrid geocoding: US Census Batch API (instant) with single-address fallbacks.
-    """
-    total = len(address_state_list)
-    if total == 0:
-        return []
+    st.markdown("---")
 
-    progress_bar = st.progress(0, text="Standardizing & geocoding addresses via US Census API...")
+    if scheduled_count > 0:
+        ics_data = export_claims_to_ics(df)
+        st.download_button(
+            label=f"📅 Export {scheduled_count} Scheduled Inspection(s) to Outlook (.ics)",
+            data=ics_data,
+            file_name="cat_inspection_schedule.ics",
+            mime="text/calendar"
+        )
+        st.markdown(" ")
 
-    parsed_items = []
-    for idx, item in enumerate(address_state_list):
-        if isinstance(item, tuple):
-            addr, st_val = item
-        else:
-            addr, st_val = item, ""
+    tab_cal, tab_map = st.tabs(["📅 CALENDAR VIEW", "🛰 SATELLITE MAP VIEW"])
+
+    with tab_cal:
+        calendar_events = []
+        scheduled_claims = df[df["status"] == "Scheduled"]
         
-        street, city, state, zip_code = parse_us_address(addr, fallback_state=st_val or "")
-        parsed_items.append((idx, street, city, state, zip_code))
-
-    census_results = census_batch_geocode(parsed_items)
-    progress_bar.progress(0.7, text="Processing Census matches & executing fallbacks...")
-
-    final_coords = []
-    for idx, item in enumerate(address_state_list):
-        if idx in census_results:
-            final_coords.append(census_results[idx])
-        else:
-            addr = item[0] if isinstance(item, tuple) else item
-            st_val = item[1] if isinstance(item, tuple) else None
-            coords = geocode_single_address_fallback(addr, state=st_val)
-            final_coords.append(coords)
-            time.sleep(1.0)
-
-    progress_bar.empty()
-    return final_coords
-
-
-def get_osrm_route(start_lat: float, start_lon: float, end_lat: float, end_lon: float) -> Tuple[float, float]:
-    """
-    Calculates driving distance (miles) and duration (minutes) between two points using OSRM.
-    Fallback to Haversine approximation if service is unreachable.
-    """
-    try:
-        url = f"http://router.project-osrm.org/route/v1/driving/{start_lon},{start_lat};{end_lon},{end_lat}"
-        params = {"overview": "false"}
-        resp = requests.get(url, params=params, timeout=3)
-        if resp.status_code == 200:
-            data = resp.json()
-            if "routes" in data and len(data["routes"]) > 0:
-                meters = data["routes"][0]["distance"]
-                seconds = data["routes"][0]["duration"]
-                miles = round(meters / 1609.34, 1)
-                minutes = int(round(seconds / 60.0))
-                return miles, minutes
-    except Exception:
-        pass
-
-    R = 3958.8
-    dlat = np.radians(end_lat - start_lat)
-    dlon = np.radians(end_lon - start_lon)
-    a = np.sin(dlat / 2)**2 + np.cos(np.radians(start_lat)) * np.cos(np.radians(end_lat)) * np.sin(dlon / 2)**2
-    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
-    miles = round(R * c, 1)
-    minutes = int(round(miles * 2.0))
-    return miles, minutes
-
-
-# --- TABLE INGESTION & PARSING ---
-
-def process_imported_table(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Processes imported CSV/Excel dataframe by detecting formatted claim IDs,
-    insured names, full addresses, and priority ranks (leaving blank if unspecified).
-    """
-    col_map = {str(c).strip().lower(): c for c in df.columns}
-    
-    claim_col = None
-    insured_col = None
-    street_col = None
-    city_col = None
-    state_col = None
-    zip_col = None
-    full_addr_col = None
-    priority_col = None
-
-    claim_pattern = re.compile(r'^[A-Za-z]{2,5}\d+[\-\_]?\d*$', re.IGNORECASE)
-    
-    for c in df.columns:
-        sample_vals = df[c].dropna().astype(str).str.strip().tolist()[:10]
-        if any(claim_pattern.match(val) for val in sample_vals):
-            claim_col = c
-            break
-
-    if not claim_col:
-        for low_c, orig_c in col_map.items():
-            if any(k in low_c for k in ["claim", "file", "policy"]):
-                claim_col = orig_c
-                break
-
-    for low_c, orig_c in col_map.items():
-        if any(k == low_c for k in ["full address", "full_address", "loss address", "property address", "location address", "site address", "address"]):
-            full_addr_col = orig_c
-            break
-
-    for low_c, orig_c in col_map.items():
-        if not insured_col and any(k in low_c for k in ["insured", "customer", "policyholder", "client", "name"]):
-            insured_col = orig_c
-        elif not street_col and any(k in low_c for k in ["street", "address 1", "addr1", "address_line_1", "loss_street", "property_street", "location", "site"]):
-            if "state" not in low_c and low_c != "st":
-                street_col = orig_c
-        elif not city_col and any(k in low_c for k in ["town", "city", "municipality", "village"]):
-            city_col = orig_c
-        elif not state_col and (low_c in ["state", "st", "province"] or "state" in low_c):
-            state_col = orig_c
-        elif not zip_col and any(k in low_c for k in ["zip", "postal", "zipcode", "zip_code"]):
-            zip_col = orig_c
-        elif not priority_col and any(k in low_c for k in ["priority", "rank", "prio"]):
-            priority_col = orig_c
-
-    address_list = []
-    metadata = []
-
-    for idx, row in df.iterrows():
-        if claim_col and pd.notna(row[claim_col]) and str(row[claim_col]).strip() != "":
-            raw_claim = str(row[claim_col]).strip()
-            claim_num = raw_claim[:-2] if raw_claim.endswith(".0") else raw_claim
-        else:
-            claim_num = f"CLM-{idx + 1001}"
-
-        insured = str(row[insured_col]).strip() if insured_col and pd.notna(row[insured_col]) else f"Policyholder {idx + 1}"
-        state_val = str(row[state_col]).strip() if state_col and pd.notna(row[state_col]) else ""
-
-        # Priority parsing: default to None (blank) if not specified or invalid
-        prio_val = None
-        if priority_col and pd.notna(row[priority_col]):
-            val_str = str(row[priority_col]).strip()
-            if val_str and val_str.lower() != "nan":
-                try:
-                    prio_val = int(float(val_str))
-                except ValueError:
-                    prio_val = None
-
-        if full_addr_col and pd.notna(row[full_addr_col]) and str(row[full_addr_col]).strip() != "":
-            full_address = str(row[full_addr_col]).strip()
-        else:
-            street_val = str(row[street_col]).strip() if street_col and pd.notna(row[street_col]) else ""
-            city_val = str(row[city_col]).strip() if city_col and pd.notna(row[city_col]) else ""
-            zip_val = str(row[zip_col]).strip() if zip_col and pd.notna(row[zip_col]) else ""
-
-            city_state_zip = " ".join(filter(None, [f"{city_val}, {state_val}".strip(", "), zip_val]))
-            if street_val:
-                full_address = f"{street_val}, {city_state_zip}".strip(", ")
-            elif city_state_zip:
-                full_address = city_state_zip
-            else:
-                full_address = ", ".join([str(v).strip() for v in row.values if pd.notna(v) and str(v).strip() != ""])
-
-        has_coords = "lat" in df.columns and "lon" in df.columns and pd.notna(row["lat"]) and pd.notna(row["lon"])
-        pre_lat = float(row["lat"]) if has_coords else None
-        pre_lon = float(row["lon"]) if has_coords else None
-
-        address_list.append(full_address)
-        metadata.append({
-            "claim_id": claim_num,
-            "insured_name": insured,
-            "display_label": f"{claim_num} - {insured}",
-            "full_address": full_address,
-            "state": state_val,
-            "priority": prio_val,
-            "status": "Unscheduled",
-            "start_time": None,
-            "end_time": None,
-            "scheduled_date": "",
-            "inspection_time": "",
-            "pre_lat": pre_lat,
-            "pre_lon": pre_lon
-        })
-
-    addrs_to_geocode = [
-        (m["full_address"], m["state"]) for m in metadata if m["pre_lat"] is None
-    ]
-    geocoded_coords = batch_geocode_addresses(addrs_to_geocode) if addrs_to_geocode else []
-
-    geo_idx = 0
-    processed_rows = []
-    for m in metadata:
-        if m["pre_lat"] is not None:
-            lat, lon = m["pre_lat"], m["pre_lon"]
-        else:
-            lat, lon = geocoded_coords[geo_idx]
-            geo_idx += 1
-
-        row_dict = dict(m)
-        del row_dict["pre_lat"]
-        del row_dict["pre_lon"]
-        row_dict["lat"] = lat
-        row_dict["lon"] = lon
-        processed_rows.append(row_dict)
-
-    return pd.DataFrame(processed_rows)
-
-
-# --- SLOT GENERATION & CONFLICT CHECKING ---
-
-def generate_available_slots(
-    start_date: date,
-    end_date: date,
-    active_days: List[str],
-    inspections_per_day: int,
-    start_time_input: Any,
-    window_hrs: float
-) -> List[Dict[str, Any]]:
-    day_map = {0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri", 5: "Sat", 6: "Sun"}
-    slots = []
-    
-    curr = start_date
-    while curr <= end_date:
-        if day_map[curr.weekday()] in active_days:
-            base_start_dt = datetime.combine(curr, start_time_input)
-            
-            for i in range(inspections_per_day):
-                s_dt = base_start_dt + timedelta(hours=i * window_hrs)
-                e_dt = s_dt + timedelta(hours=window_hrs)
-                
-                date_str = curr.strftime("%Y-%m-%d")
-                time_label = f"{s_dt.strftime('%I:%M %p')} - {e_dt.strftime('%I:%M %p')}"
-                
-                slots.append({
-                    "slot_label": f"{date_str} ({day_map[curr.weekday()]}) | {time_label}",
-                    "date_str": date_str,
-                    "start": s_dt.isoformat(),
-                    "end": e_dt.isoformat()
+        for idx, row in scheduled_claims.iterrows():
+            if pd.notna(row["start_time"]) and pd.notna(row["end_time"]) and str(row["start_time"]) != "":
+                calendar_events.append({
+                    "id": str(row["claim_id"]),
+                    "title": f"[{row['claim_id']}] {row['insured_name']}",
+                    "start": str(row["start_time"]),
+                    "end": str(row["end_time"]),
+                    "backgroundColor": "#2563EB",
+                    "borderColor": "#1D4ED8"
                 })
-        curr += timedelta(days=1)
-        
-    return slots
 
+        calendar_options = {
+            "headerToolbar": {"left": "prev,next today", "center": "title", "right": "timeGridWeek,timeGridDay,dayGridMonth"},
+            "initialView": "timeGridWeek",
+            "initialDate": start_date.strftime("%Y-%m-%d"),
+            "slotMinTime": start_time_input.strftime("%H:%M:%S"),
+            "slotMaxTime": "21:00:00",
+            "editable": True,
+            "selectable": True,
+            "slotEventOverlap": True
+        }
 
-def is_slot_conflicting(slot: Dict[str, Any], claims_df: pd.DataFrame, current_claim_id: str) -> bool:
-    if claims_df is None or claims_df.empty:
-        return False
+        cal_event = calendar(events=calendar_events, options=calendar_options, key="claims_calendar")
         
-    scheduled = claims_df[(claims_df["status"] == "Scheduled") & (claims_df["claim_id"] != str(current_claim_id))]
-    
-    slot_start = datetime.fromisoformat(slot["start"])
-    slot_end = datetime.fromisoformat(slot["end"])
-    
-    for _, row in scheduled.iterrows():
-        if pd.notna(row["start_time"]) and pd.notna(row["end_time"]) and str(row["start_time"]) != "":
-            c_start = datetime.fromisoformat(str(row["start_time"]))
-            c_end = datetime.fromisoformat(str(row["end_time"]))
+        if cal_event.get("eventChange"):
+            changed_event = cal_event["eventChange"]["event"]
+            cid = str(changed_event["id"])
+            new_start = changed_event["start"]
+            new_end = changed_event["end"]
             
-            if max(slot_start, c_start) < min(slot_end, c_end):
-                return True
-                
-    return False
+            c_mask = st.session_state.claims_df["claim_id"].astype(str) == cid
+            st.session_state.claims_df.loc[c_mask, "start_time"] = new_start
+            st.session_state.claims_df.loc[c_mask, "end_time"] = new_end
+            st.session_state.claims_df.loc[c_mask, "scheduled_date"] = new_start.split("T")[0]
+            st.toast(f"Updated time for claim {cid}!")
+            st.rerun()
 
+    with tab_map:
+        valid_coords_df = df[(df["status"] != "Ignored") & (df["lat"].notna()) & (df["lon"].notna())]
 
-# --- RECOMMENDATION ENGINE ---
+        if not valid_coords_df.empty:
+            avg_lat = valid_coords_df["lat"].mean()
+            avg_lon = valid_coords_df["lon"].mean()
+        else:
+            avg_lat, avg_lon = 29.4241, -98.4936
 
-def get_recommendations_for_day(claims_df: pd.DataFrame, target_date_str: str) -> Optional[pd.DataFrame]:
-    if claims_df is None or claims_df.empty:
-        return None
+        m = folium.Map(location=[avg_lat, avg_lon], zoom_start=10, tiles="OpenStreetMap")
+        
+        esri_satellite_url = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+        folium.TileLayer(
+            tiles=esri_satellite_url,
+            attr="Esri World Imagery",
+            name="ESRI Satellite"
+        ).add_to(m)
 
-    unscheduled = claims_df[claims_df["status"] == "Unscheduled"].copy()
-    if unscheduled.empty:
-        return None
+        day_colors = ["blue", "green", "purple", "orange", "darkred", "cadetblue", "darkgreen", "pink"]
+        scheduled_dates = sorted([d for d in df[df["status"] == "Scheduled"]["scheduled_date"].unique() if d])
+        date_color_map = {d: day_colors[i % len(day_colors)] for i, d in enumerate(scheduled_dates)}
 
-    scheduled_day = claims_df[(claims_df["status"] == "Scheduled") & (claims_df["scheduled_date"] == target_date_str)]
-
-    if not scheduled_day.empty:
-        anchor_lat = scheduled_day.iloc[-1]["lat"]
-        anchor_lon = scheduled_day.iloc[-1]["lon"]
-        anchor_type = "anchor_claim"
-    else:
-        anchor_lat = claims_df["lat"].mean()
-        anchor_lon = claims_df["lon"].mean()
-        anchor_type = "hotel"
-
-    miles_list = []
-    mins_list = []
-
-    for _, row in unscheduled.iterrows():
-        miles, mins = get_osrm_route(anchor_lat, anchor_lon, row["lat"], row["lon"])
-        miles_list.append(miles)
-        mins_list.append(mins)
-
-    unscheduled["drive_miles"] = miles_list
-    unscheduled["drive_time_mins"] = mins_list
-    unscheduled["anchor_type"] = anchor_type
-
-    # Convert priority column to numeric, using float('inf') for blank/None values
-    # so ranked priorities (1, 2, 3...) always sort ahead of unranked claims
-    def clean_prio(val):
-        if pd.isna(val) or val is None or str(val).strip() in ["", "nan", "None"]:
-            return float("inf")
-        try:
-            return float(val)
-        except ValueError:
-            return float("inf")
-
-    unscheduled["prio_sort_key"] = unscheduled["priority"].apply(clean_prio)
-
-    # Sort FIRST by priority rank (1 -> 2 -> ... -> inf), SECOND by drive time
-    unscheduled = unscheduled.sort_values(by=["prio_sort_key", "drive_time_mins"], ascending=[True, True])
-    unscheduled = unscheduled.drop(columns=["prio_sort_key"])
-
-    return unscheduled
-
-
-# --- ICS CALENDAR EXPORT ---
-
-def export_claims_to_ics(claims_df: pd.DataFrame) -> str:
-    ics_lines = [
-        "BEGIN:VCALENDAR",
-        "VERSION:2.0",
-        "PRODID:-//CAT Claims Scheduler//EN",
-        "CALSCALE:GREGORIAN"
-    ]
-
-    scheduled = claims_df[claims_df["status"] == "Scheduled"]
-
-    for _, row in scheduled.iterrows():
-        if pd.notna(row["start_time"]) and pd.notna(row["end_time"]) and str(row["start_time"]) != "":
-            try:
-                s_dt = datetime.fromisoformat(str(row["start_time"]))
-                e_dt = datetime.fromisoformat(str(row["end_time"]))
-
-                ics_lines.extend([
-                    "BEGIN:VEVENT",
-                    f"SUMMARY:CAT Inspection - {row['claim_id']} ({row['insured_name']})",
-                    f"DESCRIPTION:Claim ID: {row['claim_id']}\\nInsured: {row['insured_name']}",
-                    f"LOCATION:{row['full_address']}",
-                    f"DTSTART:{s_dt.strftime('%Y%m%dT%H%M%SZ')}",
-                    f"DTEND:{e_dt.strftime('%Y%m%dT%H%M%SZ')}",
-                    f"UID:claim-{row['claim_id']}@catscheduler.local",
-                    "END:VEVENT"
-                ])
-            except Exception:
+        bounds = []
+        for idx, row in df.iterrows():
+            if row["status"] == "Ignored" or pd.isna(row["lat"]) or pd.isna(row["lon"]):
                 continue
 
-    ics_lines.append("END:VCALENDAR")
-    return "\n".join(ics_lines)
+            lat = float(row["lat"])
+            lon = float(row["lon"])
+
+            marker_color = "red" if row["status"] == "Unscheduled" else date_color_map.get(row.get("scheduled_date"), "blue")
+            icon_type = "exclamation-sign" if row["status"] == "Unscheduled" else "ok-sign"
+
+            folium.Marker(
+                location=[lat, lon],
+                popup=f"<b>{row['claim_id']}</b><br>{row['insured_name']}<br>{row['full_address']}",
+                tooltip=f"{row['claim_id']} - {row['insured_name']}",
+                icon=folium.Icon(color=marker_color, icon=icon_type)
+            ).add_to(m)
+
+            bounds.append([lat, lon])
+
+        if bounds:
+            m.fit_bounds(bounds, padding=(30, 30))
+
+        folium.LayerControl().add_to(m)
+        st_folium(m, width=1100, height=520, key="claims_map")
+
+    st.markdown("---")
+
+    # --- MANAGEMENT & CLAIMS POOL ---
+    col_left, col_right = st.columns([1.5, 1])
+
+    with col_left:
+        st.subheader("📋 Active Claims Pool")
+        show_status = st.multiselect("Filter Status View", ["Unscheduled", "Scheduled", "Ignored"], default=["Unscheduled", "Scheduled"])
+        filtered_df = df[df["status"].isin(show_status)].copy()
+        
+        edited_df = st.data_editor(
+            filtered_df[["claim_id", "insured_name", "full_address", "priority", "status", "scheduled_date", "inspection_time"]],
+            key="claims_editor",
+            disabled=["claim_id", "insured_name", "full_address"],
+            use_container_width=True
+        )
+
+    selected_target_date_str = start_date.strftime("%Y-%m-%d")
+
+    with col_right:
+        st.subheader("🎯 Select Claim to Manage")
+        claim_options = df["display_label"].tolist()
+
+        if "managed_claim_select" not in st.session_state or st.session_state["managed_claim_select"] not in claim_options:
+            st.session_state["managed_claim_select"] = claim_options[0]
+
+        if "selected_claim_id" in st.session_state and st.session_state["selected_claim_id"]:
+            matching = [opt for opt in claim_options if opt.startswith(str(st.session_state["selected_claim_id"]) + " -")]
+            if matching:
+                st.session_state["managed_claim_select"] = matching[0]
+            del st.session_state["selected_claim_id"]
+
+        selected_label = st.selectbox(
+            "Select Claim to Manage",
+            claim_options,
+            key="managed_claim_select"
+        )
+
+        if selected_label:
+            selected_claim_id = selected_label.split(" - ")[0].strip()
+            claim_mask = st.session_state.claims_df["claim_id"].astype(str) == selected_claim_id
+            
+            if claim_mask.any():
+                current_claim = st.session_state.claims_df[claim_mask].iloc[0]
+                
+                st.write(f"**Claim Number:** `{current_claim['claim_id']}`")
+                st.write(f"**Insured Name:** {current_claim['insured_name']}")
+                st.write(f"**Address:** {current_claim['full_address']}")
+                st.write(f"**Current Status:** `{current_claim['status']}`")
+                
+                st.markdown("---")
+
+                if current_claim["status"] == "Scheduled":
+                    if current_claim["scheduled_date"]:
+                        selected_target_date_str = str(current_claim["scheduled_date"])
+
+                    if st.button("Remove from Schedule", type="primary"):
+                        st.session_state.claims_df.loc[claim_mask, "status"] = "Unscheduled"
+                        st.session_state.claims_df.loc[claim_mask, "start_time"] = None
+                        st.session_state.claims_df.loc[claim_mask, "end_time"] = None
+                        st.session_state.claims_df.loc[claim_mask, "scheduled_date"] = ""
+                        st.session_state.claims_df.loc[claim_mask, "inspection_time"] = ""
+                        st.rerun()
+
+                elif current_claim["status"] in ["Unscheduled", "Ignored"]:
+                    unbooked_slots = [s for s in all_slots if not is_slot_conflicting(s, st.session_state.claims_df, current_claim_id=selected_claim_id)]
+                    
+                    if unbooked_slots:
+                        slot_labels = [s["slot_label"] for s in unbooked_slots]
+                        selected_slot_label = st.selectbox("Choose Open Slot", slot_labels, index=0)
+                        chosen_slot = next(s for s in unbooked_slots if s["slot_label"] == selected_slot_label)
+                        selected_target_date_str = chosen_slot["date_str"]
+                        
+                        if st.button("Confirm & Lock Slot", type="primary"):
+                            st.session_state.claims_df.loc[claim_mask, "status"] = "Scheduled"
+                            st.session_state.claims_df.loc[claim_mask, "start_time"] = chosen_slot["start"]
+                            st.session_state.claims_df.loc[claim_mask, "end_time"] = chosen_slot["end"]
+                            st.session_state.claims_df.loc[claim_mask, "scheduled_date"] = chosen_slot["date_str"]
+                            
+                            start_dt = datetime.fromisoformat(chosen_slot["start"])
+                            st.session_state.claims_df.loc[claim_mask, "inspection_time"] = start_dt.strftime("%H:%M")
+                            st.rerun()
+
+    # --- RECOMMENDATIONS ---
+    st.markdown("---")
+    st.subheader(f"💡 Recommended Next Claims for {selected_target_date_str}")
+    
+    recs = get_recommendations_for_day(st.session_state.claims_df, target_date_str=selected_target_date_str)
+    
+    if recs is not None and not recs.empty:
+        for idx, rec_row in recs.head(5).reset_index(drop=True).iterrows():
+            col_rec1, col_rec2 = st.columns([3, 1])
+            with col_rec1:
+                anchor_label = "anchor claim" if rec_row.get("anchor_type") == "anchor_claim" else "hotel base"
+                st.markdown(f"**[{rec_row['claim_id']}] {rec_row['insured_name']}** — *{rec_row['full_address']}* (⏱️ `{rec_row['drive_time_mins']} mins` from {anchor_label})")
+            with col_rec2:
+                unique_key = f"btn_rec_{idx}_{rec_row['claim_id']}"
+                if st.button("Select to Manage", key=unique_key):
+                    st.session_state["selected_claim_id"] = str(rec_row["claim_id"])
+                    st.rerun()
+    
