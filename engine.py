@@ -1,3 +1,4 @@
+import re
 import time
 import random
 import concurrent.futures
@@ -91,8 +92,8 @@ def get_osrm_route(start_lat: float, start_lon: float, end_lat: float, end_lon: 
 
 def process_imported_table(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Processes imported CSV/Excel dataframe by detecting claim IDs, insured names, and full addresses.
-    Preserves exact string identifiers (e.g. ABC1234-001).
+    Processes imported CSV/Excel dataframe by detecting formatted claim IDs (e.g. ABC1234-001),
+    insured names, and full addresses.
     """
     col_map = {str(c).strip().lower(): c for c in df.columns}
     
@@ -104,11 +105,17 @@ def process_imported_table(df: pd.DataFrame) -> pd.DataFrame:
     zip_col = None
     full_addr_col = None
 
-    # Step 1: Detect Claim ID Column (supports 'claim', 'claim_id', 'file #', 'claim #', 'policy #', etc.)
-    for low_c, orig_c in col_map.items():
-        if any(k == low_c for k in ["claim_id", "claim #", "claim_num", "claim number", "claim", "file #", "file_num", "policy_num"]):
-            claim_col = orig_c
+    # Step 1: Detect Claim ID Column by pattern inspection (ABC1234-001 / XXX1111-001 pattern)
+    claim_pattern = re.compile(r'^[A-Za-z]{2,5}\d+[\-\_]?\d*$', re.IGNORECASE)
+    
+    for c in df.columns:
+        # Check first few non-null values in column
+        sample_vals = df[c].dropna().astype(str).str.strip().tolist()[:10]
+        if any(claim_pattern.match(val) for val in sample_vals):
+            claim_col = c
             break
+
+    # Fallback to column header matching if pattern test didn't trigger
     if not claim_col:
         for low_c, orig_c in col_map.items():
             if any(k in low_c for k in ["claim", "file", "policy"]):
@@ -139,10 +146,9 @@ def process_imported_table(df: pd.DataFrame) -> pd.DataFrame:
     metadata = []
 
     for idx, row in df.iterrows():
-        # Preserve original string formatting without converting to numeric floats/ints
+        # Preserve exact claim identifier string formatting
         if claim_col and pd.notna(row[claim_col]) and str(row[claim_col]).strip() != "":
             raw_claim = str(row[claim_col]).strip()
-            # Clean floating point artifact strings (e.g., "425.0" -> "425")
             claim_num = raw_claim[:-2] if raw_claim.endswith(".0") else raw_claim
         else:
             claim_num = f"CLM-{idx + 1001}"
