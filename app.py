@@ -15,6 +15,7 @@ from engine import (
     get_busy_intervals,
     day_window,
     make_slot,
+    order_openings,
     find_overlap,
     get_recommendations_for_slot,
     export_claims_to_ics,
@@ -265,9 +266,12 @@ def render_slot_picker(claim_id, claims_df, now, settings, current=None):
     cid = str(claim_id)
     S = settings
     busy = get_busy_intervals(claims_df, exclude_claim_id=cid)
-    openings = compute_openings(S["start_date"], S["end_date"], S["active_days"], S["day_start"],
-                                S["per_day"], S["window_hrs"], claims_df, now=now, exclude_claim_id=cid,
-                                latest_end=S["latest_end"])
+    openings = order_openings(
+        compute_openings(S["start_date"], S["end_date"], S["active_days"], S["day_start"],
+                         S["per_day"], S["window_hrs"], claims_df, now=now, exclude_claim_id=cid,
+                         latest_end=S["latest_end"]),
+        latest_days_first=S.get("latest_first", False)
+    )
 
     def tfmt(dt):
         return dt.strftime("%I:%M %p").lstrip("0")
@@ -519,6 +523,15 @@ rec_mode_label = st.sidebar.radio(
 )
 REC_MODE = "detour" if rec_mode_label.startswith("Least") else "fast"
 
+fill_label = st.sidebar.radio(
+    "Fill your schedule from",
+    ["Start of deployment (earliest days first)", "End of deployment (latest days first)"],
+    key="fill_direction",
+    help="Changes the order of suggested openings. Within each day, suggestions still "
+         "run morning to afternoon. You can always pick any day and time yourself."
+)
+FILL_LATEST_FIRST = fill_label.startswith("End")
+
 # --- DEPLOYMENT TIME ZONE ---
 # All schedule times are local to the deployment; this zone is used for the
 # Outlook export and for knowing which inspections are already in the past.
@@ -551,11 +564,12 @@ schedule_settings = {
     "start_date": start_date, "end_date": end_date, "active_days": active_days,
     "day_start": start_time_input, "per_day": inspections_per_day, "window_hrs": window_hrs,
     "latest_end": latest_end_input,
+    "latest_first": FILL_LATEST_FIRST,
 }
-all_slots = compute_openings(
+all_slots = order_openings(compute_openings(
     start_date, end_date, active_days, start_time_input, inspections_per_day, window_hrs,
     st.session_state.claims_df, now=now_local, latest_end=latest_end_input
-)
+), latest_days_first=FILL_LATEST_FIRST)
 
 # --- MAP TOOLS & SAVED PROGRESS ---
 st.sidebar.markdown("---")
@@ -1244,7 +1258,8 @@ if st.session_state.claims_df is not None:
             st.session_state.editor_version += 1
             st.rerun()
 
-    selected_target_date_str = start_date.strftime("%Y-%m-%d")
+    # Default day for "Fill an opening": the first suggested opening in the chosen fill order
+    selected_target_date_str = all_slots[0]["date_str"] if all_slots else start_date.strftime("%Y-%m-%d")
 
     with col_right:
         st.subheader("Manage a claim")
