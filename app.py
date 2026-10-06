@@ -9,7 +9,8 @@ from engine import (
     generate_available_slots,
     get_recommendations_for_day,
     export_claims_to_ics,
-    is_slot_conflicting
+    is_slot_conflicting,
+    batch_geocode_addresses
 )
 
 st.set_page_config(page_title="CAT Claims Dynamic Scheduler MVP", layout="wide")
@@ -51,10 +52,21 @@ all_slots = generate_available_slots(
     start_date, end_date, active_days, inspections_per_day, start_time_input, window_hrs
 )
 
-# --- SESSION SAVE / LOAD PROGRESS ---
+# --- MANUAL GEOMAP REFRESH & STATE MANAGEMENT ---
 st.sidebar.markdown("---")
-st.sidebar.subheader("💾 Save / Resume Progress")
+st.sidebar.subheader("🗺️ Map Tools & State")
+
 if st.session_state.claims_df is not None:
+    if st.sidebar.button("🔄 Force Re-Geocode & Map Refresh", type="secondary"):
+        with st.spinner("Re-geocoding all claim addresses in parallel..."):
+            addrs = st.session_state.claims_df["full_address"].tolist()
+            new_coords = batch_geocode_addresses(addrs)
+            st.session_state.claims_df["lat"] = [c[0] for c in new_coords]
+            st.session_state.claims_df["lon"] = [c[1] for c in new_coords]
+            st.sidebar.success("Map re-geocoded successfully!")
+            st.rerun()
+
+    st.sidebar.markdown(" ")
     csv_bytes = st.session_state.claims_df.to_csv(index=False).encode('utf-8')
     st.sidebar.download_button(
         label="📥 Save Progress (Download State)",
@@ -78,9 +90,11 @@ uploaded_file = st.file_uploader("Upload CSV or Excel file", type=["csv", "xlsx"
 
 if uploaded_file is not None and st.session_state.claims_df is None:
     try:
-        raw_df = pd.read_csv(uploaded_file) if uploaded_file.name.endswith(".csv") else pd.read_excel(uploaded_file)
-        st.session_state.claims_df = process_imported_table(raw_df)
-        st.success(f"Successfully imported {len(st.session_state.claims_df)} claims!")
+        with st.spinner("Parsing table and batch-geocoding addresses in parallel..."):
+            raw_df = pd.read_csv(uploaded_file) if uploaded_file.name.endswith(".csv") else pd.read_excel(uploaded_file)
+            st.session_state.claims_df = process_imported_table(raw_df)
+            st.success(f"Successfully imported and mapped {len(st.session_state.claims_df)} claims!")
+            st.rerun()
     except Exception as e:
         st.error(f"Error parsing table: {e}")
 
@@ -181,17 +195,20 @@ if st.session_state.claims_df is not None:
             if row["status"] == "Ignored" or pd.isna(row["lat"]) or pd.isna(row["lon"]):
                 continue
 
+            lat = float(row["lat"])
+            lon = float(row["lon"])
+
             marker_color = "red" if row["status"] == "Unscheduled" else date_color_map.get(row.get("scheduled_date"), "blue")
             icon_type = "exclamation-sign" if row["status"] == "Unscheduled" else "ok-sign"
 
             folium.Marker(
-                location=[float(row["lat"]), float(row["lon"])],
+                location=[lat, lon],
                 popup=f"<b>{row['claim_id']}</b><br>{row['insured_name']}<br>{row['full_address']}",
                 tooltip=f"{row['claim_id']} - {row['insured_name']}",
                 icon=folium.Icon(color=marker_color, icon=icon_type)
             ).add_to(m)
 
-            bounds.append([float(row["lat"]), float(row["lon"])])
+            bounds.append([lat, lon])
 
         if bounds:
             m.fit_bounds(bounds, padding=(30, 30))
