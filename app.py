@@ -18,11 +18,11 @@ st.set_page_config(page_title="CAT Claims Dynamic Scheduler MVP", layout="wide")
 if "claims_df" not in st.session_state:
     st.session_state.claims_df = None
 
-st.title("⚡ CAT Claims Dynamic Scheduling & Map Tool")
+st.title("CAT Dynamic Scheduling")
 
 # --- SIDEBAR PREFERENCES ---
-st.sidebar.header("🗓️ Rep Schedule Preferences")
-hotel_address = st.sidebar.text_input("Hotel Base Location", "1100 San Pedro Ave, San Antonio, TX")
+st.sidebar.header("🗓️ Rep Schedule Parameters")
+hotel_address = st.sidebar.text_input("Hotel or Base Location", "1100 San Pedro Ave, San Antonio, TX")
 
 col_d1, col_d2 = st.sidebar.columns(2)
 with col_d1:
@@ -58,8 +58,11 @@ st.sidebar.subheader("🗺️ Map Tools & State")
 
 if st.session_state.claims_df is not None:
     if st.sidebar.button("🔄 Force Re-Geocode & Map Refresh", type="secondary"):
-        with st.spinner("Re-geocoding all claim addresses in parallel..."):
-            addrs = st.session_state.claims_df["full_address"].tolist()
+        with st.spinner("Re-geocoding all claim addresses sequentially..."):
+            addrs = list(zip(
+                st.session_state.claims_df["full_address"].tolist(),
+                st.session_state.claims_df.get("state", pd.Series([""] * len(st.session_state.claims_df))).tolist()
+            ))
             new_coords = batch_geocode_addresses(addrs)
             st.session_state.claims_df["lat"] = [c[0] for c in new_coords]
             st.session_state.claims_df["lon"] = [c[1] for c in new_coords]
@@ -90,7 +93,7 @@ uploaded_file = st.file_uploader("Upload CSV or Excel file", type=["csv", "xlsx"
 
 if uploaded_file is not None and st.session_state.claims_df is None:
     try:
-        with st.spinner("Parsing table and batch-geocoding addresses in parallel..."):
+        with st.spinner("Parsing table and batch-geocoding addresses..."):
             raw_df = pd.read_csv(uploaded_file) if uploaded_file.name.endswith(".csv") else pd.read_excel(uploaded_file)
             st.session_state.claims_df = process_imported_table(raw_df)
             st.success(f"Successfully imported and mapped {len(st.session_state.claims_df)} claims!")
@@ -239,11 +242,9 @@ if st.session_state.claims_df is not None:
         st.subheader("🎯 Select Claim to Manage")
         claim_options = df["display_label"].tolist()
 
-        # Initialize or update selectbox selection state
         if "managed_claim_select" not in st.session_state or st.session_state["managed_claim_select"] not in claim_options:
             st.session_state["managed_claim_select"] = claim_options[0]
 
-        # Handle button triggers from Recommendations
         if "selected_claim_id" in st.session_state and st.session_state["selected_claim_id"]:
             matching = [opt for opt in claim_options if opt.startswith(str(st.session_state["selected_claim_id"]) + " -")]
             if matching:
@@ -314,7 +315,6 @@ if st.session_state.claims_df is not None:
                 anchor_label = "anchor claim" if rec_row.get("anchor_type") == "anchor_claim" else "hotel base"
                 st.markdown(f"**[{rec_row['claim_id']}] {rec_row['insured_name']}** — *{rec_row['full_address']}* (⏱️ `{rec_row['drive_time_mins']} mins` from {anchor_label})")
             with col_rec2:
-                # Unique button key incorporating row index and claim ID to prevent StreamlitDuplicateElementKey
                 unique_key = f"btn_rec_{idx}_{rec_row['claim_id']}"
                 if st.button("Select to Manage", key=unique_key):
                     st.session_state["selected_claim_id"] = str(rec_row["claim_id"])
