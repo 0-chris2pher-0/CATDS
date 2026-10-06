@@ -1,5 +1,6 @@
 import time
 import random
+import concurrent.futures
 import pandas as pd
 import numpy as np
 import requests
@@ -10,17 +11,15 @@ from typing import List, Dict, Any, Optional
 # --- GEOCODING & ROUTING UTILITIES ---
 
 @st.cache_data(show_spinner=False)
-def geocode_address(address: str) -> tuple[float, float]:
+def geocode_single_address(address: str) -> tuple[float, float]:
     """
-    Geocodes an address string using Nominatim with rate limiting and fallback jitter.
+    Geocodes a single address string using Nominatim with caching and fallback jitter.
     """
     clean_addr = str(address).strip()
     if not clean_addr or clean_addr.lower() == "nan":
-        return 29.4241 + random.uniform(-0.02, 0.02), -98.4936 + random.uniform(-0.02, 0.02)
+        return 29.4241 + random.uniform(-0.04, 0.04), -98.4936 + random.uniform(-0.04, 0.04)
 
     try:
-        # Respect Nominatim API rate limit (1 request per second)
-        time.sleep(1.1)
         url = "https://nominatim.openstreetmap.org/search"
         params = {
             "q": clean_addr,
@@ -30,7 +29,7 @@ def geocode_address(address: str) -> tuple[float, float]:
         headers = {
             "User-Agent": "CATClaimsSchedulerApp/2.0 (contact@example.com)"
         }
-        resp = requests.get(url, params=params, headers=headers, timeout=5)
+        resp = requests.get(url, params=params, headers=headers, timeout=4)
         if resp.status_code == 200:
             data = resp.json()
             if data and len(data) > 0:
@@ -38,8 +37,23 @@ def geocode_address(address: str) -> tuple[float, float]:
     except Exception:
         pass
 
-    # Fallback jitter coordinates so un-geocoded pins don't stack directly on top of each other
-    return 29.4241 + random.uniform(-0.03, 0.03), -98.4936 + random.uniform(-0.03, 0.03)
+    # Jitter fallback coordinates slightly so failed pins do not stack directly on top of each other
+    return 29.4241 + random.uniform(-0.04, 0.04), -98.4936 + random.uniform(-0.04, 0.04)
+
+
+def batch_geocode_addresses(address_list: List[str], max_workers: int = 5) -> List[tuple[float, float]]:
+    """
+    Geocodes a list of addresses in parallel using multi-threading for fast batch ingestion.
+    """
+    results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(geocode_single_address, addr) for addr in address_list]
+        for future in futures:
+            try:
+                results.append(future.result())
+            except Exception:
+                results.append((29.4241 + random.uniform(-0.04, 0.04), -98.4936 + random.uniform(-0.04, 0.04)))
+    return results
 
 
 def get_osrm_route(start_lat: float, start_lon: float, end_lat: float, end_lon: float) -> tuple[float, float]:
@@ -78,7 +92,7 @@ def get_osrm_route(start_lat: float, start_lon: float, end_lat: float, end_lon: 
 def process_imported_table(df: pd.DataFrame) -> pd.DataFrame:
     """
     Processes imported CSV/Excel dataframe by assembling addresses split across
-    multiple columns (Street, Town/City, State, Zip) or picking up a full address column.
+    multiple columns (Street, Town/City, State, Zip) and batch-geocoding them concurrently.
     """
     col_map = {str(c).strip().lower(): c for c in df.columns}
     
@@ -96,48 +110,34 @@ def process_imported_table(df: pd.DataFrame) -> pd.DataFrame:
             full_addr_col = orig_c
             break
 
-    # Step 2: Flexible matching for split address columns (street, town, state, zip)
+    # Step 2: Flexible matching for split address columns
     for low_c, orig_c in col_map.items():
-        # Claim ID
         if not claim_col and any(k in low_c for k in ["claim", "file #", "file_num", "claim_id", "policy_num", "number"]):
             claim_col = orig_c
-            
-        # Insured Name
         elif not insured_col and any(k in low_c for k in ["insured", "customer", "policyholder", "client", "name"]):
             insured_col = orig_c
-            
-        # Street / Address Line 1
-        elif not street_col and any(k in low_c for k in ["street", "address 1", "addr1", "address_line_1", "loss_street", "property_street", "location", "site", "street_address"]):
+        elif not street_col and any(k in low_c for k in ["street", "address 1", "addr1", "address_line_1", "loss_street", "property_street", "location", "site"]):
             if "state" not in low_c and low_c != "st":
                 street_col = orig_c
-
-        # Generic 'Address' header fallback if no explicit street match yet
         elif not street_col and not full_addr_col and "address" in low_c and "state" not in low_c:
             street_col = orig_c
-
-        # Town / City
         elif not city_col and any(k in low_c for k in ["town", "city", "municipality", "village"]):
             city_col = orig_c
-
-        # State
         elif not state_col and (low_c in ["state", "st", "province"] or "state" in low_c):
             state_col = orig_c
-
-        # Zip Code
-        elif not zip_col and any(k in low_c for k in ["zip", "postal", "zipcode", "zip_code", "postcode"]):
+        elif not zip_col and any(k in low_c for k in ["zip", "postal", "zipcode", "zip_code"]):
             zip_col = orig_c
 
-    processed_rows = []
-    
+    address_list = []
+    metadata = []
+
     for idx, row in df.iterrows():
         claim_num = str(row[claim_col]).strip() if claim_col and pd.notna(row[claim_col]) else f"CLM-{idx + 1001}"
         insured = str(row[insured_col]).strip() if insured_col and pd.notna(row[insured_col]) else f"Policyholder {idx + 1}"
         
-        # 1. Full Address Column Priority
+        # Assemble address
         if full_addr_col and pd.notna(row[full_addr_col]) and str(row[full_addr_col]).strip() != "":
             full_address = str(row[full_addr_col]).strip()
-            
-        # 2. Assemble split address parts: "Street, Town, State Zip"
         else:
             street_val = str(row[street_col]).strip() if street_col and pd.notna(row[street_col]) else ""
             city_val = str(row[city_col]).strip() if city_col and pd.notna(row[city_col]) else ""
@@ -145,22 +145,20 @@ def process_imported_table(df: pd.DataFrame) -> pd.DataFrame:
             zip_val = str(row[zip_col]).strip() if zip_col and pd.notna(row[zip_col]) else ""
 
             city_state_zip = " ".join(filter(None, [f"{city_val}, {state_val}".strip(", "), zip_val]))
-            
             if street_val:
                 full_address = f"{street_val}, {city_state_zip}".strip(", ")
             elif city_state_zip:
                 full_address = city_state_zip
             else:
-                # Absolute fallback: join all non-empty values in row
                 full_address = ", ".join([str(v).strip() for v in row.values if pd.notna(v) and str(v).strip() != ""])
 
-        # Check for pre-existing coordinates in CSV to bypass geocoding entirely
-        if "lat" in df.columns and "lon" in df.columns and pd.notna(row["lat"]) and pd.notna(row["lon"]):
-            lat, lon = float(row["lat"]), float(row["lon"])
-        else:
-            lat, lon = geocode_address(full_address)
+        # Check for pre-existing coordinates
+        has_coords = "lat" in df.columns and "lon" in df.columns and pd.notna(row["lat"]) and pd.notna(row["lon"])
+        pre_lat = float(row["lat"]) if has_coords else None
+        pre_lon = float(row["lon"]) if has_coords else None
 
-        processed_rows.append({
+        address_list.append(full_address)
+        metadata.append({
             "claim_id": claim_num,
             "insured_name": insured,
             "display_label": f"{claim_num} - {insured}",
@@ -171,9 +169,29 @@ def process_imported_table(df: pd.DataFrame) -> pd.DataFrame:
             "end_time": None,
             "scheduled_date": "",
             "inspection_time": "",
-            "lat": lat,
-            "lon": lon
+            "pre_lat": pre_lat,
+            "pre_lon": pre_lon
         })
+
+    # Execute parallel geocoding for all rows missing coordinates
+    addrs_to_geocode = [m["full_address"] for m in metadata if m["pre_lat"] is None]
+    geocoded_coords = batch_geocode_addresses(addrs_to_geocode) if addrs_to_geocode else []
+
+    geo_idx = 0
+    processed_rows = []
+    for m in metadata:
+        if m["pre_lat"] is not None:
+            lat, lon = m["pre_lat"], m["pre_lon"]
+        else:
+            lat, lon = geocoded_coords[geo_idx]
+            geo_idx += 1
+
+        row_dict = dict(m)
+        del row_dict["pre_lat"]
+        del row_dict["pre_lon"]
+        row_dict["lat"] = lat
+        row_dict["lon"] = lon
+        processed_rows.append(row_dict)
 
     return pd.DataFrame(processed_rows)
 
@@ -234,7 +252,6 @@ def is_slot_conflicting(slot: Dict[str, Any], claims_df: pd.DataFrame, current_c
             c_start = datetime.fromisoformat(str(row["start_time"]))
             c_end = datetime.fromisoformat(str(row["end_time"]))
             
-            # Check for time range overlap
             if max(slot_start, c_start) < min(slot_end, c_end):
                 return True
                 
@@ -245,8 +262,7 @@ def is_slot_conflicting(slot: Dict[str, Any], claims_df: pd.DataFrame, current_c
 
 def get_recommendations_for_day(claims_df: pd.DataFrame, target_date_str: str) -> Optional[pd.DataFrame]:
     """
-    Calculates geographic proximity and drive times to recommend unscheduled claims 
-    for a targeted date based on existing scheduled anchors.
+    Calculates geographic proximity and drive times to recommend unscheduled claims.
     """
     if claims_df is None or claims_df.empty:
         return None
@@ -257,7 +273,6 @@ def get_recommendations_for_day(claims_df: pd.DataFrame, target_date_str: str) -
 
     scheduled_day = claims_df[(claims_df["status"] == "Scheduled") & (claims_df["scheduled_date"] == target_date_str)]
 
-    # Determine anchor location (use last scheduled claim on target date if present, otherwise average lat/lon)
     if not scheduled_day.empty:
         anchor_lat = scheduled_day.iloc[-1]["lat"]
         anchor_lon = scheduled_day.iloc[-1]["lon"]
@@ -279,9 +294,7 @@ def get_recommendations_for_day(claims_df: pd.DataFrame, target_date_str: str) -
     unscheduled["drive_time_mins"] = mins_list
     unscheduled["anchor_type"] = anchor_type
 
-    # Sort primarily by drive time / proximity, secondary by priority tier
     unscheduled = unscheduled.sort_values(by=["drive_time_mins", "priority"], ascending=[True, True])
-    
     return unscheduled
 
 
@@ -289,7 +302,7 @@ def get_recommendations_for_day(claims_df: pd.DataFrame, target_date_str: str) -
 
 def export_claims_to_ics(claims_df: pd.DataFrame) -> str:
     """
-    Exports scheduled claims to iCalendar (.ics) format for Outlook/Google Calendar.
+    Exports scheduled claims to iCalendar (.ics) format.
     """
     ics_lines = [
         "BEGIN:VCALENDAR",
