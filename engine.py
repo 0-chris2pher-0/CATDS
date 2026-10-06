@@ -1,63 +1,83 @@
 import re
 import time
 import random
-import concurrent.futures
+import requests
 import pandas as pd
 import numpy as np
-import requests
 import streamlit as st
 from datetime import datetime, date, timedelta
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
-# --- GEOCODING & ROUTING UTILITIES ---
+# --- COMPLIANT & STATE-BOUNDED GEOCODING UTILITIES ---
 
 @st.cache_data(show_spinner=False)
-def geocode_single_address(address: str) -> tuple[float, float]:
+def geocode_single_address(address: str, state: str = None) -> Tuple[float, float]:
     """
-    Geocodes a single address string using Nominatim with caching and fallback jitter.
+    Geocodes a single address string using Nominatim with strict rate-limiting compliance,
+    dynamically bounded by the state parameter if provided.
     """
     clean_addr = str(address).strip()
     if not clean_addr or clean_addr.lower() == "nan":
-        return 29.4241 + random.uniform(-0.04, 0.04), -98.4936 + random.uniform(-0.04, 0.04)
+        return 29.4241 + random.uniform(-0.02, 0.02), -98.4936 + random.uniform(-0.02, 0.02)
 
     try:
         url = "https://nominatim.openstreetmap.org/search"
         params = {
             "q": clean_addr,
             "format": "json",
-            "limit": 1
+            "limit": 1,
+            "countrycodes": "us"
         }
+        
+        # Dynamically restrict search scope if state is provided
+        if state and str(state).strip() and str(state).lower() != "nan":
+            params["state"] = str(state).strip()
+
         headers = {
-            "User-Agent": "CATClaimsSchedulerApp/2.0 (contact@example.com)"
+            "User-Agent": "CATClaimsSchedulerApp/3.0 (contact@example.com)"
         }
-        resp = requests.get(url, params=params, headers=headers, timeout=4)
+        resp = requests.get(url, params=params, headers=headers, timeout=6)
         if resp.status_code == 200:
             data = resp.json()
             if data and len(data) > 0:
                 return float(data[0]["lat"]), float(data[0]["lon"])
+        elif resp.status_code == 429:
+            st.warning(f"Rate limited by Nominatim for address: {clean_addr}")
     except Exception:
         pass
 
-    # Jitter fallback coordinates slightly so failed pins do not stack directly on top of each other
-    return 29.4241 + random.uniform(-0.04, 0.04), -98.4936 + random.uniform(-0.04, 0.04)
+    # Jitter fallback near center if lookup fails or times out
+    return 29.4241 + random.uniform(-0.02, 0.02), -98.4936 + random.uniform(-0.02, 0.02)
 
 
-def batch_geocode_addresses(address_list: List[str], max_workers: int = 5) -> List[tuple[float, float]]:
+def batch_geocode_addresses(address_state_list: List[Tuple[str, Optional[str]]]) -> List[Tuple[float, float]]:
     """
-    Geocodes a list of addresses in parallel using multi-threading for fast batch ingestion.
+    Geocodes (address, state) tuples sequentially with a 1.0s delay to respect Nominatim policy.
     """
     results = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(geocode_single_address, addr) for addr in address_list]
-        for future in futures:
-            try:
-                results.append(future.result())
-            except Exception:
-                results.append((29.4241 + random.uniform(-0.04, 0.04), -98.4936 + random.uniform(-0.04, 0.04)))
+    progress_bar = st.progress(0, text="Geocoding addresses...")
+    total = len(address_state_list)
+
+    for i, item in enumerate(address_state_list):
+        if isinstance(item, tuple):
+            addr, st_val = item
+        else:
+            addr, st_val = item, None
+
+        coords = geocode_single_address(addr, state=st_val)
+        results.append(coords)
+        
+        # Respect OpenStreetMap 1 req/sec rate limit policy
+        time.sleep(1.0)
+        
+        if total > 0:
+            progress_bar.progress((i + 1) / total, text=f"Geocoding address {i + 1} of {total}...")
+
+    progress_bar.empty()
     return results
 
 
-def get_osrm_route(start_lat: float, start_lon: float, end_lat: float, end_lon: float) -> tuple[float, float]:
+def get_osrm_route(start_lat: float, start_lon: float, end_lat: float, end_lon: float) -> Tuple[float, float]:
     """
     Calculates driving distance (miles) and duration (minutes) between two points using OSRM.
     Fallback to Haversine approximation if service is unreachable.
@@ -93,7 +113,7 @@ def get_osrm_route(start_lat: float, start_lon: float, end_lat: float, end_lon: 
 def process_imported_table(df: pd.DataFrame) -> pd.DataFrame:
     """
     Processes imported CSV/Excel dataframe by detecting formatted claim IDs (e.g. ABC1234-001),
-    insured names, and full addresses.
+    insured names, and full addresses. Passes state context to batch geocoding.
     """
     col_map = {str(c).strip().lower(): c for c in df.columns}
     
@@ -109,13 +129,12 @@ def process_imported_table(df: pd.DataFrame) -> pd.DataFrame:
     claim_pattern = re.compile(r'^[A-Za-z]{2,5}\d+[\-\_]?\d*$', re.IGNORECASE)
     
     for c in df.columns:
-        # Check first few non-null values in column
         sample_vals = df[c].dropna().astype(str).str.strip().tolist()[:10]
         if any(claim_pattern.match(val) for val in sample_vals):
             claim_col = c
             break
 
-    # Fallback to column header matching if pattern test didn't trigger
+    # Fallback to column header matching
     if not claim_col:
         for low_c, orig_c in col_map.items():
             if any(k in low_c for k in ["claim", "file", "policy"]):
@@ -154,14 +173,14 @@ def process_imported_table(df: pd.DataFrame) -> pd.DataFrame:
             claim_num = f"CLM-{idx + 1001}"
 
         insured = str(row[insured_col]).strip() if insured_col and pd.notna(row[insured_col]) else f"Policyholder {idx + 1}"
-        
+        state_val = str(row[state_col]).strip() if state_col and pd.notna(row[state_col]) else ""
+
         # Assemble address
         if full_addr_col and pd.notna(row[full_addr_col]) and str(row[full_addr_col]).strip() != "":
             full_address = str(row[full_addr_col]).strip()
         else:
             street_val = str(row[street_col]).strip() if street_col and pd.notna(row[street_col]) else ""
             city_val = str(row[city_col]).strip() if city_col and pd.notna(row[city_col]) else ""
-            state_val = str(row[state_col]).strip() if state_col and pd.notna(row[state_col]) else ""
             zip_val = str(row[zip_col]).strip() if zip_col and pd.notna(row[zip_col]) else ""
 
             city_state_zip = " ".join(filter(None, [f"{city_val}, {state_val}".strip(", "), zip_val]))
@@ -183,6 +202,7 @@ def process_imported_table(df: pd.DataFrame) -> pd.DataFrame:
             "insured_name": insured,
             "display_label": f"{claim_num} - {insured}",
             "full_address": full_address,
+            "state": state_val,
             "priority": 3,
             "status": "Unscheduled",
             "start_time": None,
@@ -193,8 +213,10 @@ def process_imported_table(df: pd.DataFrame) -> pd.DataFrame:
             "pre_lon": pre_lon
         })
 
-    # Execute parallel geocoding for all rows missing coordinates
-    addrs_to_geocode = [m["full_address"] for m in metadata if m["pre_lat"] is None]
+    # Prepare address and state pairs for non-geocoded rows
+    addrs_to_geocode = [
+        (m["full_address"], m["state"]) for m in metadata if m["pre_lat"] is None
+    ]
     geocoded_coords = batch_geocode_addresses(addrs_to_geocode) if addrs_to_geocode else []
 
     geo_idx = 0
