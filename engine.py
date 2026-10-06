@@ -74,7 +74,7 @@ def get_osrm_route(start_lat: float, start_lon: float, end_lat: float, end_lon: 
 def process_imported_table(df: pd.DataFrame) -> pd.DataFrame:
     """
     Processes imported CSV/Excel dataframe by assembling addresses split across
-    multiple columns (Street, City, State, Zip) or picking up a full address column.
+    multiple columns (Street, Town/City, State, Zip) or picking up a full address column.
     """
     col_map = {str(c).strip().lower(): c for c in df.columns}
     
@@ -86,47 +86,71 @@ def process_imported_table(df: pd.DataFrame) -> pd.DataFrame:
     zip_col = None
     full_addr_col = None
 
-    # Flexible header matching for split address columns
+    # Step 1: Check for explicit single Full Address column first
     for low_c, orig_c in col_map.items():
-        if any(k in low_c for k in ["claim", "number", "file #", "id"]):
-            if not claim_col: claim_col = orig_c
-        elif any(k in low_c for k in ["insured", "name", "customer", "policyholder"]):
-            if not insured_col: insured_col = orig_c
-        elif any(k in low_c for k in ["full address", "loss address", "property address", "location address"]):
-            if not full_addr_col: full_addr_col = orig_c
-        elif any(k in low_c for k in ["street", "address", "addr", "line 1", "site"]):
-            if not street_col: street_col = orig_c
-        elif any(k in low_c for k in ["city", "town", "municipality"]):
-            if not city_col: city_col = orig_c
-        elif any(k in low_c for k in ["state", "st", "province"]):
-            if not state_col: state_col = orig_c
-        elif any(k in low_c for k in ["zip", "postal", "zipcode", "zip code"]):
-            if not zip_col: zip_col = orig_c
+        if any(k == low_c for k in ["full address", "full_address", "loss address", "property address", "location address", "site address"]):
+            full_addr_col = orig_c
+            break
+
+    # Step 2: Flexible matching for split address columns (street, town, state, zip)
+    for low_c, orig_c in col_map.items():
+        # Claim ID
+        if not claim_col and any(k in low_c for k in ["claim", "file #", "file_num", "claim_id", "policy_num", "number"]):
+            claim_col = orig_c
+            
+        # Insured Name
+        elif not insured_col and any(k in low_c for k in ["insured", "customer", "policyholder", "client", "name"]):
+            insured_col = orig_c
+            
+        # Street / Address Line 1 (excluding state collisions)
+        elif not street_col and any(k in low_c for k in ["street", "address 1", "addr1", "address_line_1", "loss_street", "property_street", "location", "site", "street_address"]):
+            if "state" not in low_c and low_c != "st":
+                street_col = orig_c
+
+        # Generic 'Address' header fallback if no explicit street match yet
+        elif not street_col and not full_addr_col and "address" in low_c and "state" not in low_c:
+            street_col = orig_c
+
+        # Town / City
+        elif not city_col and any(k in low_c for k in ["town", "city", "municipality", "village"]):
+            city_col = orig_c
+
+        # State
+        elif not state_col and (low_c in ["state", "st", "province"] or "state" in low_c):
+            state_col = orig_c
+
+        # Zip Code
+        elif not zip_col and any(k in low_c for k in ["zip", "postal", "zipcode", "zip_code", "postcode"]):
+            zip_col = orig_c
 
     processed_rows = []
     
     for idx, row in df.iterrows():
-        claim_num = str(row[claim_col]) if claim_col else f"CLM-{idx + 1001}"
-        insured = str(row[insured_col]) if insured_col else f"Policyholder {idx + 1}"
+        claim_num = str(row[claim_col]).strip() if claim_col and pd.notna(row[claim_col]) else f"CLM-{idx + 1001}"
+        insured = str(row[insured_col]).strip() if insured_col and pd.notna(row[insured_col]) else f"Policyholder {idx + 1}"
         
-        # 1. Check for single Full Address column first
-        if full_addr_col and pd.notna(row[full_addr_col]):
+        # 1. Full Address Column Priority
+        if full_addr_col and pd.notna(row[full_addr_col]) and str(row[full_addr_col]).strip() != "":
             full_address = str(row[full_addr_col]).strip()
             
-        # 2. Otherwise, assemble split components: "Street, City, State Zip"
+        # 2. Assemble split address parts: "Street, Town, State Zip"
         else:
             street_val = str(row[street_col]).strip() if street_col and pd.notna(row[street_col]) else ""
             city_val = str(row[city_col]).strip() if city_col and pd.notna(row[city_col]) else ""
             state_val = str(row[state_col]).strip() if state_col and pd.notna(row[state_col]) else ""
             zip_val = str(row[zip_col]).strip() if zip_col and pd.notna(row[zip_col]) else ""
-            
-            # Format city/state/zip cleanly
-            city_state_zip = " ".join(filter(None, [f"{city_val}, {state_val}".strip(", "), zip_val]))
-            address_parts = [p for p in [street_val, city_state_zip] if p]
-            
-            full_address = ", ".join(address_parts) if address_parts else "San Antonio, TX"
 
-        # Check for pre-existing coordinates in CSV to bypass geocoding
+            city_state_zip = " ".join(filter(None, [f"{city_val}, {state_val}".strip(", "), zip_val]))
+            
+            if street_val:
+                full_address = f"{street_val}, {city_state_zip}".strip(", ")
+            elif city_state_zip:
+                full_address = city_state_zip
+            else:
+                # Absolute fallback: join all non-empty values in the row if headers were unrecognized
+                full_address = ", ".join([str(v).strip() for v in row.values if pd.notna(v) and str(v).strip() != ""])
+
+        # Check for pre-existing coordinates in CSV to bypass geocoding entirely
         if "lat" in df.columns and "lon" in df.columns and pd.notna(row["lat"]) and pd.notna(row["lon"]):
             lat, lon = float(row["lat"]), float(row["lon"])
         else:
