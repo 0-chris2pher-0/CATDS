@@ -1,1118 +1,1418 @@
-import re
-import time
-import io
-import requests
-import pandas as pd
-import numpy as np
+import html
+import math
+import calendar as pycal
+from collections import defaultdict
 import streamlit as st
-from collections import Counter
-from datetime import datetime, date, timedelta, timezone
-from typing import List, Dict, Any, Optional, Tuple
-from urllib.parse import quote
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+import pandas as pd
+import folium
+from streamlit_folium import st_folium
+from datetime import datetime, date, timedelta
+from streamlit_calendar import calendar
+from engine import (
+    process_imported_table,
+    compute_openings,
+    compute_day_gaps,
+    get_busy_intervals,
+    day_window,
+    make_slot,
+    find_overlap,
+    get_recommendations_for_slot,
+    export_claims_to_ics,
+    is_slot_conflicting,
+    batch_geocode_addresses,
+    normalize_priority,
+    geocode_hotel_address,
+    detect_deployment_timezone,
+    get_zone,
+    parse_wallclock,
+    parse_coordinates,
+    build_navigation_links,
+    US_TIMEZONES,
+    GEO_MANUAL,
+    GEO_CONFIRMED,
+    GEO_REP_VERIFIED,
+    GEO_UNKNOWN,
+    GEO_NEEDS_REVIEW,
+)
+
+st.set_page_config(page_title="CAT Dynamic Scheduling", page_icon="🌀", layout="wide")
+
+# =====================================================================
+# STYLE
+# Palette: storm navy for the header and primary actions, blue-gray
+# workspace, white work surfaces. Status colors match the map pins:
+# red = unscheduled, blue = scheduled, gray = ignored, amber = next up.
+# =====================================================================
+INK = "#0F1E2E"
+STEEL = "#1D4E89"
+SLATE = "#52637A"
+LINE = "#DCE3EA"
+AMBER = "#E8A317"
+RED = "#D63E2A"
+SCHEDULED_BLUE = "#2F6DB5"
+IGNORED_GRAY = "#94A3B8"
+ISSUE_ORANGE = "#F07C1B"
+
+# The theme is switched in the app menu (⋮ > Settings), using the two themes
+# defined in .streamlit/config.toml. Streamlit restyles its own widgets; this
+# CSS restyles the custom pieces (header, stats, cards) to match.
+try:
+    THEME_MODE = st.context.theme.base or "light"
+except Exception:
+    THEME_MODE = "light"
+CONSOLE = THEME_MODE == "dark"
+
+# Console (dark) palette
+C_BG = "#0A0F14"
+C_PANEL = "#111A22"
+C_LINE = "#1E2A36"
+C_TEXT = "#D7E1EA"
+C_MUTED = "#7F92A6"
+C_SIGNAL = "#3FD0E0"
+
+MONO = "'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace"
+SANS = "'IBM Plex Sans', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif"
+
+st.markdown(f"""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+
+.stApp, .stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp p, .stApp label, .stApp li,
+.stApp button, .stApp input, .stApp textarea {{ font-family: {SANS}; }}
+.stApp code {{ font-family: {MONO}; }}
+[data-testid="stDecoration"] {{ display: none; }}
+.block-container {{ padding-top: 2rem; padding-bottom: 4rem; }}
+
+.stApp h3 {{ font-size: 1.15rem; font-weight: 600; letter-spacing: -0.01em; }}
+.stApp hr {{ border: none; border-top: 1px solid rgba(128, 140, 155, 0.28); margin: 1.5rem 0 1.25rem; }}
+[data-testid="stSidebar"] h2 {{ font-size: 1.05rem; font-weight: 600; }}
+[data-testid="stSidebar"] h3 {{ font-size: 0.95rem; font-weight: 600; }}
+
+.stApp .stButton button, .stApp .stDownloadButton button, .stApp .stLinkButton a {{
+    border-radius: 8px; font-weight: 500;
+}}
+.stTabs [data-baseweb="tab"] {{ font-weight: 500; font-size: 0.95rem; }}
+
+/* Header strip: the one bold element on the page */
+.cat-header {{
+    background: {INK}; color: #FFFFFF;
+    border-radius: 12px; padding: 1.1rem 1.4rem 1rem; margin-bottom: 1.25rem;
+    border-bottom: 3px solid {AMBER};
+}}
+.cat-header-title {{ font-size: 1.55rem; font-weight: 600; letter-spacing: -0.015em; line-height: 1.2; }}
+.cat-header-meta {{
+    display: flex; flex-wrap: wrap; gap: 0.35rem 1.5rem;
+    margin-top: 0.4rem; font-size: 0.88rem; color: #B9C6D3;
+}}
+.cat-header-meta b {{ color: #FFFFFF; font-weight: 500; }}
+
+/* Status stats: color bar = the status color used on the map and calendar.
+   Colors are inherited so the cards work in both themes. */
+.cat-stats {{
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 0.75rem; margin: 0.25rem 0 0.5rem;
+}}
+.cat-stat {{
+    background: rgba(128, 140, 155, 0.06);
+    border: 1px solid rgba(128, 140, 155, 0.25);
+    border-left: 5px solid var(--c);
+    border-radius: 10px; padding: 0.7rem 1rem;
+}}
+.cat-stat-value {{ font-size: 1.7rem; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1.2; }}
+.cat-stat-label {{ font-size: 0.85rem; opacity: 0.72; }}
+
+/* Month slot picker: keep the 7-day grid side by side, even on phones */
+[class*="st-key-slotpicker"] [data-testid="stHorizontalBlock"] {{ flex-wrap: nowrap !important; gap: 0.25rem !important; }}
+[class*="st-key-slotpicker"] [data-testid="stColumn"], [class*="st-key-slotpicker"] [data-testid="column"] {{
+    min-width: 0 !important; width: auto !important; flex: 1 1 0 !important;
+}}
+[class*="st-key-slotpicker"] button {{ padding: 0.2rem 0 !important; min-height: 2.1rem; font-variant-numeric: tabular-nums; }}
+[class*="st-key-slotpicker"] .stCaption, [class*="st-key-slotpicker"] [data-testid="stCaptionContainer"] {{ text-align: center; }}
+[class*="st-key-pd_open"] [data-testid="stBaseButton-secondary"] {{ background: rgba(34, 160, 90, 0.16); border-color: rgba(34, 160, 90, 0.5); }}
+[class*="st-key-pd_few"] [data-testid="stBaseButton-secondary"] {{ background: rgba(232, 163, 23, 0.18); border-color: rgba(232, 163, 23, 0.55); }}
+[class*="st-key-pd_full"] button {{ background: repeating-linear-gradient(45deg, rgba(128, 140, 155, 0.16) 0 4px, transparent 4px 8px) !important; }}
+[class*="st-key-pd_off"] button {{ opacity: 0.35; }}
+[class*="st-key-pt_open"] [data-testid="stBaseButton-secondary"] {{ border-color: rgba(34, 160, 90, 0.55); }}
+
+/* Next-up and selected-block cards */
+.cat-card {{ border-left: 4px solid {AMBER}; padding: 0.1rem 0 0.1rem 0.85rem; margin-bottom: 0.6rem; }}
+.cat-card.selected {{ border-left-color: {SCHEDULED_BLUE}; }}
+.cat-card-kicker {{ font-size: 0.82rem; opacity: 0.72; }}
+.cat-card-title {{ font-size: 1.05rem; font-weight: 600; margin: 0.1rem 0; }}
+.cat-card-sub {{ font-size: 0.9rem; opacity: 0.8; }}
+</style>
+""", unsafe_allow_html=True)
+
+if CONSOLE:
+    # Console theme: dark command strip with a faint grid, instrument-style stats
+    # in mono numerals, and one glow (on the next inspection). Nothing else moves.
+    st.markdown(f"""
+<style>
+.cat-header {{
+    background-color: {C_PANEL};
+    background-image:
+        linear-gradient(rgba(63, 208, 224, 0.06) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(63, 208, 224, 0.06) 1px, transparent 1px);
+    background-size: 22px 22px;
+    border: 1px solid {C_LINE};
+    border-bottom: 2px solid {C_SIGNAL};
+}}
+.cat-header-title {{ color: {C_TEXT}; }}
+.cat-header-meta {{ font-family: {MONO}; font-size: 0.82rem; color: {C_MUTED}; }}
+.cat-header-meta b {{ color: {C_SIGNAL}; font-weight: 500; }}
+
+.cat-stat {{
+    background: {C_PANEL};
+    border: 1px solid {C_LINE};
+    border-left: 3px solid var(--c);
+    box-shadow: -6px 0 18px -10px var(--c);
+}}
+.cat-stat-value {{ font-family: {MONO}; font-weight: 500; color: {C_TEXT}; }}
+.cat-stat-label {{ color: {C_MUTED}; opacity: 1; }}
+
+.cat-card-kicker, .cat-card-sub {{ font-family: {MONO}; font-size: 0.8rem; color: {C_MUTED}; opacity: 1; }}
+.cat-card-title {{ color: {C_TEXT}; }}
+.cat-card:not(.selected) {{
+    border-left-color: {AMBER};
+    box-shadow: -8px 0 22px -12px {AMBER};
+    animation: cat-next-glow 2.4s ease-out 1;
+}}
+@keyframes cat-next-glow {{
+    0%   {{ box-shadow: -8px 0 34px -6px {AMBER}; }}
+    100% {{ box-shadow: -8px 0 22px -12px {AMBER}; }}
+}}
+@media (prefers-reduced-motion: reduce) {{ .cat-card {{ animation: none !important; }} }}
+
+.stApp hr {{ border-top-color: {C_LINE}; }}
+[data-testid="stSidebar"] {{ border-right: 1px solid {C_LINE}; }}
+</style>
+""", unsafe_allow_html=True)
 
 
-# --- TIME ZONE SUPPORT ---
-# All times stored in the app are "wall-clock" times local to the deployment
-# (e.g. a 9:00 AM inspection in Houston is stored as 09:00). The deployment's
-# time zone is applied only when exporting, so Outlook gets the true moment.
+# =====================================================================
+# SESSION STATE & HELPERS
+# =====================================================================
+if "claims_df" not in st.session_state:
+    st.session_state.claims_df = None
 
-US_TIMEZONES = {
-    "Eastern": "America/New_York",
-    "Central": "America/Chicago",
-    "Mountain": "America/Denver",
-    "Arizona (no DST)": "America/Phoenix",
-    "Pacific": "America/Los_Angeles",
-    "Alaska": "America/Anchorage",
-    "Hawaii": "Pacific/Honolulu",
-    "Puerto Rico": "America/Puerto_Rico",
-}
+# Bumped whenever claims_df is changed outside the editor, so the data_editor
+# starts fresh instead of re-applying stale row edits.
+if "editor_version" not in st.session_state:
+    st.session_state.editor_version = 0
 
-_ET, _CT, _MT, _PT = "America/New_York", "America/Chicago", "America/Denver", "America/Los_Angeles"
-
-# Primary zone per state. Split states (TX, FL, KS, NE, ND, SD, ID, OR, KY, TN,
-# IN, MI) use the zone covering most of the state; override in the sidebar if needed.
-STATE_TIMEZONES = {
-    "CT": _ET, "DE": _ET, "DC": _ET, "FL": _ET, "GA": _ET, "IN": _ET, "KY": _ET, "ME": _ET,
-    "MD": _ET, "MA": _ET, "MI": _ET, "NH": _ET, "NJ": _ET, "NY": _ET, "NC": _ET, "OH": _ET,
-    "PA": _ET, "RI": _ET, "SC": _ET, "VT": _ET, "VA": _ET, "WV": _ET,
-    "AL": _CT, "AR": _CT, "IL": _CT, "IA": _CT, "KS": _CT, "LA": _CT, "MN": _CT, "MS": _CT,
-    "MO": _CT, "NE": _CT, "ND": _CT, "OK": _CT, "SD": _CT, "TN": _CT, "TX": _CT, "WI": _CT,
-    "CO": _MT, "ID": _MT, "MT": _MT, "NM": _MT, "UT": _MT, "WY": _MT,
-    "AZ": "America/Phoenix",
-    "CA": _PT, "NV": _PT, "OR": _PT, "WA": _PT,
-    "AK": "America/Anchorage", "HI": "Pacific/Honolulu", "PR": "America/Puerto_Rico",
-}
-
-STATE_NAMES = {
-    "ALABAMA": "AL", "ALASKA": "AK", "ARIZONA": "AZ", "ARKANSAS": "AR", "CALIFORNIA": "CA",
-    "COLORADO": "CO", "CONNECTICUT": "CT", "DELAWARE": "DE", "DISTRICT OF COLUMBIA": "DC",
-    "FLORIDA": "FL", "GEORGIA": "GA", "HAWAII": "HI", "IDAHO": "ID", "ILLINOIS": "IL",
-    "INDIANA": "IN", "IOWA": "IA", "KANSAS": "KS", "KENTUCKY": "KY", "LOUISIANA": "LA",
-    "MAINE": "ME", "MARYLAND": "MD", "MASSACHUSETTS": "MA", "MICHIGAN": "MI", "MINNESOTA": "MN",
-    "MISSISSIPPI": "MS", "MISSOURI": "MO", "MONTANA": "MT", "NEBRASKA": "NE", "NEVADA": "NV",
-    "NEW HAMPSHIRE": "NH", "NEW JERSEY": "NJ", "NEW MEXICO": "NM", "NEW YORK": "NY",
-    "NORTH CAROLINA": "NC", "NORTH DAKOTA": "ND", "OHIO": "OH", "OKLAHOMA": "OK", "OREGON": "OR",
-    "PENNSYLVANIA": "PA", "PUERTO RICO": "PR", "RHODE ISLAND": "RI", "SOUTH CAROLINA": "SC",
-    "SOUTH DAKOTA": "SD", "TENNESSEE": "TN", "TEXAS": "TX", "UTAH": "UT", "VERMONT": "VT",
-    "VIRGINIA": "VA", "WASHINGTON": "WA", "WEST VIRGINIA": "WV", "WISCONSIN": "WI", "WYOMING": "WY",
-}
+# Bumped after a pin is moved, so the map resets its last click.
+if "map_nonce" not in st.session_state:
+    st.session_state.map_nonce = 0
 
 
-def get_zone(tz_name: str) -> ZoneInfo:
+def book_claim_into_slot(claim_mask, slot):
+    """Schedules (or reschedules) the claim(s) in claim_mask into the given slot."""
+    st.session_state.claims_df.loc[claim_mask, "status"] = "Scheduled"
+    st.session_state.claims_df.loc[claim_mask, "start_time"] = slot["start"]
+    st.session_state.claims_df.loc[claim_mask, "end_time"] = slot["end"]
+    st.session_state.claims_df.loc[claim_mask, "scheduled_date"] = slot["date_str"]
+    st.session_state.claims_df.loc[claim_mask, "inspection_time"] = parse_wallclock(slot["start"]).strftime("%H:%M")
+    st.session_state.editor_version += 1
+
+
+def save_manual_pin(claim_id, lat, lon):
+    """Stores a rep-placed pin. Saved with progress, and kept on re-geocode."""
+    mask = st.session_state.claims_df["claim_id"].astype(str) == str(claim_id)
+    st.session_state.claims_df.loc[mask, "lat"] = float(lat)
+    st.session_state.claims_df.loc[mask, "lon"] = float(lon)
+    st.session_state.claims_df.loc[mask, "geo_quality"] = GEO_MANUAL
+    st.session_state.map_nonce += 1
+    st.session_state.editor_version += 1
+    st.toast(f"Pin saved for {claim_id}")
+
+
+def confirm_pin(claim_id):
+    """Marks the current pin as correct without moving it."""
+    mask = st.session_state.claims_df["claim_id"].astype(str) == str(claim_id)
+    st.session_state.claims_df.loc[mask, "geo_quality"] = GEO_CONFIRMED
+    st.session_state.map_nonce += 1
+    st.session_state.editor_version += 1
+    st.toast(f"Location confirmed for {claim_id}")
+
+
+def queue_next_pin_to_fix(current_claim_id):
+    """After a fix, jump the 'Claim to fix' picker to the next claim that still needs checking."""
+    cdf = st.session_state.claims_df
+    flagged = [str(c) for c, q in zip(cdf["claim_id"], cdf["geo_quality"])
+               if q in GEO_NEEDS_REVIEW and str(c) != str(current_claim_id)]
+    if flagged:
+        ids = [str(c) for c in cdf["claim_id"]]
+        cur_pos = ids.index(str(current_claim_id)) if str(current_claim_id) in ids else -1
+        after = [c for c in flagged if ids.index(c) > cur_pos]
+        st.session_state["pending_fix_claim_id"] = (after or flagged)[0]
+    else:
+        st.session_state["pending_fix_claim_id"] = None
+        st.session_state["all_pins_checked"] = True
+
+
+def _set_state(key, value):
+    st.session_state[key] = value
+
+
+def render_slot_picker(claim_id, claims_df, now, settings, current=None):
     """
-    Returns a ZoneInfo. On Windows this needs the 'tzdata' package
-    (pip install tzdata); raises ZoneInfoNotFoundError if it's missing.
+    Booking picker. Shows the next opening; with the calendar toggle on, shows a month
+    view colored by real availability, then the chosen day's bookings and open time.
+    Any start time (15-minute steps) and any length can be booked, as long as it doesn't
+    overlap another inspection. Returns a slot dict to book, or None.
+    `current` = (start, end) of this claim's existing booking when rescheduling.
     """
-    return ZoneInfo(tz_name)
+    cid = str(claim_id)
+    S = settings
+    busy = get_busy_intervals(claims_df, exclude_claim_id=cid)
+    openings = compute_openings(S["start_date"], S["end_date"], S["active_days"], S["day_start"],
+                                S["per_day"], S["window_hrs"], claims_df, now=now, exclude_claim_id=cid,
+                                latest_end=S["latest_end"])
 
+    def tfmt(dt):
+        return dt.strftime("%I:%M %p").lstrip("0")
 
-def state_to_timezone(state: Any) -> Optional[str]:
-    if state is None:
+    # Free time for each inspection day in the date range
+    gaps_by_day = {}
+    d = S["start_date"]
+    while d <= S["end_date"]:
+        if d.strftime("%a") in S["active_days"]:
+            gaps_by_day[d.isoformat()] = compute_day_gaps(d, S["day_start"], S["per_day"], S["window_hrs"],
+                                                          busy, now, S["latest_end"])
+        d += timedelta(days=1)
+    openings_by_day = defaultdict(list)
+    for o in openings:
+        openings_by_day[o["date_str"]].append(o)
+
+    days_with_time = [ds for ds, g in gaps_by_day.items() if g]
+    if not days_with_time:
+        st.info("No open time left in this date range. Extend the end date or adjust the day settings in the sidebar.")
         return None
-    s = str(state).strip().upper()
-    s = STATE_NAMES.get(s, s)
-    return STATE_TIMEZONES.get(s)
 
-
-def _extract_state_from_address(address: Any) -> Optional[str]:
-    """Scans an address from the end for a state abbreviation (zip comes after state)."""
-    if address is None:
+    if not st.toggle("📅 Pick a day and time", key=f"pick_cal_{cid}"):
+        if openings:
+            nxt = openings[0]
+            n_s, n_e = parse_wallclock(nxt["start"]), parse_wallclock(nxt["end"])
+            st.markdown(f"**Next opening:** {n_s.strftime('%a %b %d')}, {tfmt(n_s)} - {tfmt(n_e)}")
+            return nxt
+        st.info("No full-length openings left, but there is shorter open time. "
+                "Turn on **Pick a day and time** to book a shorter inspection.")
         return None
-    tokens = [t for t in re.split(r"[\s,]+", str(address).upper()) if t]
-    for tok in reversed(tokens[-4:]):
-        if tok in STATE_TIMEZONES:
-            return tok
-    return None
 
+    day_key, time_key, dur_key, month_key = (f"pick_day_{cid}", f"pick_time_{cid}",
+                                             f"pick_dur_{cid}", f"pick_month_{cid}")
 
-def detect_deployment_timezone(claims_df: Optional[pd.DataFrame], hotel_address: str = "",
-                               default: str = "America/Chicago") -> Tuple[str, str]:
-    """
-    Picks the most common time zone among the claims' states.
-    Returns (tz_name, source) where source is 'claim addresses', 'hotel address' or 'default'.
-    """
-    zones = []
-    if claims_df is not None and not claims_df.empty:
-        for _, row in claims_df.iterrows():
-            tz = state_to_timezone(row.get("state", "")) or \
-                 state_to_timezone(_extract_state_from_address(row.get("full_address", "")))
-            if tz:
-                zones.append(tz)
-    if zones:
-        return Counter(zones).most_common(1)[0][0], "claim addresses"
+    def first_free_start(ds):
+        if openings_by_day.get(ds):
+            return parse_wallclock(openings_by_day[ds][0]["start"])
+        return gaps_by_day[ds][0][0]
 
-    tz = state_to_timezone(_extract_state_from_address(hotel_address))
-    if tz:
-        return tz, "hotel address"
-    return default, "default"
+    if st.session_state.get(day_key) not in days_with_time:
+        st.session_state[day_key] = openings[0]["date_str"] if openings else days_with_time[0]
+        st.session_state[time_key] = first_free_start(st.session_state[day_key]).time()
+    if time_key not in st.session_state:
+        st.session_state[time_key] = first_free_start(st.session_state[day_key]).time()
+    if dur_key not in st.session_state:
+        st.session_state[dur_key] = float(S["window_hrs"])
+    sel_day = st.session_state[day_key]
 
+    # Months covered by the date range
+    months = []
+    y, mo = S["start_date"].year, S["start_date"].month
+    while (y, mo) <= (S["end_date"].year, S["end_date"].month):
+        months.append((y, mo))
+        y, mo = (y + 1, 1) if mo == 12 else (y, mo + 1)
+    if st.session_state.get(month_key) not in months:
+        d0 = date.fromisoformat(sel_day)
+        st.session_state[month_key] = (d0.year, d0.month) if (d0.year, d0.month) in months else months[0]
+    y, mo = st.session_state[month_key]
+    m_idx = months.index((y, mo))
 
-def parse_wallclock(value: Any) -> Optional[datetime]:
-    """
-    Parses stored/calendar times ('2026-10-06T09:00:00', '...Z', '...-05:00', '....000Z')
-    into a naive wall-clock datetime. Returns None for blanks/NaN.
-    The calendar runs in UTC mode, so a trailing Z/offset carries the same wall-clock value.
-    """
-    if value is None:
+    with st.container(key=f"slotpicker_{cid}"):
+        n1, n2, n3 = st.columns([1, 3, 1], vertical_alignment="center")
+        n1.button("◀", key=f"pm_prev_{cid}", disabled=m_idx == 0, use_container_width=True,
+                  on_click=_set_state, args=(month_key, months[max(m_idx - 1, 0)]))
+        n2.markdown(f"<div style='text-align:center;font-weight:600'>{pycal.month_name[mo]} {y}</div>",
+                    unsafe_allow_html=True)
+        n3.button("▶", key=f"pm_next_{cid}", disabled=m_idx == len(months) - 1, use_container_width=True,
+                  on_click=_set_state, args=(month_key, months[min(m_idx + 1, len(months) - 1)]))
+
+        for col, wd in zip(st.columns(7), ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"]):
+            col.caption(wd)
+
+        def pick_day(ds):
+            st.session_state[day_key] = ds
+            st.session_state[time_key] = first_free_start(ds).time()
+
+        for week in pycal.Calendar(firstweekday=6).monthdatescalendar(y, mo):
+            for col, d in zip(st.columns(7), week):
+                if d.month != mo:
+                    col.markdown("&nbsp;", unsafe_allow_html=True)
+                    continue
+                ds = d.isoformat()
+                if ds not in gaps_by_day:
+                    state, tip, can_pick = "off", "Not an inspection day", False
+                elif not gaps_by_day[ds]:
+                    state, tip, can_pick = "full", "No open time left", False
+                else:
+                    n_open = len(openings_by_day.get(ds, []))
+                    state = "open" if n_open >= 2 else "few"
+                    tip = "Open " + ", ".join(f"{tfmt(a)}-{tfmt(b)}" for a, b in gaps_by_day[ds])
+                    can_pick = True
+                col.button(str(d.day), key=f"pd_{state}_{cid}_{ds}", help=tip, disabled=not can_pick,
+                           use_container_width=True, type="primary" if ds == sel_day else "secondary",
+                           on_click=pick_day, args=(ds,))
+
+        st.caption("Green: room for 2+ inspections. Amber: room for 1 or less. Hatched: no open time. "
+                   "Faded: not an inspection day.")
+
+    # ---- The selected day ----
+    day_d = date.fromisoformat(sel_day)
+    ws, we = day_window(day_d, S["day_start"], S["per_day"], S["window_hrs"], S["latest_end"])
+    st.markdown(f"**{day_d.strftime('%A, %b %d')}** ({tfmt(ws)} - {tfmt(we)} working hours)")
+
+    rows = [(b["start"], f"{tfmt(b['start'])} - {tfmt(b['end'])}", f"Booked: {b['label']}")
+            for b in busy if b["start"].date() == day_d]
+    if current and current[0] and current[0].date() == day_d:
+        rows.append((current[0], f"{tfmt(current[0])} - {tfmt(current[1])}", "This claim's current time"))
+    rows += [(a, f"{tfmt(a)} - {tfmt(b)}", "Open") for a, b in gaps_by_day[sel_day]]
+    rows.append((we, f"After {tfmt(we)}", "Evening: type a later start time if the insured is available"))
+    st.markdown("  \n".join(
+        f":green[**{when}** · open]" if what == "Open" else f"{when} · {what}"
+        for _, when, what in sorted(rows, key=lambda r: r[0])
+    ))
+
+    # Quick starts: the beginning of each open block
+    quick = sorted({parse_wallclock(o["start"]) for o in openings_by_day.get(sel_day, [])} |
+                   {a for a, _ in gaps_by_day[sel_day]})
+    if quick:
+        st.caption("Quick start times")
+        for i in range(0, len(quick), 3):
+            for col, t in zip(st.columns(3), quick[i:i + 3]):
+                col.button(tfmt(t), key=f"pt_open_{cid}_{t.isoformat()}", use_container_width=True,
+                           type="primary" if st.session_state[time_key] == t.time() else "secondary",
+                           on_click=_set_state, args=(time_key, t.time()))
+
+    t1, t2 = st.columns(2)
+    t1.time_input("Start time", key=time_key, step=timedelta(minutes=15))
+    t2.number_input("Length (hours)", key=dur_key, min_value=0.25, max_value=8.0, step=0.25)
+
+    start_dt = datetime.combine(day_d, st.session_state[time_key])
+    requested_hrs = float(st.session_state[dur_key])
+    slot = make_slot(start_dt, requested_hrs)
+    end_dt = parse_wallclock(slot["end"])
+
+    def hm(minutes):
+        h, m = divmod(int(round(minutes)), 60)
+        return f"{h} hr {m} min" if h and m else (f"{h} hr" if h else f"{m} min")
+
+    if start_dt <= now:
+        st.error("That start time has already passed. Pick a later time.")
         return None
-    if isinstance(value, datetime):
-        return value.replace(tzinfo=None)
-    try:
-        if pd.isna(value):
+
+    # Can't start in the middle of another inspection
+    during = next((b for b in busy if b["start"] <= start_dt < b["end"]), None)
+    if during:
+        st.error(f"{tfmt(start_dt)} is during {during['label']} ({tfmt(during['start'])} - {tfmt(during['end'])}). "
+                 "Pick a start time in an open block.")
+        return None
+
+    # Not enough room before the next inspection: offer a shortened inspection,
+    # but only after the rep acknowledges it may not be enough time.
+    next_booking = min((b for b in busy if b["start"] > start_dt), key=lambda b: b["start"], default=None)
+    if next_booking and end_dt > next_booking["start"]:
+        fit_end = next_booking["start"]
+        fit_min = (fit_end - start_dt).total_seconds() / 60
+        if fit_min < 15:
+            st.error(f"Only {hm(fit_min)} open before {next_booking['label']} at {tfmt(fit_end)}. "
+                     "Pick an earlier start time.")
             return None
-    except (TypeError, ValueError):
-        pass
-    s = str(value).strip()
-    if not s or s.lower() in ("nan", "none", "nat"):
-        return None
-    if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
-    try:
-        dt = datetime.fromisoformat(s)
-    except ValueError:
-        try:
-            dt = pd.Timestamp(s).to_pydatetime()
-        except Exception:
+        st.warning(
+            f"Only **{hm(fit_min)}** is open before {next_booking['label']} at {tfmt(fit_end)}. "
+            f"You asked for {hm(requested_hrs * 60)}, so this may not be enough time for the inspection. "
+            f"If you continue, this inspection will be shortened to **{tfmt(start_dt)} - {tfmt(fit_end)}** to fit."
+        )
+        ack = st.checkbox("I understand. Book the shorter inspection.",
+                          key=f"ack_short_{cid}_{start_dt.isoformat()}_{requested_hrs}")
+        if not ack:
             return None
-    return dt.replace(tzinfo=None)
+        slot = make_slot(start_dt, fit_min / 60)
+        end_dt = fit_end
+
+    if start_dt < ws:
+        st.caption(f"Starts before your usual {tfmt(ws)} day start.")
+    st.markdown(f"**Selected:** {start_dt.strftime('%a %b %d')}, {tfmt(start_dt)} - {tfmt(end_dt)}")
+    return slot
 
 
-def format_slot_time(dt: Optional[datetime]) -> str:
-    """e.g. 'Wed 10/07 08:00 AM'"""
+def render_nav_buttons(address, lat, lon, geo_quality=None):
+    """Shows 'Google Maps' and 'Apple Maps' directions buttons side by side."""
+    links = build_navigation_links(address, lat, lon, prefer_coords=(geo_quality in GEO_REP_VERIFIED))
+    if not links:
+        return
+    b1, b2 = st.columns(2)
+    with b1:
+        st.link_button("🗺️ Google Maps", links["google"], use_container_width=True)
+    with b2:
+        st.link_button("🍎 Apple Maps", links["apple"], use_container_width=True)
+
+
+def fmt_dt(dt):
     return dt.strftime("%a %m/%d %I:%M %p") if dt else ""
 
 
-# --- NAVIGATION LINKS ---
-
-def build_navigation_links(address: Any, lat: Any = None, lon: Any = None, prefer_coords: bool = False) -> Dict[str, str]:
-    """
-    Returns turn-by-turn directions links for Google Maps and Apple Maps.
-    Uses the street ADDRESS when available so Google/Apple apply their own
-    rooftop-accurate geocoding (more reliable than our free geocoded pin).
-    Falls back to lat/lon if there's no address.
-    On phones these open the Google Maps / Apple Maps apps when installed.
-    """
-    addr = str(address).strip() if address is not None else ""
-    has_coords = False
-    try:
-        has_coords = lat is not None and lon is not None and pd.notna(lat) and pd.notna(lon)
-    except (TypeError, ValueError):
-        pass
-    if prefer_coords and has_coords:
-        # The rep placed this pin by hand, so it beats the street address.
-        dest = f"{float(lat)},{float(lon)}"
-    elif addr and addr.lower() != "nan":
-        dest = addr
-    else:
-        try:
-            if lat is None or lon is None or pd.isna(lat) or pd.isna(lon):
-                return {}
-        except (TypeError, ValueError):
-            return {}
-        dest = f"{float(lat)},{float(lon)}"
-
-    q = quote(dest)
-    return {
-        "google": f"https://www.google.com/maps/dir/?api=1&destination={q}",
-        "apple": f"https://maps.apple.com/?daddr={q}",
-    }
+def esc(value):
+    return html.escape(str(value)) if value is not None else ""
 
 
-# --- PRIORITY NORMALIZATION ---
+# =====================================================================
+# SIDEBAR
+# =====================================================================
+st.sidebar.header("Schedule settings")
+st.sidebar.caption("Switch between Field (light) and Console (dark) themes in the ⋮ menu at the top right, under Settings.")
+hotel_address = st.sidebar.text_input("Hotel base location", "1100 San Pedro Ave, San Antonio, TX")
+hotel_coords = geocode_hotel_address(hotel_address)
+if hotel_address.strip() and hotel_coords is None:
+    st.sidebar.warning("Couldn't find the hotel address. The first stop of each day will use "
+                       "the center of your claims for drive times.")
 
-def normalize_priority(val: Any) -> Optional[int]:
-    """
-    Converts any priority value (int, float, '2', '2.0', NaN, None, '') into
-    an int rank, or None if the claim is unranked. Used everywhere priority is
-    read so imports, saved-state CSVs, and data_editor edits all agree.
-    """
-    if val is None:
-        return None
-    try:
-        if pd.isna(val):
-            return None
-    except (TypeError, ValueError):
-        pass
-    val_str = str(val).strip()
-    if not val_str or val_str.lower() in ("nan", "none", "<na>"):
-        return None
-    try:
-        return int(float(val_str))
-    except (TypeError, ValueError, OverflowError):
-        return None
+col_d1, col_d2 = st.sidebar.columns(2)
+start_date = col_d1.date_input("Start date", date.today())
+end_date = col_d2.date_input("End date", date.today() + timedelta(days=5))
 
-
-# --- GEOCODING (free sources only) ---
-# Lookup chain per address, most to least precise:
-#   1. US Census batch (all addresses in one request)
-#   2. US Census single-line lookup (does its own address parsing)
-#   3. OpenStreetMap / Nominatim structured lookup, then free-text lookup
-#   4. ZIP code area, then city area (approximate, flagged for review)
-#   5. Not found (no pin; flagged so the rep can place it manually)
-# Every claim gets a geo_quality label so the map can show how each pin was placed.
-
-GEO_EXACT = "Exact address"
-GEO_CENSUS_APPROX = "Close address match"
-GEO_OSM = "OpenStreetMap match"
-GEO_ZIP = "ZIP area (approx.)"
-GEO_CITY = "City area (approx.)"
-GEO_NOT_FOUND = "Not found"
-GEO_MANUAL = "Set by rep"
-GEO_CONFIRMED = "Confirmed by rep"
-GEO_IMPORTED = "From import file"
-GEO_UNKNOWN = "Unknown"
-
-# Pins a rep should double-check or place by hand
-GEO_NEEDS_REVIEW = {GEO_ZIP, GEO_CITY, GEO_NOT_FOUND}
-
-# Pins a rep has checked: never flagged, never overwritten by a re-check,
-# and used for directions instead of the street address.
-GEO_REP_VERIFIED = {GEO_MANUAL, GEO_CONFIRMED}
-
-# Nominatim's usage policy asks for a real contact. Set NOMINATIM_CONTACT in
-# Streamlit secrets (Manage app > Settings > Secrets), or edit the fallback below.
-_NOMINATIM_CONTACT_FALLBACK = "replace-with-your-email@example.com"
-
-
-def _nominatim_headers() -> Dict[str, str]:
-    try:
-        contact = st.secrets.get("NOMINATIM_CONTACT", _NOMINATIM_CONTACT_FALLBACK)
-    except Exception:
-        contact = _NOMINATIM_CONTACT_FALLBACK
-    return {"User-Agent": f"CATClaimsSchedulerApp/5.0 ({contact})"}
-
-
-_last_nominatim_call = [0.0]
-
-
-def _nominatim_throttle():
-    """Nominatim allows at most 1 request per second."""
-    wait = 1.05 - (time.time() - _last_nominatim_call[0])
-    if wait > 0:
-        time.sleep(wait)
-    _last_nominatim_call[0] = time.time()
-
-
-def clean_address_for_geocoding(address: Any) -> str:
-    """
-    Strips things geocoders choke on: unit numbers (Apt 4, Unit B, #12, Lot 7),
-    parenthetical notes ("(rear house)"), and messy spacing/commas.
-    The original address is kept for display and directions.
-    """
-    if address is None:
-        return ""
-    s = str(address).strip()
-    if not s or s.lower() == "nan":
-        return ""
-    s = re.sub(r"\(.*?\)", " ", s)
-    s = re.sub(
-        r"\b(?:apt|apartment|unit|suite|bldg|building|trlr|trailer|spc|space|lot|rm|room)\b\.?\s*#?\s*[\w\-]+",
-        " ", s, flags=re.IGNORECASE
-    )
-    s = re.sub(r"#\s*[\w\-]+", " ", s)
-    s = re.sub(r"\s+", " ", s)
-    s = re.sub(r"\s*,\s*", ", ", s)
-    s = re.sub(r"(?:,\s*){2,}", ", ", s)
-    return s.strip(" ,")
-
-
-def _normalize_state(value: Any) -> str:
-    s = str(value or "").strip().upper()
-    if s == "NAN":
-        return ""
-    return STATE_NAMES.get(s, s)
-
-
-def parse_us_address(address_str: str, fallback_state: str = "") -> Tuple[str, str, str, str]:
-    """
-    Parses a raw address into (street, city, state, zip), reading from the END
-    of the address, where ZIP and state reliably sit. Handles:
-      "123 Oak St, San Antonio, TX 78201"
-      "123 Oak St, San Antonio TX 78201"
-      "123 Oak St, New Braunfels, Texas"
-    """
-    clean = clean_address_for_geocoding(address_str)
-    fallback_state = _normalize_state(fallback_state)
-    if not clean:
-        return "", "", fallback_state, ""
-
-    parts = [p.strip() for p in clean.split(",") if p.strip()]
-    zip_code, state = "", ""
-
-    # Peel ZIP, then state, off the end (they may be in their own comma parts)
-    for _ in range(2):
-        if not parts:
-            break
-        tokens = parts[-1].split()
-        if not zip_code and tokens and re.fullmatch(r"\d{5}(?:-\d{4})?", tokens[-1]):
-            zip_code = tokens.pop()[:5]
-        if not state and tokens:
-            two = " ".join(tokens[-2:]).upper() if len(tokens) >= 2 else ""
-            if two in STATE_NAMES:
-                state = STATE_NAMES[two]
-                tokens = tokens[:-2]
-            elif tokens[-1].upper() in STATE_TIMEZONES:
-                state = tokens.pop().upper()
-            elif tokens[-1].upper() in STATE_NAMES:
-                state = STATE_NAMES[tokens.pop().upper()]
-        if tokens:
-            parts[-1] = " ".join(tokens)
-        else:
-            parts.pop()
-        if zip_code and state:
-            break
-
-    street = parts[0] if parts else ""
-    city = parts[-1] if len(parts) >= 2 else ""
-    return street, city, state or fallback_state, zip_code
-
-
-def census_batch_geocode(parsed_addresses: List[Tuple[int, str, str, str, str]]) -> Dict[int, Tuple[float, float, str]]:
-    """
-    Sends structured addresses to the US Census Bureau Batch Geocoder in one request.
-    Returns row_index -> (lat, lon, quality).
-    """
-    if not parsed_addresses:
-        return {}
-
-    import csv
-    csv_buffer = io.StringIO()
-    writer = csv.writer(csv_buffer, quoting=csv.QUOTE_ALL)
-    for row_id, street, city, state, zip_code in parsed_addresses:
-        writer.writerow([row_id, street, city, state, zip_code])
-
-    results = {}
-    try:
-        response = requests.post(
-            "https://geocoding.geo.census.gov/geocoder/locations/addressbatch",
-            files={"addressFile": ("addresses.csv", csv_buffer.getvalue(), "text/csv")},
-            data={"benchmark": "Public_AR_Current", "vintage": "Current_Current"},
-            timeout=120
-        )
-        if response.status_code == 200:
-            # Columns: id, input address, match status, match type, matched address, "lon,lat", ...
-            for fields in csv.reader(io.StringIO(response.text)):
-                if len(fields) >= 6 and fields[2] == "Match" and "," in fields[5]:
-                    try:
-                        lon_str, lat_str = fields[5].split(",")
-                        quality = GEO_EXACT if fields[3] == "Exact" else GEO_CENSUS_APPROX
-                        results[int(fields[0])] = (float(lat_str), float(lon_str), quality)
-                    except ValueError:
-                        pass
-    except Exception as e:
-        st.warning(f"The US Census batch lookup didn't respond ({e}). Trying addresses one at a time.")
-
-    return results
-
-
-# --- Free Census reference files: ZIP and city center points ---
-# Downloaded once per app start from the Census "Gazetteer" files (about 1 MB each)
-# and kept in memory, so ZIP/city fallbacks are instant instead of online lookups.
-
-_GAZETTEER_YEARS = [2025, 2024, 2023, 2022, 2021, 2020]
-
-
-def _normalize_place_name(name: Any) -> str:
-    s = str(name or "").lower()
-    s = re.sub(r"[.\'’]", "", s)
-    s = re.sub(r"\bsaint\b", "st", s)
-    s = re.sub(r"\bfort\b", "ft", s)
-    s = re.sub(r"\bmount\b", "mt", s)
-    return re.sub(r"\s+", " ", s).strip()
-
-
-_PLACE_SUFFIX = re.compile(
-    r"\s+(?:city and borough|consolidated government.*|metropolitan government.*|unified government.*|"
-    r"urban county|city|town|village|cdp|borough|municipality|comunidad|zona urbana)(?:\s*\(balance\))?$",
-    re.IGNORECASE
+active_days = st.sidebar.multiselect(
+    "Inspection days",
+    ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
+    default=["Mon", "Tue", "Wed", "Thu", "Fri"]
 )
 
+inspections_per_day = st.sidebar.slider(
+    "Inspections per day", 1, 8, 3,
+    help="Sets the length of your working day: day start time + this many windows."
+)
 
-@st.cache_resource(show_spinner=False)
-def _load_gazetteer(kind: str) -> Dict[Any, Tuple[float, float]]:
-    """kind = 'zcta' (ZIP codes) or 'place' (cities/towns). Raises if unavailable (not cached)."""
-    import zipfile
-    for year in _GAZETTEER_YEARS:
-        url = (f"https://www2.census.gov/geo/docs/maps-data/data/gazetteer/"
-               f"{year}_Gazetteer/{year}_Gaz_{kind}_national.zip")
-        try:
-            resp = requests.get(url, timeout=45)
-            if resp.status_code != 200:
-                continue
-            with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
-                txt_name = next(n for n in zf.namelist() if n.lower().endswith(".txt"))
-                with zf.open(txt_name) as fh:
-                    gdf = pd.read_csv(fh, sep="\t", dtype=str, encoding="latin-1")
-            gdf.columns = [c.strip() for c in gdf.columns]
-            out = {}
-            for _, r in gdf.iterrows():
-                try:
-                    lat, lon = float(r["INTPTLAT"]), float(str(r["INTPTLONG"]).strip())
-                except (ValueError, KeyError):
-                    continue
-                if kind == "zcta":
-                    out[str(r["GEOID"]).strip().zfill(5)] = (lat, lon)
-                else:
-                    key = (str(r["USPS"]).strip().upper(),
-                           _normalize_place_name(_PLACE_SUFFIX.sub("", str(r["NAME"]).strip())))
-                    out.setdefault(key, (lat, lon))
-            if out:
-                return out
-        except Exception:
-            continue
-    raise LookupError(f"Census {kind} reference file unavailable")
+window_hrs = st.sidebar.number_input(
+    "Window length (hours)",
+    help="Default inspection length. Openings are suggested in blocks of this length, "
+         "but you can book any start time and length.",
+    min_value=0.25,
+    max_value=8.00,
+    value=2.50,
+    step=0.25
+)
 
+start_time_input = st.sidebar.time_input("Day start time", value=datetime.strptime("08:00", "%H:%M").time())
+latest_end_input = st.sidebar.time_input(
+    "Latest end for suggested openings", value=datetime.strptime("19:00", "%H:%M").time(),
+    help="Suggested openings never run past this time. You can still book later by hand "
+         "if the insured is available."
+)
 
-def _gazetteer(kind: str) -> Dict[Any, Tuple[float, float]]:
-    try:
-        return _load_gazetteer(kind)
-    except Exception:
-        return {}
+rec_mode_label = st.sidebar.radio(
+    "Recommendations",
+    ["Closest to previous stop (faster)", "Least added driving (smarter, may take longer)"],
+    key="rec_mode",
+    help="Closest: ranks claims by drive time from where you'll be before the opening. "
+         "Least added driving: also counts the drive to where you're going next (your next "
+         "inspection, or the hotel at the end of the day), so claims on the way rank higher. "
+         "It looks up about twice as many drive times, so it can be slower."
+)
+REC_MODE = "detour" if rec_mode_label.startswith("Least") else "fast"
 
+# --- DEPLOYMENT TIME ZONE ---
+# All schedule times are local to the deployment; this zone is used for the
+# Outlook export and for knowing which inspections are already in the past.
+detected_tz, detected_source = detect_deployment_timezone(st.session_state.claims_df, hotel_address)
+detected_label = next((k for k, v in US_TIMEZONES.items() if v == detected_tz), detected_tz)
+tz_choices = [f"Auto-detect ({detected_label})"] + list(US_TIMEZONES.keys())
+tz_choice = st.sidebar.selectbox(
+    "Deployment time zone",
+    tz_choices,
+    index=0,
+    help=f"Auto-detected from {detected_source}. Override if the deployment is in a split-zone "
+         "area (e.g. El Paso, the Florida panhandle, western Kansas/Nebraska/Dakotas)."
+)
+deployment_tz = detected_tz if tz_choice.startswith("Auto-detect") else US_TIMEZONES[tz_choice]
+tz_display = detected_label if tz_choice.startswith("Auto-detect") else tz_choice
 
-# --- Census single-address lookups (safe to run in parallel) ---
+try:
+    deployment_zone = get_zone(deployment_tz)
+    now_local = datetime.now(deployment_zone).replace(tzinfo=None)
+    ics_tz = deployment_tz
+except Exception:
+    st.sidebar.error("Time zone data isn't installed. Run `pip install tzdata` (needed on Windows). "
+                     "Until then, calendar exports use floating local times.")
+    now_local = datetime.now()
+    ics_tz = None
 
-_ONELINE_CACHE: Dict[str, Optional[Tuple[float, float, str]]] = {}
+# Openings come from the real bookings: any free time inside each day's working
+# window, in blocks of the default window length starting at the earliest free time.
+schedule_settings = {
+    "start_date": start_date, "end_date": end_date, "active_days": active_days,
+    "day_start": start_time_input, "per_day": inspections_per_day, "window_hrs": window_hrs,
+    "latest_end": latest_end_input,
+}
+all_slots = compute_openings(
+    start_date, end_date, active_days, start_time_input, inspections_per_day, window_hrs,
+    st.session_state.claims_df, now=now_local, latest_end=latest_end_input
+)
 
-# Rural road names the Census often stores spelled out
-_ROAD_EXPANSIONS = [
-    (r"\bFM\b", "Farm to Market Road"),
-    (r"\bRM\b", "Ranch to Market Road"),
-    (r"\bRR\b", "Ranch Road"),
-    (r"\bCR\b", "County Road"),
-    (r"\bSH\b", "State Highway"),
-    (r"\bHWY\b", "Highway"),
-]
+# --- MAP TOOLS & SAVED PROGRESS ---
+st.sidebar.markdown("---")
+st.sidebar.subheader("Map & saved progress")
 
+if st.session_state.claims_df is not None:
+    if st.sidebar.button("🔄 Re-check all addresses", type="secondary",
+                         help="Looks up every address again. Pins you placed or confirmed are kept."):
+        cdf = st.session_state.claims_df
+        if "geo_quality" not in cdf.columns:
+            cdf["geo_quality"] = GEO_UNKNOWN
+        redo_idx = cdf.index[~cdf["geo_quality"].isin(GEO_REP_VERIFIED)].tolist()
+        with st.spinner("Re-checking addresses..."):
+            addrs = [(cdf.at[i, "full_address"], cdf.at[i, "state"] if "state" in cdf.columns else "") for i in redo_idx]
+            results = batch_geocode_addresses(addrs)
+            for i, (lat, lon, quality) in zip(redo_idx, results):
+                cdf.at[i, "lat"] = lat
+                cdf.at[i, "lon"] = lon
+                cdf.at[i, "geo_quality"] = quality
+        st.session_state.map_nonce += 1
+        st.rerun()
 
-def _street_variants(street: str) -> List[str]:
-    variants = [street]
-    expanded = street
-    for pattern, replacement in _ROAD_EXPANSIONS:
-        expanded = re.sub(pattern, replacement, expanded, flags=re.IGNORECASE)
-    if expanded != street:
-        variants.append(expanded)
-    return variants
-
-
-def _census_oneline_raw(address: str) -> Optional[Tuple[float, float, str]]:
-    """No Streamlit calls in here, so it can run in worker threads."""
-    if address in _ONELINE_CACHE:
-        return _ONELINE_CACHE[address]
-    resp = requests.get(
-        "https://geocoding.geo.census.gov/geocoder/locations/onelineaddress",
-        params={"address": address, "benchmark": "Public_AR_Current", "format": "json"},
-        timeout=12
+    st.sidebar.markdown(" ")
+    csv_bytes = st.session_state.claims_df.to_csv(index=False).encode('utf-8')
+    st.sidebar.download_button(
+        label="📥 Save progress",
+        data=csv_bytes,
+        file_name=f"cat_scheduler_state_{date.today().strftime('%Y%m%d')}.csv",
+        mime="text/csv"
     )
-    resp.raise_for_status()
-    matches = resp.json().get("result", {}).get("addressMatches", [])
-    result = None
-    if matches:
-        c = matches[0]["coordinates"]
-        result = (float(c["y"]), float(c["x"]), GEO_CENSUS_APPROX if len(matches) > 1 else GEO_EXACT)
-    _ONELINE_CACHE[address] = result
-    return result
 
-
-def _census_retry(address: str, state: str) -> Optional[Tuple[float, float, str]]:
-    """Census single-line lookup, also trying spelled-out rural road names."""
-    street, city, st_abbr, zip_code = parse_us_address(address, fallback_state=state)
-    if not street:
-        return None
-    tail = ", ".join(p for p in [city, f"{st_abbr} {zip_code}".strip()] if p)
-    for variant in _street_variants(street):
-        query = f"{variant}, {tail}" if tail else variant
+saved_file = st.sidebar.file_uploader("📂 Load saved progress", type=["csv"], key="load_state_csv")
+if saved_file is not None:
+    # Only load a given file once. Without this check the saved CSV would be
+    # re-read on every rerun and overwrite any edits.
+    file_sig = (saved_file.name, saved_file.size)
+    if st.session_state.get("loaded_state_sig") != file_sig:
         try:
-            hit = _census_oneline_raw(query)
-        except Exception:
-            hit = None
-        if hit:
-            return hit
-    return None
+            loaded_df = pd.read_csv(saved_file)
+            st.session_state.claims_df = loaded_df
+            st.session_state.loaded_state_sig = file_sig
+            st.session_state.editor_version += 1
+            st.session_state.map_nonce += 1
+            st.sidebar.success("Progress restored.")
+        except Exception as e:
+            st.sidebar.error(f"Couldn't load that file: {e}")
 
 
-def _centroid_fallback(address: str, state: str) -> Tuple[Optional[float], Optional[float], str]:
-    """Instant ZIP-area, then city-area location from the Census reference files."""
-    _, city, st_abbr, zip_code = parse_us_address(address, fallback_state=state)
-    if zip_code:
-        hit = _gazetteer("zcta").get(zip_code)
-        if hit:
-            return hit[0], hit[1], GEO_ZIP
-    if city and st_abbr:
-        hit = _gazetteer("place").get((st_abbr, _normalize_place_name(city)))
-        if hit:
-            return hit[0], hit[1], GEO_CITY
-    return None, None, GEO_NOT_FOUND
+# =====================================================================
+# HEADER
+# =====================================================================
+st.markdown(f"""
+<div class="cat-header">
+  <div class="cat-header-title">CAT Dynamic Scheduling</div>
+  <div class="cat-header-meta">
+    <span><b>{esc(tz_display)}</b> time</span>
+    <span><b>{start_date.strftime('%b %d')}</b> to <b>{end_date.strftime('%b %d, %Y')}</b></span>
+    <span>Base: <b>{esc(hotel_address) or 'not set'}</b></span>
+  </div>
+</div>
+""", unsafe_allow_html=True)
 
 
-def batch_geocode_addresses(address_state_list: List[Tuple[str, Optional[str]]]) -> List[Tuple[Optional[float], Optional[float], str]]:
-    """
-    Fast geocoding for imports:
-      1. Census batch (one request for everything)
-      2. Census single-line retries for misses, run in parallel (incl. rural road spellings)
-      3. Instant ZIP-area / city-area location from Census reference files (flagged for review)
-    Returns (lat, lon, quality) per item; lat/lon are None when nothing was found.
-    """
-    from concurrent.futures import ThreadPoolExecutor
+# =====================================================================
+# IMPORT
+# =====================================================================
+st.subheader("Import claims")
+uploaded_file = st.file_uploader("Upload a CSV or Excel claims list", type=["csv", "xlsx"])
 
-    total = len(address_state_list)
-    if total == 0:
-        return []
-
-    progress_bar = st.progress(0.05, text="Looking up addresses with the US Census...")
-
-    items = []
-    for item in address_state_list:
-        addr, st_val = item if isinstance(item, tuple) else (item, "")
-        items.append((str(addr) if addr is not None else "", st_val or ""))
-
-    parsed = [(idx, *parse_us_address(addr, fallback_state=st_val)) for idx, (addr, st_val) in enumerate(items)]
-    results: Dict[int, Tuple[Optional[float], Optional[float], str]] = dict(census_batch_geocode(parsed))
-
-    misses = [i for i in range(total) if i not in results]
-    if misses:
-        progress_bar.progress(0.55, text=f"Retrying {len(misses)} addresses the Census batch couldn't match...")
-        with ThreadPoolExecutor(max_workers=6) as pool:
-            retry_hits = list(pool.map(lambda i: _census_retry(*items[i]), misses))
-        for i, hit in zip(misses, retry_hits):
-            if hit:
-                results[i] = hit
-
-    still_missing = [i for i in range(total) if i not in results]
-    if still_missing:
-        progress_bar.progress(0.85, text=f"Placing {len(still_missing)} addresses by ZIP code or city...")
-        for i in still_missing:
-            results[i] = _centroid_fallback(*items[i])
-
-    progress_bar.empty()
-    return [results[i] for i in range(total)]
-
-
-def parse_coordinates(text: Any) -> Optional[Tuple[float, float]]:
-    """
-    Pulls a lat/lon pair out of pasted text: "29.4241, -98.4936",
-    or a Google Maps link containing "@29.4241,-98.4936" or "q=29.4241,-98.4936".
-    """
-    if not text:
-        return None
-    m = re.search(r"(-?\d{1,2}\.\d+)\s*,\s*(-?\d{1,3}\.\d+)", str(text))
-    if not m:
-        return None
-    lat, lon = float(m.group(1)), float(m.group(2))
-    if -90 <= lat <= 90 and -180 <= lon <= 180:
-        return lat, lon
-    return None
-
-
-@st.cache_data(show_spinner=False)
-def _geocode_hotel_cached(address: str) -> Tuple[float, float]:
-    """Raises if not found, so failures aren't cached and are retried next run."""
+if uploaded_file is not None and st.session_state.claims_df is None:
     try:
-        resp = requests.get(
-            "https://geocoding.geo.census.gov/geocoder/locations/onelineaddress",
-            params={"address": address, "benchmark": "Public_AR_Current", "format": "json"},
-            timeout=8
-        )
-        if resp.status_code == 200:
-            matches = resp.json().get("result", {}).get("addressMatches", [])
-            if matches:
-                c = matches[0]["coordinates"]
-                return float(c["y"]), float(c["x"])
-    except Exception:
-        pass
-
-    try:
-        resp = requests.get(
-            "https://nominatim.openstreetmap.org/search",
-            params={"q": address, "format": "json", "limit": 1, "countrycodes": "us"},
-            headers={"User-Agent": "CATClaimsSchedulerApp/4.0 (contact@example.com)"},
-            timeout=6
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            if data:
-                return float(data[0]["lat"]), float(data[0]["lon"])
-    except Exception:
-        pass
-
-    raise LookupError(f"Could not geocode hotel address: {address}")
+        with st.spinner("Reading the claims list and looking up addresses..."):
+            raw_df = pd.read_csv(uploaded_file) if uploaded_file.name.endswith(".csv") else pd.read_excel(uploaded_file)
+            st.session_state.claims_df = process_imported_table(raw_df)
+            st.rerun()
+    except Exception as e:
+        st.error(f"Couldn't read that file: {e}")
 
 
-def geocode_hotel_address(address: str) -> Optional[Tuple[float, float]]:
-    """
-    Geocodes the hotel/base address. Returns None (instead of a random fallback point)
-    when it can't be found, so the app can warn the user.
-    """
-    clean = str(address or "").strip()
-    if not clean:
-        return None
-    try:
-        return _geocode_hotel_cached(clean)
-    except Exception:
-        return None
+# =====================================================================
+# DASHBOARD
+# =====================================================================
+if st.session_state.claims_df is not None:
+    cdf = st.session_state.claims_df
+    for required_col in ["scheduled_date", "inspection_time", "start_time", "end_time"]:
+        if required_col not in cdf.columns:
+            cdf[required_col] = ""
+    for text_col in ["scheduled_date", "inspection_time"]:
+        cdf[text_col] = cdf[text_col].fillna("").astype(str)
+    if "priority" not in cdf.columns:
+        cdf["priority"] = None
+    if "geo_quality" not in cdf.columns:
+        cdf["geo_quality"] = GEO_UNKNOWN
+    cdf["geo_quality"] = cdf["geo_quality"].fillna(GEO_UNKNOWN).astype(str)
+    cdf["lat"] = pd.to_numeric(cdf["lat"], errors="coerce")
+    cdf["lon"] = pd.to_numeric(cdf["lon"], errors="coerce")
 
+    # Keep priority as a float column (NaN = unranked) so it accepts both
+    # integer ranks and blanks from the editor without dtype errors.
+    cdf["priority"] = pd.to_numeric(cdf["priority"].apply(normalize_priority), errors="coerce").astype(float)
 
-# Cached so that the extra reruns triggered by editing priorities don't
-# re-query OSRM for every unscheduled claim each time.
-@st.cache_data(show_spinner=False)
-def get_osrm_route(start_lat: float, start_lon: float, end_lat: float, end_lon: float) -> Tuple[float, float]:
-    """
-    Calculates driving distance (miles) and duration (minutes) between two points using OSRM.
-    Fallback to Haversine approximation if service is unreachable.
-    """
-    try:
-        url = f"http://router.project-osrm.org/route/v1/driving/{start_lon},{start_lat};{end_lon},{end_lat}"
-        params = {"overview": "false"}
-        resp = requests.get(url, params=params, timeout=3)
-        if resp.status_code == 200:
-            data = resp.json()
-            if "routes" in data and len(data["routes"]) > 0:
-                meters = data["routes"][0]["distance"]
-                seconds = data["routes"][0]["duration"]
-                miles = round(meters / 1609.34, 1)
-                minutes = int(round(seconds / 60.0))
-                return miles, minutes
-    except Exception:
-        pass
+    df = st.session_state.claims_df
+    review_mask = df["geo_quality"].isin(GEO_NEEDS_REVIEW)
 
-    R = 3958.8
-    dlat = np.radians(end_lat - start_lat)
-    dlon = np.radians(end_lon - start_lon)
-    a = np.sin(dlat / 2)**2 + np.cos(np.radians(start_lat)) * np.cos(np.radians(end_lat)) * np.sin(dlon / 2)**2
-    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
-    miles = round(R * c, 1)
-    minutes = int(round(miles * 2.0))
-    return miles, minutes
-
-
-# --- TABLE INGESTION & PARSING ---
-
-def process_imported_table(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Processes imported CSV/Excel dataframe by detecting formatted claim IDs,
-    insured names, full addresses, and priority ranks (leaving blank if unspecified).
-    """
-    col_map = {str(c).strip().lower(): c for c in df.columns}
-    
-    claim_col = None
-    insured_col = None
-    street_col = None
-    city_col = None
-    state_col = None
-    zip_col = None
-    full_addr_col = None
-    priority_col = None
-
-    claim_pattern = re.compile(r'^[A-Za-z]{2,5}\d+[\-\_]?\d*$', re.IGNORECASE)
-    
-    for c in df.columns:
-        sample_vals = df[c].dropna().astype(str).str.strip().tolist()[:10]
-        if any(claim_pattern.match(val) for val in sample_vals):
-            claim_col = c
-            break
-
-    if not claim_col:
-        for low_c, orig_c in col_map.items():
-            if any(k in low_c for k in ["claim", "file", "policy"]):
-                claim_col = orig_c
-                break
-
-    for low_c, orig_c in col_map.items():
-        if any(k == low_c for k in ["full address", "full_address", "loss address", "property address", "location address", "site address", "address"]):
-            full_addr_col = orig_c
-            break
-
-    for low_c, orig_c in col_map.items():
-        if not insured_col and any(k in low_c for k in ["insured", "customer", "policyholder", "client", "name"]):
-            insured_col = orig_c
-        elif not street_col and any(k in low_c for k in ["street", "address 1", "addr1", "address_line_1", "loss_street", "property_street", "location", "site"]):
-            if "state" not in low_c and low_c != "st":
-                street_col = orig_c
-        elif not city_col and any(k in low_c for k in ["town", "city", "municipality", "village"]):
-            city_col = orig_c
-        elif not state_col and (low_c in ["state", "st", "province"] or "state" in low_c):
-            state_col = orig_c
-        elif not zip_col and any(k in low_c for k in ["zip", "postal", "zipcode", "zip_code"]):
-            zip_col = orig_c
-        elif not priority_col and any(k in low_c for k in ["priority", "rank", "prio"]):
-            priority_col = orig_c
-
-    address_list = []
-    metadata = []
-
-    for idx, row in df.iterrows():
-        if claim_col and pd.notna(row[claim_col]) and str(row[claim_col]).strip() != "":
-            raw_claim = str(row[claim_col]).strip()
-            claim_num = raw_claim[:-2] if raw_claim.endswith(".0") else raw_claim
-        else:
-            claim_num = f"CLM-{idx + 1001}"
-
-        insured = str(row[insured_col]).strip() if insured_col and pd.notna(row[insured_col]) else f"Policyholder {idx + 1}"
-        state_val = str(row[state_col]).strip() if state_col and pd.notna(row[state_col]) else ""
-
-        # Priority parsing: default to None (blank) if not specified or invalid
-        prio_val = normalize_priority(row[priority_col]) if priority_col else None
-
-        if full_addr_col and pd.notna(row[full_addr_col]) and str(row[full_addr_col]).strip() != "":
-            full_address = str(row[full_addr_col]).strip()
-        else:
-            street_val = str(row[street_col]).strip() if street_col and pd.notna(row[street_col]) else ""
-            city_val = str(row[city_col]).strip() if city_col and pd.notna(row[city_col]) else ""
-            zip_val = str(row[zip_col]).strip() if zip_col and pd.notna(row[zip_col]) else ""
-
-            city_state_zip = " ".join(filter(None, [f"{city_val}, {state_val}".strip(", "), zip_val]))
-            if street_val:
-                full_address = f"{street_val}, {city_state_zip}".strip(", ")
-            elif city_state_zip:
-                full_address = city_state_zip
-            else:
-                full_address = ", ".join([str(v).strip() for v in row.values if pd.notna(v) and str(v).strip() != ""])
-
-        has_coords = "lat" in df.columns and "lon" in df.columns and pd.notna(row["lat"]) and pd.notna(row["lon"])
-        pre_lat = float(row["lat"]) if has_coords else None
-        pre_lon = float(row["lon"]) if has_coords else None
-
-        address_list.append(full_address)
-        metadata.append({
-            "claim_id": claim_num,
-            "insured_name": insured,
-            "display_label": f"{claim_num} - {insured}",
-            "full_address": full_address,
-            "state": state_val,
-            "priority": prio_val,
-            "status": "Unscheduled",
-            "start_time": None,
-            "end_time": None,
-            "scheduled_date": "",
-            "inspection_time": "",
-            "pre_lat": pre_lat,
-            "pre_lon": pre_lon
-        })
-
-    addrs_to_geocode = [
-        (m["full_address"], m["state"]) for m in metadata if m["pre_lat"] is None
+    # --- STATUS STATS ---
+    scheduled_count = int((df["status"] == "Scheduled").sum())
+    stats = [
+        ("Total claims", len(df), INK),
+        ("Unscheduled", int((df["status"] == "Unscheduled").sum()), RED),
+        ("Scheduled", scheduled_count, SCHEDULED_BLUE),
+        ("Ignored", int((df["status"] == "Ignored").sum()), IGNORED_GRAY),
+        ("Location issues", int(review_mask.sum()), ISSUE_ORANGE),
     ]
-    geocoded_coords = batch_geocode_addresses(addrs_to_geocode) if addrs_to_geocode else []
+    st.markdown(
+        '<div class="cat-stats">' + "".join(
+            f'<div class="cat-stat" style="--c:{color}">'
+            f'<div class="cat-stat-value">{value}</div><div class="cat-stat-label">{label}</div></div>'
+            for label, value, color in stats
+        ) + "</div>",
+        unsafe_allow_html=True
+    )
 
-    geo_idx = 0
-    processed_rows = []
-    for m in metadata:
-        if m["pre_lat"] is not None:
-            lat, lon, quality = m["pre_lat"], m["pre_lon"], GEO_IMPORTED
-        else:
-            lat, lon, quality = geocoded_coords[geo_idx]
-            geo_idx += 1
+    if review_mask.any():
+        st.warning(f"{int(review_mask.sum())} claim(s) have an approximate or missing location. "
+                   "Turn on **Fix pin locations** in the Map tab to confirm or move them.")
 
-        row_dict = dict(m)
-        del row_dict["pre_lat"]
-        del row_dict["pre_lon"]
-        row_dict["lat"] = lat
-        row_dict["lon"] = lon
-        row_dict["geo_quality"] = quality
-        processed_rows.append(row_dict)
+    st.markdown("---")
 
-    return pd.DataFrame(processed_rows)
+    if scheduled_count > 0:
+        ics_data = export_claims_to_ics(df, ics_tz)
+        st.download_button(
+            label=f"📅 Export {scheduled_count} inspection(s) to Outlook ({tz_display} time)",
+            data=ics_data,
+            file_name="cat_inspection_schedule.ics",
+            mime="text/calendar"
+        )
+        st.markdown(" ")
 
+    tab_cal, tab_map = st.tabs(["Calendar", "Map"])
 
-# --- SLOT GENERATION & CONFLICT CHECKING ---
+    # -----------------------------------------------------------------
+    # CALENDAR
+    # -----------------------------------------------------------------
+    with tab_cal:
+        scheduled_claims = df[df["status"] == "Scheduled"].copy()
+        scheduled_claims["_start_dt"] = [parse_wallclock(v) for v in scheduled_claims["start_time"]]
+        scheduled_claims["_end_dt"] = [parse_wallclock(v) for v in scheduled_claims["end_time"]]
+        # Boolean Series (not a plain list): with zero scheduled claims, an empty list
+        # would select zero COLUMNS instead of zero rows and drop "_start_dt".
+        has_times = pd.Series(
+            [s is not None and e is not None for s, e in zip(scheduled_claims["_start_dt"], scheduled_claims["_end_dt"])],
+            index=scheduled_claims.index, dtype=bool
+        )
+        scheduled_claims = scheduled_claims.loc[has_times]
 
-def generate_available_slots(
-    start_date: date,
-    end_date: date,
-    active_days: List[str],
-    inspections_per_day: int,
-    start_time_input: Any,
-    window_hrs: float
-) -> List[Dict[str, Any]]:
-    day_map = {0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri", 5: "Sat", 6: "Sun"}
-    slots = []
-    
-    curr = start_date
-    while curr <= end_date:
-        if day_map[curr.weekday()] in active_days:
-            base_start_dt = datetime.combine(curr, start_time_input)
-            
-            for i in range(inspections_per_day):
-                s_dt = base_start_dt + timedelta(hours=i * window_hrs)
-                e_dt = s_dt + timedelta(hours=window_hrs)
-                
-                date_str = curr.strftime("%Y-%m-%d")
-                time_label = f"{s_dt.strftime('%I:%M %p')} - {e_dt.strftime('%I:%M %p')}"
-                
-                slots.append({
-                    "slot_label": f"{date_str} ({day_map[curr.weekday()]}) | {time_label}",
-                    "date_str": date_str,
-                    "start": s_dt.isoformat(),
-                    "end": e_dt.isoformat()
+        # --- NEXT UP ---
+        is_upcoming = pd.Series([s > now_local for s in scheduled_claims["_start_dt"]],
+                                index=scheduled_claims.index, dtype=bool)
+        upcoming = scheduled_claims.loc[is_upcoming]
+        upcoming = upcoming.sort_values("_start_dt") if not upcoming.empty else upcoming
+        next_id = str(upcoming.iloc[0]["claim_id"]) if not upcoming.empty else None
+
+        if next_id:
+            nr = upcoming.iloc[0]
+            mins_until = int((nr["_start_dt"] - now_local).total_seconds() // 60)
+            until_txt = f"{mins_until // 60}h {mins_until % 60}m" if mins_until >= 60 else f"{mins_until} min"
+            with st.container(border=True):
+                st.markdown(f"""
+<div class="cat-card">
+  <div class="cat-card-kicker">Next inspection, starts in {until_txt}</div>
+  <div class="cat-card-title">{esc(nr['claim_id'])} - {esc(nr['insured_name'])}</div>
+  <div class="cat-card-sub">{fmt_dt(nr['_start_dt'])}<br>{esc(nr['full_address'])}</div>
+</div>""", unsafe_allow_html=True)
+                render_nav_buttons(nr["full_address"], nr["lat"], nr["lon"], nr["geo_quality"])
+
+        # --- EVENTS: past = hatched, next = amber, others = blue ---
+        # Past blocks stay draggable in case the calendar wasn't kept up to date.
+        calendar_events = []
+        for _, row in scheduled_claims.iterrows():
+            cid = str(row["claim_id"])
+            event = {
+                "id": cid,
+                "title": f"[{cid}] {row['insured_name']}",
+                "start": row["_start_dt"].isoformat(),
+                "end": row["_end_dt"].isoformat(),
+                # Inspections can't be dragged or resized over each other
+                "overlap": False,
+            }
+            if row["_end_dt"] <= now_local:
+                event.update({
+                    "classNames": ["past-event"],
+                    "backgroundColor": "#3A4654" if CONSOLE else "#A3AFBF",
+                    "borderColor": "#566373" if CONSOLE else "#7B8797",
+                    "textColor": "#C3CFDB" if CONSOLE else "#1F2937",
                 })
-        curr += timedelta(days=1)
-        
-    return slots
-
-
-# --- FLEXIBLE AVAILABILITY ---
-# Each inspection day is a working window (day start time + inspections per day x window
-# length). Open time is whatever the actual bookings leave free, so shortening or moving
-# an inspection immediately opens earlier time. Starts snap to 15-minute steps.
-
-STEP_MINUTES = 15
-_DAY_ABBR = {0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri", 5: "Sat", 6: "Sun"}
-
-
-def round_up_to_step(dt: datetime, step_min: int = STEP_MINUTES) -> datetime:
-    dt = dt.replace(second=0, microsecond=0)
-    extra = dt.minute % step_min
-    return dt + timedelta(minutes=step_min - extra) if extra else dt
-
-
-def day_window(day: date, day_start_time: Any, inspections_per_day: int, window_hrs: float,
-               latest_end: Any = None) -> Tuple[datetime, datetime]:
-    """
-    The usual working day: start time + inspections per day x window length,
-    never later than latest_end (e.g. 7 PM). Suggested openings stay inside it.
-    Reps can still book later by hand.
-    """
-    start = datetime.combine(day, day_start_time)
-    end = start + timedelta(hours=inspections_per_day * window_hrs)
-    if latest_end is not None:
-        end = min(end, datetime.combine(day, latest_end))
-    return start, max(start, end)
-
-
-def get_busy_intervals(claims_df: Optional[pd.DataFrame], exclude_claim_id: Any = None) -> List[Dict[str, Any]]:
-    """Booked inspections as {start, end, claim_id, label}, optionally leaving one claim out."""
-    busy = []
-    if claims_df is None or claims_df.empty or "status" not in claims_df.columns:
-        return busy
-    for _, r in claims_df[claims_df["status"] == "Scheduled"].iterrows():
-        if exclude_claim_id is not None and str(r["claim_id"]) == str(exclude_claim_id):
-            continue
-        s, e = parse_wallclock(r.get("start_time")), parse_wallclock(r.get("end_time"))
-        if s and e and e > s:
-            busy.append({"start": s, "end": e, "claim_id": str(r["claim_id"]),
-                         "label": f"{r['claim_id']} - {r.get('insured_name', '')}"})
-    return busy
-
-
-def compute_day_gaps(day: date, day_start_time: Any, inspections_per_day: int, window_hrs: float,
-                     busy: List[Dict[str, Any]], now: Optional[datetime] = None,
-                     latest_end: Any = None) -> List[Tuple[datetime, datetime]]:
-    """Free time inside the day's working window, after bookings and (today) the current time."""
-    ws, we = day_window(day, day_start_time, inspections_per_day, window_hrs, latest_end)
-    cursor = ws
-    if now and now > cursor:
-        cursor = round_up_to_step(now)
-    if cursor >= we:
-        return []
-    blocks = sorted((max(b["start"], ws), min(b["end"], we)) for b in busy if b["start"] < we and b["end"] > ws)
-    gaps = []
-    for s, e in blocks:
-        if s > cursor:
-            gaps.append((cursor, s))
-        cursor = max(cursor, e)
-    if cursor < we:
-        gaps.append((cursor, we))
-    out = []
-    for g0, g1 in gaps:
-        g0 = round_up_to_step(g0)
-        if g1 - g0 >= timedelta(minutes=STEP_MINUTES):
-            out.append((g0, g1))
-    return out
-
-
-def _slot_dict(s_dt: datetime, e_dt: datetime) -> Dict[str, Any]:
-    date_str = s_dt.strftime("%Y-%m-%d")
-    time_label = f"{s_dt.strftime('%I:%M %p')} - {e_dt.strftime('%I:%M %p')}"
-    return {
-        "slot_label": f"{date_str} ({_DAY_ABBR[s_dt.weekday()]}) | {time_label}",
-        "date_str": date_str,
-        "start": s_dt.isoformat(),
-        "end": e_dt.isoformat(),
-    }
-
-
-def compute_openings(start_date: date, end_date: date, active_days: List[str], day_start_time: Any,
-                     inspections_per_day: int, window_hrs: float, claims_df: Optional[pd.DataFrame],
-                     now: Optional[datetime] = None, exclude_claim_id: Any = None,
-                     latest_end: Any = None) -> List[Dict[str, Any]]:
-    """
-    Suggested openings: inside each free gap, back-to-back blocks of the default window
-    length, starting at the earliest free time. Example: day 8:00-3:30, 2.5 h windows,
-    an inspection shortened to 8:00-9:30 -> openings at 9:30 and 12:00.
-    Same shape as generate_available_slots, so the rest of the app can use either.
-    """
-    busy = get_busy_intervals(claims_df, exclude_claim_id)
-    duration = timedelta(hours=window_hrs)
-    openings = []
-    day = start_date
-    while day <= end_date:
-        if _DAY_ABBR[day.weekday()] in active_days:
-            for g0, g1 in compute_day_gaps(day, day_start_time, inspections_per_day, window_hrs, busy, now, latest_end):
-                t = g0
-                while t + duration <= g1:
-                    openings.append(_slot_dict(t, t + duration))
-                    t += duration
-        day += timedelta(days=1)
-    return openings
-
-
-def make_slot(start_dt: datetime, duration_hrs: float) -> Dict[str, Any]:
-    """A custom booking at any start time and length."""
-    return _slot_dict(start_dt, start_dt + timedelta(hours=duration_hrs))
-
-
-def find_overlap(start_dt: datetime, end_dt: datetime, busy: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    return next((b for b in busy if max(start_dt, b["start"]) < min(end_dt, b["end"])), None)
-
-
-def is_slot_conflicting(slot: Dict[str, Any], claims_df: pd.DataFrame, current_claim_id: str) -> bool:
-    if claims_df is None or claims_df.empty:
-        return False
-        
-    scheduled = claims_df[(claims_df["status"] == "Scheduled") & (claims_df["claim_id"].astype(str) != str(current_claim_id))]
-    
-    slot_start = parse_wallclock(slot["start"])
-    slot_end = parse_wallclock(slot["end"])
-    
-    for _, row in scheduled.iterrows():
-        c_start = parse_wallclock(row["start_time"])
-        c_end = parse_wallclock(row["end_time"])
-        if c_start and c_end and max(slot_start, c_start) < min(slot_end, c_end):
-            return True
-                
-    return False
-
-
-# --- RECOMMENDATION ENGINE ---
-
-def find_previous_stop(claims_df: pd.DataFrame, slot: Dict[str, Any]) -> Optional[pd.Series]:
-    """
-    Returns the scheduled claim that ends latest at or before the opening starts,
-    on the same day. That's where the rep will be driving from.
-    """
-    slot_start = parse_wallclock(slot["start"])
-    same_day = claims_df[
-        (claims_df["status"] == "Scheduled") &
-        (claims_df["scheduled_date"].astype(str) == slot["date_str"])
-    ]
-    best_row, best_end = None, None
-    for _, row in same_day.iterrows():
-        c_end = parse_wallclock(row["end_time"])
-        if c_end and c_end <= slot_start and (best_end is None or c_end > best_end):
-            best_row, best_end = row, c_end
-    return best_row
-
-
-def get_recommendations_for_slot(
-    claims_df: pd.DataFrame,
-    slot: Dict[str, Any],
-    hotel_coords: Optional[Tuple[float, float]] = None,
-    include_statuses: Tuple[str, ...] = ("Unscheduled",),
-    now_local: Optional[datetime] = None
-) -> Tuple[Optional[pd.DataFrame], Dict[str, Any]]:
-    """
-    Recommends claims to fill an opening (slot).
-
-    Candidates:
-      - "Unscheduled" claims  -> rec_type "New"
-      - "Scheduled" claims    -> rec_type "Reschedule" (moving it into this opening).
-        Skips claims whose inspection has already started (before now_local) and
-        the previous stop itself.
-
-    Anchor (drive-from point): previous scheduled stop that day, else the hotel,
-    else the center of all claims.
-
-    Sorted FIRST by priority rank (1, 2, 3...; unranked last), SECOND by drive time.
-    Returns (recs_df or None, anchor_info).
-    """
-    anchor_info = {"type": "claims_center", "label": "center of claims"}
-    if claims_df is None or claims_df.empty:
-        return None, anchor_info
-
-    prev_stop = find_previous_stop(claims_df, slot)
-    if prev_stop is not None and (pd.isna(prev_stop["lat"]) or pd.isna(prev_stop["lon"])):
-        prev_stop = None  # previous stop has no pin yet; fall back to the hotel
-    if prev_stop is not None:
-        anchor_lat, anchor_lon = float(prev_stop["lat"]), float(prev_stop["lon"])
-        prev_end = parse_wallclock(prev_stop["end_time"])
-        anchor_info = {
-            "type": "previous_stop",
-            "claim_id": str(prev_stop["claim_id"]),
-            "label": f"previous stop {prev_stop['claim_id']} (ends {prev_end.strftime('%I:%M %p')})"
-        }
-    elif hotel_coords:
-        anchor_lat, anchor_lon = hotel_coords
-        anchor_info = {"type": "hotel", "label": "hotel base"}
-    else:
-        anchor_lat, anchor_lon = float(claims_df["lat"].mean()), float(claims_df["lon"].mean())
-
-    candidates = claims_df[claims_df["status"].isin(include_statuses)].copy()
-    if anchor_info["type"] == "previous_stop":
-        candidates = candidates[candidates["claim_id"].astype(str) != anchor_info["claim_id"]]
-
-    if "Scheduled" in include_statuses and not candidates.empty:
-        starts = candidates["start_time"].apply(parse_wallclock)
-        keep = []
-        for status, start in zip(candidates["status"], starts):
-            if status != "Scheduled":
-                keep.append(True)
-            elif start is None:
-                keep.append(True)
+            elif cid == next_id:
+                event.update({
+                    "title": f"⏭️ {event['title']}",
+                    "classNames": ["next-event"],
+                    "backgroundColor": AMBER,
+                    "borderColor": "#B7800F",
+                    "textColor": "#111827",
+                })
             else:
-                keep.append(now_local is None or start > now_local)
-        candidates = candidates[keep]
+                event.update({"backgroundColor": SCHEDULED_BLUE, "borderColor": STEEL})
+            calendar_events.append(event)
 
-    if candidates.empty:
-        return None, anchor_info
+        # --- SHADING: dates outside the inspection date range ---
+        # (Inactive weekdays and off-hours are shaded by businessHours below.)
+        def shade_range(d_from, d_to):
+            if d_from >= d_to:
+                return
+            for all_day in (True, False):  # all-day version for month view, timed for week/day views
+                calendar_events.append({
+                    "start": d_from.isoformat() if all_day else f"{d_from.isoformat()}T00:00:00",
+                    "end": d_to.isoformat() if all_day else f"{d_to.isoformat()}T00:00:00",
+                    "allDay": all_day,
+                    "display": "background",
+                    "backgroundColor": IGNORED_GRAY,
+                })
 
-    anchor_ok = pd.notna(anchor_lat) and pd.notna(anchor_lon)
-    miles_list, mins_list = [], []
-    for _, row in candidates.iterrows():
-        if anchor_ok and pd.notna(row["lat"]) and pd.notna(row["lon"]):
-            miles, mins = get_osrm_route(float(anchor_lat), float(anchor_lon), float(row["lat"]), float(row["lon"]))
+        shade_range(start_date - timedelta(days=28), start_date)
+        shade_range(end_date + timedelta(days=1), end_date + timedelta(days=60))
+
+        # --- OPEN TIME: light green behind the free parts of each working day ---
+        cal_busy = get_busy_intervals(df)
+        d = start_date
+        while d <= end_date:
+            if d.strftime("%a") in active_days:
+                for g0, g1 in compute_day_gaps(d, start_time_input, inspections_per_day, window_hrs,
+                                               cal_busy, now_local, latest_end_input):
+                    calendar_events.append({
+                        "start": g0.isoformat(), "end": g1.isoformat(),
+                        "display": "background", "backgroundColor": "#22A05A",
+                    })
+            d += timedelta(days=1)
+
+        # --- VISIBLE HOURS ---
+        # Show until 7 PM by default, but extend to fit the inspection windows
+        # and any inspection that runs later (or starts earlier) than that.
+        def minutes_of_day(dt, base_date):
+            if dt.date() > base_date:
+                return 24 * 60
+            return dt.hour * 60 + dt.minute
+
+        day_start_dt = datetime.combine(start_date, start_time_input)
+        day_end_dt = day_start_dt + timedelta(hours=inspections_per_day * window_hrs)
+        window_end_min = minutes_of_day(day_end_dt, start_date)
+
+        latest_min = max([19 * 60, window_end_min] +
+                         [minutes_of_day(e, s.date()) for s, e in zip(scheduled_claims["_start_dt"], scheduled_claims["_end_dt"])])
+        earliest_min = min([start_time_input.hour * 60 + start_time_input.minute] +
+                           [s.hour * 60 + s.minute for s in scheduled_claims["_start_dt"]])
+        slot_max_min = min(24 * 60, int(math.ceil(latest_min / 60.0)) * 60)
+        slot_min_min = (earliest_min // 60) * 60
+
+        def hhmm(total_min):
+            return f"{total_min // 60:02d}:{total_min % 60:02d}:00"
+
+        js_day = {"Sun": 0, "Mon": 1, "Tue": 2, "Wed": 3, "Thu": 4, "Fri": 5, "Sat": 6}
+
+        calendar_options = {
+            "headerToolbar": {"left": "prev,next today", "center": "title", "right": "timeGridWeek,timeGridDay,dayGridMonth"},
+            "initialView": "timeGridWeek",
+            "initialDate": start_date.strftime("%Y-%m-%d"),
+            "slotMinTime": hhmm(slot_min_min),
+            "slotMaxTime": hhmm(slot_max_min),
+            "expandRows": True,
+            "allDaySlot": False,
+            "editable": True,
+            "selectable": True,
+            "slotEventOverlap": True,
+            # Drag and resize in 15-minute steps
+            "snapDuration": "00:15:00",
+            # Show stored times exactly as entered (deployment-local), regardless
+            # of the time zone of the computer viewing the app.
+            "timeZone": "UTC",
+            # "now" in deployment-local time, so today's highlight and the
+            # current-time line are correct for the deployment.
+            "now": now_local.isoformat(),
+            "nowIndicator": True,
+            # Gray shading outside your usual working hours and on non-inspection days
+            "businessHours": {
+                "daysOfWeek": [js_day[d] for d in active_days],
+                "startTime": start_time_input.strftime("%H:%M"),
+                "endTime": day_window(start_date, start_time_input, inspections_per_day, window_hrs,
+                                      latest_end_input)[1].strftime("%H:%M"),
+            },
+            # Inspections can be dragged on inspection days from the day start into the
+            # evening (insureds are often available late), but not onto days off.
+            "eventConstraint": {
+                "daysOfWeek": [js_day[d] for d in active_days],
+                "startTime": start_time_input.strftime("%H:%M"),
+                "endTime": "24:00",
+            },
+        }
+
+        calendar_css = f"""
+            @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&display=swap');
+            .fc {{
+                font-family: 'IBM Plex Sans', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+                --fc-border-color: {LINE};
+                --fc-button-bg-color: #FFFFFF;
+                --fc-button-border-color: {LINE};
+                --fc-button-text-color: {INK};
+                --fc-button-hover-bg-color: #EEF2F6;
+                --fc-button-hover-border-color: #C9D3DD;
+                --fc-button-active-bg-color: {STEEL};
+                --fc-button-active-border-color: {STEEL};
+                --fc-today-bg-color: rgba(232, 163, 23, 0.07);
+                --fc-now-indicator-color: {RED};
+                --fc-non-business-color: rgba(148, 163, 184, 0.22);
+                --fc-neutral-bg-color: #F4F6F9;
+            }}
+            .fc .fc-toolbar-title {{ font-size: 1.05rem; font-weight: 600; color: {INK}; }}
+            .fc .fc-button {{ font-size: 0.82rem; font-weight: 500; border-radius: 7px; box-shadow: none !important; text-transform: capitalize; }}
+            .fc .fc-button-primary:not(:disabled).fc-button-active {{ color: #FFFFFF; }}
+            .fc .fc-col-header-cell-cushion {{ color: {SLATE}; font-weight: 600; font-size: 0.82rem; text-decoration: none; }}
+            .fc .fc-timegrid-slot-label-cushion {{ color: {SLATE}; font-size: 0.78rem; }}
+            .fc .fc-daygrid-day-number {{ color: {SLATE}; text-decoration: none; }}
+            .fc-event {{ border-radius: 6px; font-size: 0.8rem; }}
+            .fc-event.past-event {{
+                background-image: repeating-linear-gradient(
+                    45deg, rgba(255,255,255,0.55) 0 5px, transparent 5px 10px) !important;
+                opacity: 0.85;
+            }}
+            .fc-event.past-event .fc-event-title {{ text-decoration: line-through; }}
+            .fc-event.next-event {{ box-shadow: 0 0 0 3px rgba(232, 163, 23, 0.45); font-weight: 600; }}
+        """
+        if CONSOLE:
+            calendar_css += f"""
+            @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&display=swap');
+            html, body {{ background: {C_BG}; }}
+            .fc {{
+                color: {C_TEXT};
+                background: {C_BG};
+                --fc-page-bg-color: {C_BG};
+                --fc-neutral-bg-color: {C_PANEL};
+                --fc-border-color: {C_LINE};
+                --fc-button-bg-color: {C_PANEL};
+                --fc-button-border-color: {C_LINE};
+                --fc-button-text-color: {C_TEXT};
+                --fc-button-hover-bg-color: #18242F;
+                --fc-button-hover-border-color: #2A3A4A;
+                --fc-button-active-bg-color: #0891B2;
+                --fc-button-active-border-color: {C_SIGNAL};
+                --fc-today-bg-color: rgba(63, 208, 224, 0.06);
+                --fc-now-indicator-color: {C_SIGNAL};
+                --fc-non-business-color: rgba(0, 0, 0, 0.35);
+                --fc-list-event-hover-bg-color: {C_PANEL};
+            }}
+            .fc .fc-toolbar-title {{ color: {C_TEXT}; font-family: {MONO}; font-weight: 500; font-size: 0.98rem; }}
+            .fc .fc-col-header-cell-cushion, .fc .fc-timegrid-slot-label-cushion,
+            .fc .fc-daygrid-day-number {{ color: {C_MUTED}; font-family: {MONO}; }}
+            .fc-event {{ font-family: {MONO}; font-size: 0.76rem; }}
+            .fc-event.past-event {{
+                background-image: repeating-linear-gradient(
+                    45deg, rgba(255,255,255,0.10) 0 5px, transparent 5px 10px) !important;
+            }}
+            .fc-event.next-event {{ box-shadow: 0 0 14px rgba(232, 163, 23, 0.55); }}
+            """
+
+        cal_event = calendar(
+            events=calendar_events,
+            options=calendar_options,
+            custom_css=calendar_css,
+            # Only click and drag/resize. The default also reports "eventsSet" on every
+            # render, which reruns the whole app and keeps rebuilding the map.
+            callbacks=["eventClick", "eventChange"],
+            key="claims_calendar"
+        ) or {}
+
+        # --- CLICK A BLOCK: directions + manage ---
+        clicked = (cal_event.get("eventClick") or {}).get("event") or {}
+        clicked_id = str(clicked.get("id") or "")
+        if clicked_id:
+            c_rows = df[(df["claim_id"].astype(str) == clicked_id) & (df["status"] == "Scheduled")]
+            if not c_rows.empty:
+                c_row = c_rows.iloc[0]
+                with st.container(border=True):
+                    st.markdown(f"""
+<div class="cat-card selected">
+  <div class="cat-card-kicker">Selected inspection</div>
+  <div class="cat-card-title">{esc(c_row['claim_id'])} - {esc(c_row['insured_name'])}</div>
+  <div class="cat-card-sub">{fmt_dt(parse_wallclock(c_row['start_time']))}<br>{esc(c_row['full_address'])}</div>
+</div>""", unsafe_allow_html=True)
+                    render_nav_buttons(c_row["full_address"], c_row["lat"], c_row["lon"], c_row["geo_quality"])
+                    if st.button("Manage this claim", key=f"cal_manage_{clicked_id}"):
+                        st.session_state["selected_claim_id"] = clicked_id
+                        st.rerun()
+
+        # --- DRAG / RESIZE A BLOCK ---
+        # The calendar keeps returning its last event on every rerun, so only
+        # apply a given change once (otherwise the app can loop on reruns).
+        if cal_event.get("eventChange"):
+            changed_event = cal_event["eventChange"]["event"]
+            change_sig = (str(changed_event.get("id")), changed_event.get("start"), changed_event.get("end"))
+            if st.session_state.get("last_calendar_change") != change_sig:
+                st.session_state["last_calendar_change"] = change_sig
+                cid = str(changed_event["id"])
+                new_start = parse_wallclock(changed_event["start"])
+                new_end = parse_wallclock(changed_event.get("end")) or (new_start + timedelta(hours=window_hrs))
+
+                c_mask = st.session_state.claims_df["claim_id"].astype(str) == cid
+                st.session_state.claims_df.loc[c_mask, "start_time"] = new_start.isoformat()
+                st.session_state.claims_df.loc[c_mask, "end_time"] = new_end.isoformat()
+                st.session_state.claims_df.loc[c_mask, "scheduled_date"] = new_start.strftime("%Y-%m-%d")
+                st.session_state.claims_df.loc[c_mask, "inspection_time"] = new_start.strftime("%H:%M")
+                st.session_state.editor_version += 1
+                st.toast(f"Moved {cid} to {fmt_dt(new_start)}")
+                st.rerun()
+
+    # -----------------------------------------------------------------
+    # MAP
+    # Runs as a fragment: clicking or panning the map reruns only this
+    # section, not the whole page, so the map isn't rebuilt by unrelated
+    # parts of the app while you're fixing pins.
+    # -----------------------------------------------------------------
+    @st.fragment
+    def render_map_tab():
+        mdf = st.session_state.claims_df
+        m_review = mdf["geo_quality"].isin(GEO_NEEDS_REVIEW)
+
+        fix_mode = st.toggle(
+            "Fix pin locations",
+            key="pin_fix_mode",
+            help="Zoom to a claim on the satellite view, click the right roof, and save. "
+                 "Or paste coordinates from Google Maps."
+        )
+
+        fix_row = None
+        if fix_mode:
+            # Claims that need a check come first
+            fix_order = mdf.assign(_ok=~m_review).sort_values("_ok", kind="mergesort")
+            fix_map = {}
+            for _, r in fix_order.iterrows():
+                flag = "⚠️ " if r["geo_quality"] in GEO_NEEDS_REVIEW else ""
+                fix_map[f"{flag}{r['claim_id']} - {r['insured_name']} ({r['geo_quality']})"] = str(r["claim_id"])
+            pending = st.session_state.pop("pending_fix_claim_id", None)
+            if pending:
+                pending_label = next((lbl for lbl, cid in fix_map.items() if cid == pending), None)
+                if pending_label:
+                    st.session_state["pin_fix_claim"] = pending_label
+            if st.session_state.get("pin_fix_claim") not in fix_map:
+                st.session_state.pop("pin_fix_claim", None)
+            if st.session_state.pop("all_pins_checked", False):
+                st.success("All flagged locations are checked.")
+            fix_label = st.selectbox("Claim to fix", list(fix_map.keys()), key="pin_fix_claim")
+            fix_id = fix_map[fix_label]
+            fix_row = mdf[mdf["claim_id"].astype(str) == fix_id].iloc[0]
+            st.caption(f"{fix_row['full_address']}")
+
+        valid_coords_df = mdf[(mdf["status"] != "Ignored") & (mdf["lat"].notna()) & (mdf["lon"].notna())]
+
+        if fix_row is not None and pd.notna(fix_row["lat"]) and pd.notna(fix_row["lon"]):
+            map_center, map_zoom = [float(fix_row["lat"]), float(fix_row["lon"])], 18
+        elif fix_row is not None and hotel_coords:
+            map_center, map_zoom = list(hotel_coords), 13
+        elif not valid_coords_df.empty:
+            map_center, map_zoom = [valid_coords_df["lat"].mean(), valid_coords_df["lon"].mean()], 10
         else:
-            miles, mins = None, None  # no pin yet: listed after claims with drive times
-        miles_list.append(miles)
-        mins_list.append(mins)
+            map_center, map_zoom = [29.4241, -98.4936], 10
 
-    candidates["drive_miles"] = miles_list
-    candidates["drive_time_mins"] = mins_list
-    candidates["anchor_type"] = anchor_info["type"]
-    candidates["rec_type"] = ["Reschedule" if s == "Scheduled" else "New" for s in candidates["status"]]
-    candidates["current_slot"] = [
-        format_slot_time(parse_wallclock(t)) if s == "Scheduled" else ""
-        for s, t in zip(candidates["status"], candidates["start_time"])
+        m = folium.Map(location=map_center, zoom_start=map_zoom, tiles=None, max_zoom=20)
+
+        esri_satellite_url = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+        if CONSOLE:
+            street_layer = folium.TileLayer("CartoDB dark_matter", name="Street map", show=not fix_mode, max_zoom=20)
+        else:
+            street_layer = folium.TileLayer("OpenStreetMap", name="Street map", show=not fix_mode, max_zoom=20)
+        satellite_layer = folium.TileLayer(tiles=esri_satellite_url, attr="Esri World Imagery",
+                                           name="Satellite", show=fix_mode, max_zoom=20, max_native_zoom=19)
+        # The first base layer added is the one shown; satellite first when fixing pins
+        for layer in ([satellite_layer, street_layer] if fix_mode else [street_layer, satellite_layer]):
+            layer.add_to(m)
+
+        day_colors = ["blue", "green", "purple", "darkblue", "darkred", "cadetblue", "darkgreen", "pink"]
+        scheduled_dates = sorted([d for d in mdf[mdf["status"] == "Scheduled"]["scheduled_date"].unique() if d])
+        date_color_map = {d: day_colors[i % len(day_colors)] for i, d in enumerate(scheduled_dates)}
+
+        bounds = []
+        for _, row in mdf.iterrows():
+            if row["status"] == "Ignored" or pd.isna(row["lat"]) or pd.isna(row["lon"]):
+                continue
+
+            lat = float(row["lat"])
+            lon = float(row["lon"])
+            needs_review = row["geo_quality"] in GEO_NEEDS_REVIEW
+            is_fix_target = fix_row is not None and str(row["claim_id"]) == str(fix_row["claim_id"])
+
+            # Pin style:
+            #   color = status (red = unscheduled; scheduled = one color per day)
+            #   "!"   = location needs checking (approximate)
+            #   none  = unscheduled with a good location; check = scheduled with a good location
+            if is_fix_target:
+                marker_color, icon_type = "orange", "screenshot"
+            elif row["status"] == "Unscheduled":
+                marker_color = "red"
+                icon_type = "exclamation-sign" if needs_review else ""
+            else:
+                marker_color = date_color_map.get(row.get("scheduled_date"), "blue")
+                icon_type = "exclamation-sign" if needs_review else "ok-sign"
+
+            nav = build_navigation_links(row["full_address"], lat, lon, prefer_coords=(row["geo_quality"] in GEO_REP_VERIFIED))
+            links_html = " &nbsp; ".join(
+                f'<a href="{url}" target="_blank" rel="noopener">{name}</a>'
+                for name, url in [("Google Maps", nav.get("google")), ("Apple Maps", nav.get("apple"))] if url
+            )
+            folium.Marker(
+                location=[lat, lon],
+                popup=folium.Popup(
+                    f"<b>{esc(row['claim_id'])}</b><br>{esc(row['insured_name'])}<br>{esc(row['full_address'])}"
+                    f"<br><span style='color:#52637A'>Location: {esc(row['geo_quality'])}</span><br>{links_html}",
+                    max_width=280
+                ),
+                tooltip=f"{row['claim_id']} - {row['insured_name']}" + (" (location needs checking)" if needs_review else ""),
+                icon=folium.Icon(color=marker_color, icon=icon_type)
+            ).add_to(m)
+
+            bounds.append([lat, lon])
+
+        if hotel_coords:
+            folium.Marker(
+                location=list(hotel_coords),
+                popup=f"<b>Hotel base</b><br>{esc(hotel_address)}",
+                tooltip="Hotel base",
+                icon=folium.Icon(color="black", icon="home")
+            ).add_to(m)
+            bounds.append(list(hotel_coords))
+
+        if bounds and not fix_mode:
+            m.fit_bounds(bounds, padding=(30, 30))
+
+        folium.LayerControl().add_to(m)
+
+        map_key = f"claims_map_{st.session_state.map_nonce}_{fix_row['claim_id'] if fix_row is not None else 'all'}"
+
+        # In fix mode, show a crosshair where you last clicked. It's drawn as a separate
+        # layer so the map updates in place instead of reloading and losing your zoom.
+        preview_group = None
+        if fix_mode:
+            prev_state = st.session_state.get(map_key) or {}
+            prev_click = prev_state.get("last_clicked") if isinstance(prev_state, dict) else None
+            preview_group = folium.FeatureGroup(name="Selected spot")
+            if prev_click:
+                folium.CircleMarker(
+                    location=[prev_click["lat"], prev_click["lng"]],
+                    radius=9, color="#FFFFFF", weight=3, fill=True,
+                    fill_color=AMBER, fill_opacity=0.9,
+                    tooltip="New spot (not saved yet)"
+                ).add_to(preview_group)
+
+        try:
+            map_state = st_folium(m, width=1100, height=540, key=map_key,
+                                  returned_objects=["last_clicked"],
+                                  feature_group_to_add=preview_group) or {}
+        except TypeError:
+            # Older streamlit-folium without feature_group_to_add
+            map_state = st_folium(m, width=1100, height=540, key=map_key,
+                                  returned_objects=["last_clicked"]) or {}
+
+        st.caption("Red pins are unscheduled. Scheduled pins are colored by day, with a check mark. "
+                   "A **!** means the location is approximate and should be checked.")
+
+        if fix_mode and fix_row is not None:
+            has_pin = pd.notna(fix_row["lat"]) and pd.notna(fix_row["lon"])
+            if has_pin and fix_row["geo_quality"] not in GEO_REP_VERIFIED:
+                if st.button("✓ Pin is correct", type="primary", key=f"confirm_pin_{fix_row['claim_id']}",
+                             help="Keeps the pin where it is and marks the location as checked."):
+                    confirm_pin(fix_row["claim_id"])
+                    queue_next_pin_to_fix(fix_row["claim_id"])
+                    st.rerun()
+            elif fix_row["geo_quality"] in GEO_REP_VERIFIED:
+                st.caption(f"✓ {fix_row['geo_quality']}. You can still move it below.")
+            fc1, fc2 = st.columns(2)
+            with fc1:
+                clicked_pt = map_state.get("last_clicked")
+                if clicked_pt:
+                    st.markdown(f"Selected spot  \n`{clicked_pt['lat']:.6f}, {clicked_pt['lng']:.6f}`")
+                    if st.button(f"Move {fix_row['claim_id']} pin here"):
+                        save_manual_pin(fix_row["claim_id"], clicked_pt["lat"], clicked_pt["lng"])
+                        queue_next_pin_to_fix(fix_row["claim_id"])
+                        st.rerun()
+                else:
+                    st.caption("Click the map to choose the spot for this claim.")
+            with fc2:
+                pasted = st.text_input("Or paste coordinates or a Google Maps link",
+                                       key=f"paste_coords_{fix_row['claim_id']}",
+                                       placeholder="29.4241, -98.4936")
+                if st.button("Save pasted location", key=f"save_paste_{fix_row['claim_id']}"):
+                    coords = parse_coordinates(pasted)
+                    if coords:
+                        save_manual_pin(fix_row["claim_id"], coords[0], coords[1])
+                        queue_next_pin_to_fix(fix_row["claim_id"])
+                        st.rerun()
+                    else:
+                        st.error("No coordinates found. Paste something like 29.4241, -98.4936 "
+                                 "or a Google Maps link that contains them.")
+
+    with tab_map:
+        render_map_tab()
+
+    st.markdown("---")
+
+    # --- MANAGEMENT & CLAIMS POOL ---
+    col_left, col_right = st.columns([1.5, 1])
+
+    with col_left:
+        st.subheader("Claims pool")
+        st.caption("Edit **Priority** (1 = highest, blank = unranked) or set **Status** to Unscheduled or Ignored. "
+                   "Changes save automatically and re-sort the recommendations below.")
+
+        if st.session_state.get("editor_notice"):
+            st.warning(st.session_state.pop("editor_notice"))
+
+        show_status = st.multiselect("Show statuses", ["Unscheduled", "Scheduled", "Ignored"], default=["Unscheduled", "Scheduled"])
+        filtered_df = df[df["status"].isin(show_status)].copy()
+        filtered_df["priority"] = filtered_df["priority"].astype("Int64")  # nullable int: shows "2", not "2.0"
+
+        editor_cols = ["claim_id", "insured_name", "full_address", "priority", "status", "scheduled_date", "inspection_time", "geo_quality"]
+        editor_key = f"claims_editor_{st.session_state.editor_version}_{'_'.join(sorted(show_status))}"
+
+        edited_df = st.data_editor(
+            filtered_df[editor_cols],
+            key=editor_key,
+            disabled=["claim_id", "insured_name", "full_address", "scheduled_date", "inspection_time", "geo_quality"],
+            column_config={
+                "claim_id": st.column_config.TextColumn("Claim"),
+                "insured_name": st.column_config.TextColumn("Insured"),
+                "full_address": st.column_config.TextColumn("Address"),
+                "scheduled_date": st.column_config.TextColumn("Date"),
+                "inspection_time": st.column_config.TextColumn("Time"),
+                "geo_quality": st.column_config.TextColumn("Location", help="How the map pin was placed."),
+                "priority": st.column_config.NumberColumn(
+                    "Priority",
+                    help="1 = highest. Leave blank for unranked claims.",
+                    min_value=1,
+                    step=1,
+                    format="%d"
+                ),
+                "status": st.column_config.SelectboxColumn(
+                    "Status",
+                    options=["Unscheduled", "Scheduled", "Ignored"],
+                    required=True,
+                    help="Use 'Confirm & Lock Slot' on the right to schedule a claim."
+                ),
+            },
+            hide_index=True,
+            use_container_width=True
+        )
+
+        # --- SYNC EDITOR CHANGES BACK INTO SESSION STATE ---
+        # edited_df keeps the same index as claims_df, so rows map back directly.
+        changes_made = False
+        blocked_claims = []
+
+        for row_idx in edited_df.index:
+            old_row = filtered_df.loc[row_idx]
+            new_row = edited_df.loc[row_idx]
+
+            old_prio = normalize_priority(old_row["priority"])
+            new_prio = normalize_priority(new_row["priority"])
+            if new_prio != old_prio:
+                st.session_state.claims_df.at[row_idx, "priority"] = new_prio if new_prio is not None else float("nan")
+                changes_made = True
+
+            if new_row["status"] != old_row["status"]:
+                if new_row["status"] in ("Unscheduled", "Ignored"):
+                    st.session_state.claims_df.at[row_idx, "status"] = new_row["status"]
+                    st.session_state.claims_df.at[row_idx, "start_time"] = None
+                    st.session_state.claims_df.at[row_idx, "end_time"] = None
+                    st.session_state.claims_df.at[row_idx, "scheduled_date"] = ""
+                    st.session_state.claims_df.at[row_idx, "inspection_time"] = ""
+                    changes_made = True
+                elif new_row["status"] == "Scheduled":
+                    # Scheduling needs a time slot, so it isn't allowed from the table.
+                    blocked_claims.append(str(old_row["claim_id"]))
+
+        if blocked_claims:
+            st.session_state["editor_notice"] = (
+                f"Claim(s) {', '.join(blocked_claims)} weren't scheduled. Select the claim on the right "
+                "and use **Confirm & Lock Slot** to pick a time."
+            )
+
+        if changes_made or blocked_claims:
+            st.session_state.editor_version += 1
+            st.rerun()
+
+    selected_target_date_str = start_date.strftime("%Y-%m-%d")
+
+    with col_right:
+        st.subheader("Manage a claim")
+        claim_options = df["display_label"].tolist()
+
+        if "managed_claim_select" not in st.session_state or st.session_state["managed_claim_select"] not in claim_options:
+            st.session_state["managed_claim_select"] = claim_options[0]
+
+        if "selected_claim_id" in st.session_state and st.session_state["selected_claim_id"]:
+            matching = [opt for opt in claim_options if opt.startswith(str(st.session_state["selected_claim_id"]) + " -")]
+            if matching:
+                st.session_state["managed_claim_select"] = matching[0]
+            del st.session_state["selected_claim_id"]
+
+        selected_label = st.selectbox(
+            "Claim",
+            claim_options,
+            key="managed_claim_select"
+        )
+
+        if selected_label:
+            selected_claim_id = selected_label.split(" - ")[0].strip()
+            claim_mask = st.session_state.claims_df["claim_id"].astype(str) == selected_claim_id
+            
+            if claim_mask.any():
+                current_claim = st.session_state.claims_df[claim_mask].iloc[0]
+                
+                loc_note = current_claim["geo_quality"]
+                if loc_note in GEO_NEEDS_REVIEW:
+                    loc_note = f":orange[⚠️ {loc_note}]. Fix it in the Map tab."
+                st.markdown(
+                    f"**Claim:** `{current_claim['claim_id']}`  \n"
+                    f"**Insured:** {current_claim['insured_name']}  \n"
+                    f"**Address:** {current_claim['full_address']}  \n"
+                    f"**Location:** {loc_note}  \n"
+                    f"**Status:** `{current_claim['status']}`"
+                )
+                render_nav_buttons(current_claim["full_address"], current_claim["lat"], current_claim["lon"], current_claim["geo_quality"])
+                
+                st.markdown("---")
+
+                if current_claim["status"] == "Scheduled":
+                    if current_claim["scheduled_date"]:
+                        selected_target_date_str = str(current_claim["scheduled_date"])
+
+                    st.write(f"**Currently:** {fmt_dt(parse_wallclock(current_claim['start_time'])) or 'no time set'}")
+
+                    move_slot = render_slot_picker(
+                        selected_claim_id, st.session_state.claims_df, now_local, schedule_settings,
+                        current=(parse_wallclock(current_claim["start_time"]), parse_wallclock(current_claim["end_time"]))
+                    )
+                    if move_slot:
+                        if st.button("🔁 Move to this slot", type="primary"):
+                            book_claim_into_slot(claim_mask, move_slot)
+                            st.rerun()
+
+                    if st.button("Remove from schedule"):
+                        st.session_state.claims_df.loc[claim_mask, "status"] = "Unscheduled"
+                        st.session_state.claims_df.loc[claim_mask, "start_time"] = None
+                        st.session_state.claims_df.loc[claim_mask, "end_time"] = None
+                        st.session_state.claims_df.loc[claim_mask, "scheduled_date"] = ""
+                        st.session_state.claims_df.loc[claim_mask, "inspection_time"] = ""
+                        st.session_state.editor_version += 1
+                        st.rerun()
+
+                elif current_claim["status"] in ["Unscheduled", "Ignored"]:
+                    chosen_slot = render_slot_picker(selected_claim_id, st.session_state.claims_df,
+                                                     now_local, schedule_settings)
+                    if chosen_slot:
+                        selected_target_date_str = chosen_slot["date_str"]
+                        if st.button("Book this slot", type="primary"):
+                            book_claim_into_slot(claim_mask, chosen_slot)
+                            st.rerun()
+
+    # -----------------------------------------------------------------
+    # RECOMMENDATIONS
+    # -----------------------------------------------------------------
+    st.markdown("---")
+    st.subheader("Fill an opening")
+
+    open_slots = [
+        s for s in all_slots
+        if parse_wallclock(s["start"]) > now_local
+        and not is_slot_conflicting(s, st.session_state.claims_df, current_claim_id="")
     ]
 
-    ranks = [normalize_priority(v) for v in candidates["priority"]]
-    candidates["priority_rank"] = pd.Series(ranks, index=candidates.index, dtype="object")
-    candidates["is_priority"] = [r is not None for r in ranks]
+    if not open_slots:
+        st.info("No open slots left in this date range. Extend the end date or add inspections per day in the sidebar.")
+    else:
+        rc1, rc2 = st.columns([1.3, 1])
+        with rc1:
+            # Default to the first opening on the date in context (selected claim / chosen slot)
+            default_idx = next((i for i, s in enumerate(open_slots) if s["date_str"] == selected_target_date_str), 0)
+            opening_label = st.selectbox("Opening", [s["slot_label"] for s in open_slots], index=default_idx)
+            opening = next(s for s in open_slots if s["slot_label"] == opening_label)
+        with rc2:
+            pool_choice = st.radio(
+                "Show",
+                ["Unscheduled", "Scheduled (reschedule)", "Both"],
+                horizontal=True,
+                key="rec_pool",
+                help="Scheduled claims are shown as candidates to move into this opening. "
+                     "Inspections that have already started are left out."
+            )
+        include = {
+            "Unscheduled": ("Unscheduled",),
+            "Scheduled (reschedule)": ("Scheduled",),
+            "Both": ("Unscheduled", "Scheduled"),
+        }[pool_choice]
 
-    # Unranked claims get +inf so ranked priorities always sort first;
-    # drive time is the tie-breaker within a rank and among unranked claims.
-    candidates["prio_sort_key"] = [float(r) if r is not None else float("inf") for r in ranks]
-    candidates["drive_sort_key"] = [float(m) if m is not None else float("inf") for m in mins_list]
-    candidates = candidates.sort_values(
-        by=["prio_sort_key", "drive_sort_key"], ascending=[True, True], kind="mergesort"
-    ).drop(columns=["prio_sort_key", "drive_sort_key"])
+        recs, anchor_info = get_recommendations_for_slot(
+            st.session_state.claims_df,
+            opening,
+            hotel_coords=hotel_coords,
+            include_statuses=include,
+            now_local=now_local,
+            mode=REC_MODE
+        )
 
-    return candidates, anchor_info
+        nxt = anchor_info.get("next")
+        if REC_MODE == "detour" and nxt:
+            st.caption(f"Ranked by added driving between **{anchor_info['label']}** and **{nxt['label']}**. "
+                       "Ranked claims (❗) still come first by priority.")
+        elif REC_MODE == "detour":
+            st.caption(f"Drive times from **{anchor_info['label']}**. Set a hotel address so the last stop "
+                       "of the day can favor claims on the way back. Ranked claims (❗) come first.")
+        else:
+            st.caption(f"Drive times from **{anchor_info['label']}**. Ranked claims (❗) come first by priority; "
+                       "drive time breaks ties and orders unranked claims.")
 
+        if recs is None or recs.empty:
+            st.info("No claims match this opening. Try showing both unscheduled and scheduled claims.")
+        else:
+            opening_time = parse_wallclock(opening["start"]).strftime("%I:%M %p").lstrip("0")
+            for idx, rec_row in recs.head(5).reset_index(drop=True).iterrows():
+                with st.container(border=True):
+                    col_rec1, col_rec2, col_rec3 = st.columns([3, 0.9, 0.7], vertical_alignment="center")
+                    with col_rec1:
+                        claim_label = f"{rec_row['claim_id']} - {rec_row['insured_name']}"
+                        rank = normalize_priority(rec_row.get("priority_rank"))
 
-# --- ICS CALENDAR EXPORT ---
+                        # Ranked claim: bold red ❗ badge; unranked: no badge, proximity only
+                        title = f":red[**❗ P{rank}**] **{claim_label}**" if rank is not None else f"**{claim_label}**"
+                        if rec_row["rec_type"] == "Reschedule":
+                            title += f" :blue[🔁 currently {rec_row['current_slot']}]"
 
-def _ics_escape(text: Any) -> str:
-    """Escapes text per RFC 5545 (backslash, semicolon, comma, newline)."""
-    s = str(text) if text is not None else ""
-    return (s.replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,")
-             .replace("\r\n", "\\n").replace("\n", "\\n"))
+                        if pd.notna(rec_row["drive_time_mins"]) and rec_row["drive_time_mins"] is not None:
+                            approx = "≈ " if rec_row["geo_quality"] in GEO_NEEDS_REVIEW else ""
+                            drive_txt = f"⏱️ {approx}{int(rec_row['drive_time_mins'])} min · {rec_row['drive_miles']} mi"
+                            detour = rec_row.get("detour_mins")
+                            if REC_MODE == "detour" and detour is not None and pd.notna(detour):
+                                drive_txt += f" · adds {int(detour)} min to your route"
+                                if rec_row.get("late_for_next"):
+                                    drive_txt += (f"  \n:orange[⚠️ {int(rec_row['drive_to_next_mins'])} min drive to "
+                                                  f"{nxt['label']}. You may be late.]")
+                        else:
+                            drive_txt = ":orange[📍 No map pin yet. Set it in the Map tab.]"
 
-
-def export_claims_to_ics(claims_df: pd.DataFrame, tz_name: Optional[str]) -> str:
-    """
-    Exports scheduled inspections. Stored wall-clock times are interpreted in the
-    deployment time zone (tz_name) and written as UTC, so Outlook shows the correct
-    moment for any viewer. If tz_name is None (zone data unavailable), times are
-    written as "floating" local times instead.
-    """
-    zone = get_zone(tz_name) if tz_name else None
-    now_utc = datetime.now(timezone.utc)
-    dtstamp = now_utc.strftime("%Y%m%dT%H%M%SZ")
-    sequence = int(now_utc.timestamp() // 60)  # increases on each export so updates win
-
-    ics_lines = [
-        "BEGIN:VCALENDAR",
-        "VERSION:2.0",
-        "PRODID:-//CAT Claims Scheduler//EN",
-        "CALSCALE:GREGORIAN",
-        "METHOD:PUBLISH"
-    ]
-
-    def fmt(dt: datetime) -> str:
-        if zone is None:
-            return dt.strftime("%Y%m%dT%H%M%S")
-        return dt.replace(tzinfo=zone).astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-
-    scheduled = claims_df[claims_df["status"] == "Scheduled"]
-
-    for _, row in scheduled.iterrows():
-        s_dt = parse_wallclock(row["start_time"])
-        e_dt = parse_wallclock(row["end_time"])
-        if not s_dt or not e_dt:
-            continue
-        ics_lines.extend([
-            "BEGIN:VEVENT",
-            f"UID:claim-{_ics_escape(row['claim_id'])}@catscheduler.local",
-            f"DTSTAMP:{dtstamp}",
-            f"SEQUENCE:{sequence}",
-            f"SUMMARY:{_ics_escape('CAT Inspection - ' + str(row['claim_id']) + ' (' + str(row['insured_name']) + ')')}",
-            f"DESCRIPTION:{_ics_escape('Claim ID: ' + str(row['claim_id']) + chr(10) + 'Insured: ' + str(row['insured_name']))}",
-            f"LOCATION:{_ics_escape(row['full_address'])}",
-            f"DTSTART:{fmt(s_dt)}",
-            f"DTEND:{fmt(e_dt)}",
-            "END:VEVENT"
-        ])
-
-    ics_lines.append("END:VCALENDAR")
-    return "\r\n".join(ics_lines) + "\r\n"
+                        st.markdown(f"{title}  \n{rec_row['full_address']}  \n{drive_txt}")
+                    with col_rec2:
+                        action = f"🔁 Move to {opening_time}" if rec_row["rec_type"] == "Reschedule" else f"📌 Book {opening_time}"
+                        if st.button(action, key=f"btn_book_{idx}_{rec_row['claim_id']}", use_container_width=True,
+                                     type="primary" if idx == 0 else "secondary"):
+                            mask = st.session_state.claims_df["claim_id"].astype(str) == str(rec_row["claim_id"])
+                            book_claim_into_slot(mask, opening)
+                            st.toast(f"Booked {rec_row['claim_id']} for {opening_label}")
+                            st.rerun()
+                    with col_rec3:
+                        if st.button("Manage", key=f"btn_rec_{idx}_{rec_row['claim_id']}", use_container_width=True):
+                            st.session_state["selected_claim_id"] = str(rec_row["claim_id"])
+                            st.rerun()
