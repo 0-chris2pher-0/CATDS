@@ -224,4 +224,100 @@ def is_slot_conflicting(slot: Dict[str, Any], claims_df: pd.DataFrame, current_c
     if claims_df is None or claims_df.empty:
         return False
         
-    scheduled = claims_df[(claims_df["status"] == "Scheduled") & (claims_df["claim_id"] != str(current_claim_
+    scheduled = claims_df[(claims_df["status"] == "Scheduled") & (claims_df["claim_id"] != str(current_claim_id))]
+    
+    slot_start = datetime.fromisoformat(slot["start"])
+    slot_end = datetime.fromisoformat(slot["end"])
+    
+    for _, row in scheduled.iterrows():
+        if pd.notna(row["start_time"]) and pd.notna(row["end_time"]) and str(row["start_time"]) != "":
+            c_start = datetime.fromisoformat(str(row["start_time"]))
+            c_end = datetime.fromisoformat(str(row["end_time"]))
+            
+            # Check for time range overlap
+            if max(slot_start, c_start) < min(slot_end, c_end):
+                return True
+                
+    return False
+
+
+# --- RECOMMENDATION ENGINE ---
+
+def get_recommendations_for_day(claims_df: pd.DataFrame, target_date_str: str) -> Optional[pd.DataFrame]:
+    """
+    Calculates geographic proximity and drive times to recommend unscheduled claims 
+    for a targeted date based on existing scheduled anchors.
+    """
+    if claims_df is None or claims_df.empty:
+        return None
+
+    unscheduled = claims_df[claims_df["status"] == "Unscheduled"].copy()
+    if unscheduled.empty:
+        return None
+
+    scheduled_day = claims_df[(claims_df["status"] == "Scheduled") & (claims_df["scheduled_date"] == target_date_str)]
+
+    # Determine anchor location (use last scheduled claim on target date if present, otherwise average lat/lon)
+    if not scheduled_day.empty:
+        anchor_lat = scheduled_day.iloc[-1]["lat"]
+        anchor_lon = scheduled_day.iloc[-1]["lon"]
+        anchor_type = "anchor_claim"
+    else:
+        anchor_lat = claims_df["lat"].mean()
+        anchor_lon = claims_df["lon"].mean()
+        anchor_type = "hotel"
+
+    miles_list = []
+    mins_list = []
+
+    for _, row in unscheduled.iterrows():
+        miles, mins = get_osrm_route(anchor_lat, anchor_lon, row["lat"], row["lon"])
+        miles_list.append(miles)
+        mins_list.append(mins)
+
+    unscheduled["drive_miles"] = miles_list
+    unscheduled["drive_time_mins"] = mins_list
+    unscheduled["anchor_type"] = anchor_type
+
+    # Sort primarily by drive time / proximity, secondary by priority tier
+    unscheduled = unscheduled.sort_values(by=["drive_time_mins", "priority"], ascending=[True, True])
+    
+    return unscheduled
+
+
+# --- ICS CALENDAR EXPORT ---
+
+def export_claims_to_ics(claims_df: pd.DataFrame) -> str:
+    """
+    Exports scheduled claims to iCalendar (.ics) format for Outlook/Google Calendar.
+    """
+    ics_lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//CAT Claims Scheduler//EN",
+        "CALSCALE:GREGORIAN"
+    ]
+
+    scheduled = claims_df[claims_df["status"] == "Scheduled"]
+
+    for _, row in scheduled.iterrows():
+        if pd.notna(row["start_time"]) and pd.notna(row["end_time"]) and str(row["start_time"]) != "":
+            try:
+                s_dt = datetime.fromisoformat(str(row["start_time"]))
+                e_dt = datetime.fromisoformat(str(row["end_time"]))
+
+                ics_lines.extend([
+                    "BEGIN:VEVENT",
+                    f"SUMMARY:CAT Inspection - {row['claim_id']} ({row['insured_name']})",
+                    f"DESCRIPTION:Claim ID: {row['claim_id']}\\nInsured: {row['insured_name']}",
+                    f"LOCATION:{row['full_address']}",
+                    f"DTSTART:{s_dt.strftime('%Y%m%dT%H%M%SZ')}",
+                    f"DTEND:{e_dt.strftime('%Y%m%dT%H%M%SZ')}",
+                    f"UID:claim-{row['claim_id']}@catscheduler.local",
+                    "END:VEVENT"
+                ])
+            except Exception:
+                continue
+
+    ics_lines.append("END:VCALENDAR")
+    return "\n".join(ics_lines)
