@@ -91,6 +91,11 @@ if uploaded_file is not None and st.session_state.claims_df is None:
 
 # --- DASHBOARD ---
 if st.session_state.claims_df is not None:
+    # Guarantee required scheduling columns exist to avoid KeyErrors
+    for required_col in ["scheduled_date", "inspection_time", "start_time", "end_time"]:
+        if required_col not in st.session_state.claims_df.columns:
+            st.session_state.claims_df[required_col] = ""
+
     df = st.session_state.claims_df
 
     c1, c2, c3, c4 = st.columns(4)
@@ -114,7 +119,7 @@ if st.session_state.claims_df is not None:
         )
         st.markdown(" ")
 
-    tab_cal, tab_map = st.tabs(["📅 CALENDAR VIEW", "🛰️️ SATELLITE MAP VIEW"])
+    tab_cal, tab_map = st.tabs(["📅 CALENDAR VIEW", "🛰 SATELLITE MAP VIEW"])
 
     with tab_cal:
         st.caption("Drag/drop or resize blocks to update inspection times. Overlapping appointments are enabled.")
@@ -123,7 +128,7 @@ if st.session_state.claims_df is not None:
         scheduled_claims = df[df["status"] == "Scheduled"]
         
         for idx, row in scheduled_claims.iterrows():
-            if pd.notna(row["start_time"]) and pd.notna(row["end_time"]):
+            if pd.notna(row["start_time"]) and pd.notna(row["end_time"]) and row["start_time"] != "":
                 calendar_events.append({
                     "id": str(row["claim_id"]),
                     "title": f"[{row['claim_id']}] {row['insured_name']}",
@@ -174,7 +179,6 @@ if st.session_state.claims_df is not None:
         
         esri_satellite_url = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
         
-        # Center map on average lat/lon of claims
         avg_lat = df["lat"].mean() if not df.empty else 29.4241
         avg_lon = df["lon"].mean() if not df.empty else -98.4936
 
@@ -186,7 +190,6 @@ if st.session_state.claims_df is not None:
             name="ESRI Satellite"
         )
         
-        # Keep OpenStreetMap as a secondary toggle option
         folium.TileLayer('OpenStreetMap', name='Street View').add_to(m)
         
         day_colors = ["blue", "green", "purple", "orange", "darkred", "cadetblue", "darkgreen", "pink"]
@@ -242,17 +245,15 @@ if st.session_state.claims_df is not None:
             cid = row["claim_id"]
             c_mask = st.session_state.claims_df["claim_id"] == cid
             
-            # Sync priority
             orig_prio = st.session_state.claims_df.loc[c_mask, "priority"].values[0]
             if orig_prio != row["priority"]:
                 st.session_state.claims_df.loc[c_mask, "priority"] = row["priority"]
                 table_updated = True
 
-            # Sync manual Date / Time entry
             new_date = str(row["scheduled_date"]) if pd.notna(row["scheduled_date"]) else ""
             new_time = str(row["inspection_time"]) if pd.notna(row["inspection_time"]) else ""
             
-            if new_date and new_time and (new_date != "None") and (new_time != "None"):
+            if new_date and new_time and (new_date != "None") and (new_time != "None") and (new_date != "") and (new_time != ""):
                 try:
                     s_dt = datetime.strptime(f"{new_date} {new_time}", "%Y-%m-%d %H:%M")
                     e_dt = s_dt + timedelta(hours=window_hrs)
@@ -315,7 +316,6 @@ if st.session_state.claims_df is not None:
             elif current_claim["status"] in ["Unscheduled", "Ignored"]:
                 st.markdown("#### Assign to Calendar Slot Window")
                 
-                # Dynamic slot calculation based on calendar state
                 unbooked_slots = [s for s in all_slots if not is_slot_conflicting(s, st.session_state.claims_df, current_claim_id=selected_claim_id)]
                 
                 if unbooked_slots:
