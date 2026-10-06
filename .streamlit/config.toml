@@ -1,6 +1,15 @@
-[theme]
-base = "light"
+# Two themes. Users switch between them in the app menu (⋮ > Settings).
+# Field = light, built for daylight and phones outdoors.
+# Console = dark, built for planning at the hotel.
+
+[theme.light]
 primaryColor = "#1D4E89"
 backgroundColor = "#F4F6F9"
 secondaryBackgroundColor = "#E9EEF3"
 textColor = "#14222F"
+
+[theme.dark]
+primaryColor = "#0891B2"
+backgroundColor = "#0A0F14"
+secondaryBackgroundColor = "#111A22"
+textColor = "#D7E1EA"
