@@ -964,12 +964,28 @@ def find_previous_stop(claims_df: pd.DataFrame, slot: Dict[str, Any]) -> Optiona
     return best_row
 
 
+def find_next_stop(claims_df: pd.DataFrame, slot: Dict[str, Any]) -> Optional[pd.Series]:
+    """The scheduled claim that starts soonest at or after the opening ends, on the same day."""
+    slot_end = parse_wallclock(slot["end"])
+    same_day = claims_df[
+        (claims_df["status"] == "Scheduled") &
+        (claims_df["scheduled_date"].astype(str) == slot["date_str"])
+    ]
+    best_row, best_start = None, None
+    for _, row in same_day.iterrows():
+        c_start = parse_wallclock(row["start_time"])
+        if c_start and c_start >= slot_end and (best_start is None or c_start < best_start):
+            best_row, best_start = row, c_start
+    return best_row
+
+
 def get_recommendations_for_slot(
     claims_df: pd.DataFrame,
     slot: Dict[str, Any],
     hotel_coords: Optional[Tuple[float, float]] = None,
     include_statuses: Tuple[str, ...] = ("Unscheduled",),
-    now_local: Optional[datetime] = None
+    now_local: Optional[datetime] = None,
+    mode: str = "fast"
 ) -> Tuple[Optional[pd.DataFrame], Dict[str, Any]]:
     """
     Recommends claims to fill an opening (slot).
@@ -983,7 +999,13 @@ def get_recommendations_for_slot(
     Anchor (drive-from point): previous scheduled stop that day, else the hotel,
     else the center of all claims.
 
-    Sorted FIRST by priority rank (1, 2, 3...; unranked last), SECOND by drive time.
+    mode="fast":   tiebreaker is drive time from the anchor (one route lookup per claim).
+    mode="detour": tiebreaker is the extra driving the claim adds between the anchor and
+                   where you go next (the next booked inspection that day, else the hotel):
+                   anchor->claim + claim->next - anchor->next. Two lookups per claim.
+                   Also flags claims that would make you late for the next inspection.
+
+    Sorted FIRST by priority rank (1, 2, 3...; unranked last), SECOND by the tiebreaker.
     Returns (recs_df or None, anchor_info).
     """
     anchor_info = {"type": "claims_center", "label": "center of claims"}
@@ -1007,9 +1029,27 @@ def get_recommendations_for_slot(
     else:
         anchor_lat, anchor_lon = float(claims_df["lat"].mean()), float(claims_df["lon"].mean())
 
+    # Where you go after this opening (detour mode only)
+    next_info = None
+    if mode == "detour":
+        nxt = find_next_stop(claims_df, slot)
+        if nxt is not None and pd.notna(nxt["lat"]) and pd.notna(nxt["lon"]):
+            next_info = {
+                "type": "next_stop", "claim_id": str(nxt["claim_id"]),
+                "lat": float(nxt["lat"]), "lon": float(nxt["lon"]),
+                "start": parse_wallclock(nxt["start_time"]),
+                "label": f"next stop {nxt['claim_id']} ({parse_wallclock(nxt['start_time']).strftime('%I:%M %p').lstrip('0')})",
+            }
+        elif hotel_coords:
+            next_info = {"type": "hotel", "claim_id": None, "lat": hotel_coords[0], "lon": hotel_coords[1],
+                         "start": None, "label": "the hotel"}
+    anchor_info["next"] = next_info
+
     candidates = claims_df[claims_df["status"].isin(include_statuses)].copy()
     if anchor_info["type"] == "previous_stop":
         candidates = candidates[candidates["claim_id"].astype(str) != anchor_info["claim_id"]]
+    if next_info and next_info["claim_id"]:
+        candidates = candidates[candidates["claim_id"].astype(str) != next_info["claim_id"]]
 
     if "Scheduled" in include_statuses and not candidates.empty:
         starts = candidates["start_time"].apply(parse_wallclock)
@@ -1038,6 +1078,28 @@ def get_recommendations_for_slot(
 
     candidates["drive_miles"] = miles_list
     candidates["drive_time_mins"] = mins_list
+
+    # Detour mode: extra driving this claim adds on the way to the next destination
+    detour_list, to_next_list, late_list = [], [], []
+    if next_info and anchor_ok:
+        _, base_mins = get_osrm_route(float(anchor_lat), float(anchor_lon), next_info["lat"], next_info["lon"])
+        slot_end = parse_wallclock(slot["end"])
+        gap_mins = ((next_info["start"] - slot_end).total_seconds() / 60) if next_info["start"] else None
+        for (_, row), d1 in zip(candidates.iterrows(), mins_list):
+            if d1 is None:
+                detour_list.append(None); to_next_list.append(None); late_list.append(False)
+                continue
+            _, d2 = get_osrm_route(float(row["lat"]), float(row["lon"]), next_info["lat"], next_info["lon"])
+            detour_list.append(max(0, d1 + d2 - base_mins))
+            to_next_list.append(d2)
+            late_list.append(gap_mins is not None and d2 > gap_mins)
+    else:
+        detour_list = [None] * len(candidates)
+        to_next_list = [None] * len(candidates)
+        late_list = [False] * len(candidates)
+    candidates["detour_mins"] = detour_list
+    candidates["drive_to_next_mins"] = to_next_list
+    candidates["late_for_next"] = late_list
     candidates["anchor_type"] = anchor_info["type"]
     candidates["rec_type"] = ["Reschedule" if s == "Scheduled" else "New" for s in candidates["status"]]
     candidates["current_slot"] = [
@@ -1052,7 +1114,14 @@ def get_recommendations_for_slot(
     # Unranked claims get +inf so ranked priorities always sort first;
     # drive time is the tie-breaker within a rank and among unranked claims.
     candidates["prio_sort_key"] = [float(r) if r is not None else float("inf") for r in ranks]
-    candidates["drive_sort_key"] = [float(m) if m is not None else float("inf") for m in mins_list]
+    if mode == "detour" and next_info and anchor_ok:
+        # Claims that would make you late for the next inspection sort after the rest
+        candidates["drive_sort_key"] = [
+            (float("inf") if d is None else float(d) + (10_000 if late else 0))
+            for d, late in zip(detour_list, late_list)
+        ]
+    else:
+        candidates["drive_sort_key"] = [float(m) if m is not None else float("inf") for m in mins_list]
     candidates = candidates.sort_values(
         by=["prio_sort_key", "drive_sort_key"], ascending=[True, True], kind="mergesort"
     ).drop(columns=["prio_sort_key", "drive_sort_key"])
