@@ -532,3 +532,4 @@ if st.session_state.claims_df is not None:
                         st.session_state["selected_claim_id"] = str(rec_row["claim_id"])
                         st.rerun()
 
+
