@@ -10,7 +10,12 @@ from datetime import datetime, date, timedelta
 from streamlit_calendar import calendar
 from engine import (
     process_imported_table,
-    generate_available_slots,
+    compute_openings,
+    compute_day_gaps,
+    get_busy_intervals,
+    day_window,
+    make_slot,
+    find_overlap,
     get_recommendations_for_slot,
     export_claims_to_ics,
     is_slot_conflicting,
@@ -245,69 +250,76 @@ def queue_next_pin_to_fix(current_claim_id):
         st.session_state["all_pins_checked"] = True
 
 
-def render_slot_picker(claim_id, slots, claims_df, now, current_start=None):
+def _set_state(key, value):
+    st.session_state[key] = value
+
+
+def render_slot_picker(claim_id, claims_df, now, settings, current=None):
     """
-    Shows the next open slot, with an optional month calendar to pick a different
-    day and time. Days are colored by availability (based on the schedule settings
-    and already-booked inspections). Returns the chosen slot, or None if nothing is open.
+    Booking picker. Shows the next opening; with the calendar toggle on, shows a month
+    view colored by real availability, then the chosen day's bookings and open time.
+    Any start time (15-minute steps) and any length can be booked, as long as it doesn't
+    overlap another inspection. Returns a slot dict to book, or None.
+    `current` = (start, end) of this claim's existing booking when rescheduling.
     """
     cid = str(claim_id)
+    S = settings
+    busy = get_busy_intervals(claims_df, exclude_claim_id=cid)
+    openings = compute_openings(S["start_date"], S["end_date"], S["active_days"], S["day_start"],
+                                S["per_day"], S["window_hrs"], claims_df, now=now, exclude_claim_id=cid,
+                                latest_end=S["latest_end"])
 
-    # Other claims' booked times
-    others = []
-    for _, r in claims_df[(claims_df["status"] == "Scheduled") & (claims_df["claim_id"].astype(str) != cid)].iterrows():
-        s, e = parse_wallclock(r["start_time"]), parse_wallclock(r["end_time"])
-        if s and e:
-            others.append((s, e, f"{r['claim_id']} - {r['insured_name']}"))
+    def tfmt(dt):
+        return dt.strftime("%I:%M %p").lstrip("0")
 
-    info = []
-    for s in slots:
-        s_start, s_end = parse_wallclock(s["start"]), parse_wallclock(s["end"])
-        occupant = next((who for (o_s, o_e, who) in others if max(s_start, o_s) < min(s_end, o_e)), None)
-        if current_start and s["start"] == str(current_start):
-            status = "current"
-        elif s_start <= now:
-            status = "past"
-        elif occupant:
-            status = "booked"
-        else:
-            status = "open"
-        info.append({**s, "status": status, "occupant": occupant, "_start": s_start, "_end": s_end})
+    # Free time for each inspection day in the date range
+    gaps_by_day = {}
+    d = S["start_date"]
+    while d <= S["end_date"]:
+        if d.strftime("%a") in S["active_days"]:
+            gaps_by_day[d.isoformat()] = compute_day_gaps(d, S["day_start"], S["per_day"], S["window_hrs"],
+                                                          busy, now, S["latest_end"])
+        d += timedelta(days=1)
+    openings_by_day = defaultdict(list)
+    for o in openings:
+        openings_by_day[o["date_str"]].append(o)
 
-    open_slots = [x for x in info if x["status"] == "open"]
-    if not open_slots:
-        st.info("No open slots in the current date range. Extend the end date or add inspections per day in the sidebar.")
+    days_with_time = [ds for ds, g in gaps_by_day.items() if g]
+    if not days_with_time:
+        st.info("No open time left in this date range. Extend the end date or adjust the day settings in the sidebar.")
         return None
 
-    sel_key, day_key, month_key = f"pick_slot_{cid}", f"pick_day_{cid}", f"pick_month_{cid}"
-    open_starts = {x["start"] for x in open_slots}
-    if st.session_state.get(sel_key) not in open_starts:
-        st.session_state[sel_key] = open_slots[0]["start"]
-    chosen = next(x for x in open_slots if x["start"] == st.session_state[sel_key])
+    if not st.toggle("📅 Pick a day and time", key=f"pick_cal_{cid}"):
+        if openings:
+            nxt = openings[0]
+            n_s, n_e = parse_wallclock(nxt["start"]), parse_wallclock(nxt["end"])
+            st.markdown(f"**Next opening:** {n_s.strftime('%a %b %d')}, {tfmt(n_s)} - {tfmt(n_e)}")
+            return nxt
+        st.info("No full-length openings left, but there is shorter open time. "
+                "Turn on **Pick a day and time** to book a shorter inspection.")
+        return None
 
-    def time_range(x):
-        return f"{x['_start'].strftime('%I:%M %p').lstrip('0')} - {x['_end'].strftime('%I:%M %p').lstrip('0')}"
+    day_key, time_key, dur_key, month_key = (f"pick_day_{cid}", f"pick_time_{cid}",
+                                             f"pick_dur_{cid}", f"pick_month_{cid}")
 
-    heading = "Next open slot" if chosen is open_slots[0] else "Selected slot"
-    st.markdown(f"**{heading}:** {chosen['_start'].strftime('%a %b %d')}, {time_range(chosen)}")
+    def first_free_start(ds):
+        if openings_by_day.get(ds):
+            return parse_wallclock(openings_by_day[ds][0]["start"])
+        return gaps_by_day[ds][0][0]
 
-    if not st.toggle("📅 Pick from calendar", key=f"pick_cal_{cid}"):
-        return chosen
-
-    by_day = defaultdict(list)
-    for x in info:
-        by_day[x["date_str"]].append(x)
-
-    if st.session_state.get(day_key) not in by_day:
-        st.session_state[day_key] = chosen["date_str"]
+    if st.session_state.get(day_key) not in days_with_time:
+        st.session_state[day_key] = openings[0]["date_str"] if openings else days_with_time[0]
+        st.session_state[time_key] = first_free_start(st.session_state[day_key]).time()
+    if time_key not in st.session_state:
+        st.session_state[time_key] = first_free_start(st.session_state[day_key]).time()
+    if dur_key not in st.session_state:
+        st.session_state[dur_key] = float(S["window_hrs"])
     sel_day = st.session_state[day_key]
 
-    # Months covered by the inspection date range
-    all_days = sorted(by_day.keys())
-    first_d, last_d = date.fromisoformat(all_days[0]), date.fromisoformat(all_days[-1])
+    # Months covered by the date range
     months = []
-    y, mo = first_d.year, first_d.month
-    while (y, mo) <= (last_d.year, last_d.month):
+    y, mo = S["start_date"].year, S["start_date"].month
+    while (y, mo) <= (S["end_date"].year, S["end_date"].month):
         months.append((y, mo))
         y, mo = (y + 1, 1) if mo == 12 else (y, mo + 1)
     if st.session_state.get(month_key) not in months:
@@ -318,17 +330,19 @@ def render_slot_picker(claim_id, slots, claims_df, now, current_start=None):
 
     with st.container(key=f"slotpicker_{cid}"):
         n1, n2, n3 = st.columns([1, 3, 1], vertical_alignment="center")
-        if n1.button("◀", key=f"pm_prev_{cid}", disabled=m_idx == 0, use_container_width=True):
-            st.session_state[month_key] = months[m_idx - 1]
-            st.rerun()
+        n1.button("◀", key=f"pm_prev_{cid}", disabled=m_idx == 0, use_container_width=True,
+                  on_click=_set_state, args=(month_key, months[max(m_idx - 1, 0)]))
         n2.markdown(f"<div style='text-align:center;font-weight:600'>{pycal.month_name[mo]} {y}</div>",
                     unsafe_allow_html=True)
-        if n3.button("▶", key=f"pm_next_{cid}", disabled=m_idx == len(months) - 1, use_container_width=True):
-            st.session_state[month_key] = months[m_idx + 1]
-            st.rerun()
+        n3.button("▶", key=f"pm_next_{cid}", disabled=m_idx == len(months) - 1, use_container_width=True,
+                  on_click=_set_state, args=(month_key, months[min(m_idx + 1, len(months) - 1)]))
 
         for col, wd in zip(st.columns(7), ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"]):
             col.caption(wd)
+
+        def pick_day(ds):
+            st.session_state[day_key] = ds
+            st.session_state[time_key] = first_free_start(ds).time()
 
         for week in pycal.Calendar(firstweekday=6).monthdatescalendar(y, mo):
             for col, d in zip(st.columns(7), week):
@@ -336,45 +350,99 @@ def render_slot_picker(claim_id, slots, claims_df, now, current_start=None):
                     col.markdown("&nbsp;", unsafe_allow_html=True)
                     continue
                 ds = d.isoformat()
-                items = by_day.get(ds, [])
-                n_open = sum(1 for x in items if x["status"] == "open")
-                n_booked = sum(1 for x in items if x["status"] in ("booked", "current"))
-                if not items:
-                    state, tip = "off", "No inspections this day"
-                elif n_open == 0:
-                    state = "full"
-                    tip = "Fully booked" if n_booked else "No open times left"
-                elif n_open == 1 and len(items) > 1:
-                    state, tip = "few", f"1 of {len(items)} open"
+                if ds not in gaps_by_day:
+                    state, tip, can_pick = "off", "Not an inspection day", False
+                elif not gaps_by_day[ds]:
+                    state, tip, can_pick = "full", "No open time left", False
                 else:
-                    state, tip = "open", f"{n_open} of {len(items)} open"
-                if col.button(str(d.day), key=f"pd_{state}_{cid}_{ds}", help=tip,
-                              disabled=(n_open == 0), use_container_width=True,
-                              type="primary" if ds == sel_day else "secondary"):
-                    st.session_state[day_key] = ds
-                    st.session_state[sel_key] = next(x["start"] for x in items if x["status"] == "open")
-                    st.rerun()
+                    n_open = len(openings_by_day.get(ds, []))
+                    state = "open" if n_open >= 2 else "few"
+                    tip = "Open " + ", ".join(f"{tfmt(a)}-{tfmt(b)}" for a, b in gaps_by_day[ds])
+                    can_pick = True
+                col.button(str(d.day), key=f"pd_{state}_{cid}_{ds}", help=tip, disabled=not can_pick,
+                           use_container_width=True, type="primary" if ds == sel_day else "secondary",
+                           on_click=pick_day, args=(ds,))
 
-        st.caption("Green: open. Amber: one time left. Hatched: full. Faded: not an inspection day.")
+        st.caption("Green: room for 2+ inspections. Amber: room for 1 or less. Hatched: no open time. "
+                   "Faded: not an inspection day.")
 
-        # Times for the selected day
-        day_items = by_day.get(sel_day, [])
-        st.markdown(f"**{date.fromisoformat(sel_day).strftime('%A, %b %d')}**")
-        for i in range(0, len(day_items), 2):
-            for col, x in zip(st.columns(2), day_items[i:i + 2]):
-                label = time_range(x)
-                if x["status"] == "open":
-                    if col.button(label, key=f"pt_open_{cid}_{x['start']}", use_container_width=True,
-                                  type="primary" if x["start"] == st.session_state[sel_key] else "secondary"):
-                        st.session_state[sel_key] = x["start"]
-                        st.rerun()
-                else:
-                    tag = {"booked": "booked", "current": "current", "past": "past"}[x["status"]]
-                    tip = f"Booked: {x['occupant']}" if x["status"] == "booked" else None
-                    col.button(f"{label} · {tag}", key=f"pt_{tag}_{cid}_{x['start']}", disabled=True,
-                               help=tip, use_container_width=True)
+    # ---- The selected day ----
+    day_d = date.fromisoformat(sel_day)
+    ws, we = day_window(day_d, S["day_start"], S["per_day"], S["window_hrs"], S["latest_end"])
+    st.markdown(f"**{day_d.strftime('%A, %b %d')}** ({tfmt(ws)} - {tfmt(we)} working hours)")
 
-    return chosen
+    rows = [(b["start"], f"{tfmt(b['start'])} - {tfmt(b['end'])}", f"Booked: {b['label']}")
+            for b in busy if b["start"].date() == day_d]
+    if current and current[0] and current[0].date() == day_d:
+        rows.append((current[0], f"{tfmt(current[0])} - {tfmt(current[1])}", "This claim's current time"))
+    rows += [(a, f"{tfmt(a)} - {tfmt(b)}", "Open") for a, b in gaps_by_day[sel_day]]
+    rows.append((we, f"After {tfmt(we)}", "Evening: type a later start time if the insured is available"))
+    st.markdown("  \n".join(
+        f":green[**{when}** · open]" if what == "Open" else f"{when} · {what}"
+        for _, when, what in sorted(rows, key=lambda r: r[0])
+    ))
+
+    # Quick starts: the beginning of each open block
+    quick = sorted({parse_wallclock(o["start"]) for o in openings_by_day.get(sel_day, [])} |
+                   {a for a, _ in gaps_by_day[sel_day]})
+    if quick:
+        st.caption("Quick start times")
+        for i in range(0, len(quick), 3):
+            for col, t in zip(st.columns(3), quick[i:i + 3]):
+                col.button(tfmt(t), key=f"pt_open_{cid}_{t.isoformat()}", use_container_width=True,
+                           type="primary" if st.session_state[time_key] == t.time() else "secondary",
+                           on_click=_set_state, args=(time_key, t.time()))
+
+    t1, t2 = st.columns(2)
+    t1.time_input("Start time", key=time_key, step=timedelta(minutes=15))
+    t2.number_input("Length (hours)", key=dur_key, min_value=0.25, max_value=8.0, step=0.25)
+
+    start_dt = datetime.combine(day_d, st.session_state[time_key])
+    requested_hrs = float(st.session_state[dur_key])
+    slot = make_slot(start_dt, requested_hrs)
+    end_dt = parse_wallclock(slot["end"])
+
+    def hm(minutes):
+        h, m = divmod(int(round(minutes)), 60)
+        return f"{h} hr {m} min" if h and m else (f"{h} hr" if h else f"{m} min")
+
+    if start_dt <= now:
+        st.error("That start time has already passed. Pick a later time.")
+        return None
+
+    # Can't start in the middle of another inspection
+    during = next((b for b in busy if b["start"] <= start_dt < b["end"]), None)
+    if during:
+        st.error(f"{tfmt(start_dt)} is during {during['label']} ({tfmt(during['start'])} - {tfmt(during['end'])}). "
+                 "Pick a start time in an open block.")
+        return None
+
+    # Not enough room before the next inspection: offer a shortened inspection,
+    # but only after the rep acknowledges it may not be enough time.
+    next_booking = min((b for b in busy if b["start"] > start_dt), key=lambda b: b["start"], default=None)
+    if next_booking and end_dt > next_booking["start"]:
+        fit_end = next_booking["start"]
+        fit_min = (fit_end - start_dt).total_seconds() / 60
+        if fit_min < 15:
+            st.error(f"Only {hm(fit_min)} open before {next_booking['label']} at {tfmt(fit_end)}. "
+                     "Pick an earlier start time.")
+            return None
+        st.warning(
+            f"Only **{hm(fit_min)}** is open before {next_booking['label']} at {tfmt(fit_end)}. "
+            f"You asked for {hm(requested_hrs * 60)}, so this may not be enough time for the inspection. "
+            f"If you continue, this inspection will be shortened to **{tfmt(start_dt)} - {tfmt(fit_end)}** to fit."
+        )
+        ack = st.checkbox("I understand. Book the shorter inspection.",
+                          key=f"ack_short_{cid}_{start_dt.isoformat()}_{requested_hrs}")
+        if not ack:
+            return None
+        slot = make_slot(start_dt, fit_min / 60)
+        end_dt = fit_end
+
+    if start_dt < ws:
+        st.caption(f"Starts before your usual {tfmt(ws)} day start.")
+    st.markdown(f"**Selected:** {start_dt.strftime('%a %b %d')}, {tfmt(start_dt)} - {tfmt(end_dt)}")
+    return slot
 
 
 def render_nav_buttons(address, lat, lon, geo_quality=None):
@@ -418,10 +486,15 @@ active_days = st.sidebar.multiselect(
     default=["Mon", "Tue", "Wed", "Thu", "Fri"]
 )
 
-inspections_per_day = st.sidebar.slider("Inspections per day", 1, 8, 3)
+inspections_per_day = st.sidebar.slider(
+    "Inspections per day", 1, 8, 3,
+    help="Sets the length of your working day: day start time + this many windows."
+)
 
 window_hrs = st.sidebar.number_input(
     "Window length (hours)",
+    help="Default inspection length. Openings are suggested in blocks of this length, "
+         "but you can book any start time and length.",
     min_value=0.25,
     max_value=8.00,
     value=2.50,
@@ -429,6 +502,11 @@ window_hrs = st.sidebar.number_input(
 )
 
 start_time_input = st.sidebar.time_input("Day start time", value=datetime.strptime("08:00", "%H:%M").time())
+latest_end_input = st.sidebar.time_input(
+    "Latest end for suggested openings", value=datetime.strptime("19:00", "%H:%M").time(),
+    help="Suggested openings never run past this time. You can still book later by hand "
+         "if the insured is available."
+)
 
 # --- DEPLOYMENT TIME ZONE ---
 # All schedule times are local to the deployment; this zone is used for the
@@ -456,8 +534,16 @@ except Exception:
     now_local = datetime.now()
     ics_tz = None
 
-all_slots = generate_available_slots(
-    start_date, end_date, active_days, inspections_per_day, start_time_input, window_hrs
+# Openings come from the real bookings: any free time inside each day's working
+# window, in blocks of the default window length starting at the earliest free time.
+schedule_settings = {
+    "start_date": start_date, "end_date": end_date, "active_days": active_days,
+    "day_start": start_time_input, "per_day": inspections_per_day, "window_hrs": window_hrs,
+    "latest_end": latest_end_input,
+}
+all_slots = compute_openings(
+    start_date, end_date, active_days, start_time_input, inspections_per_day, window_hrs,
+    st.session_state.claims_df, now=now_local, latest_end=latest_end_input
 )
 
 # --- MAP TOOLS & SAVED PROGRESS ---
@@ -644,6 +730,8 @@ if st.session_state.claims_df is not None:
                 "title": f"[{cid}] {row['insured_name']}",
                 "start": row["_start_dt"].isoformat(),
                 "end": row["_end_dt"].isoformat(),
+                # Inspections can't be dragged or resized over each other
+                "overlap": False,
             }
             if row["_end_dt"] <= now_local:
                 event.update({
@@ -681,6 +769,19 @@ if st.session_state.claims_df is not None:
         shade_range(start_date - timedelta(days=28), start_date)
         shade_range(end_date + timedelta(days=1), end_date + timedelta(days=60))
 
+        # --- OPEN TIME: light green behind the free parts of each working day ---
+        cal_busy = get_busy_intervals(df)
+        d = start_date
+        while d <= end_date:
+            if d.strftime("%a") in active_days:
+                for g0, g1 in compute_day_gaps(d, start_time_input, inspections_per_day, window_hrs,
+                                               cal_busy, now_local, latest_end_input):
+                    calendar_events.append({
+                        "start": g0.isoformat(), "end": g1.isoformat(),
+                        "display": "background", "backgroundColor": "#22A05A",
+                    })
+            d += timedelta(days=1)
+
         # --- VISIBLE HOURS ---
         # Show until 7 PM by default, but extend to fit the inspection windows
         # and any inspection that runs later (or starts earlier) than that.
@@ -716,6 +817,8 @@ if st.session_state.claims_df is not None:
             "editable": True,
             "selectable": True,
             "slotEventOverlap": True,
+            # Drag and resize in 15-minute steps
+            "snapDuration": "00:15:00",
             # Show stored times exactly as entered (deployment-local), regardless
             # of the time zone of the computer viewing the app.
             "timeZone": "UTC",
@@ -723,14 +826,20 @@ if st.session_state.claims_df is not None:
             # current-time line are correct for the deployment.
             "now": now_local.isoformat(),
             "nowIndicator": True,
-            # Shade inactive inspection days and hours outside the inspection window,
-            # and don't allow dragging inspections into the shaded areas.
+            # Gray shading outside your usual working hours and on non-inspection days
             "businessHours": {
                 "daysOfWeek": [js_day[d] for d in active_days],
                 "startTime": start_time_input.strftime("%H:%M"),
-                "endTime": "24:00" if window_end_min >= 24 * 60 else day_end_dt.strftime("%H:%M"),
+                "endTime": day_window(start_date, start_time_input, inspections_per_day, window_hrs,
+                                      latest_end_input)[1].strftime("%H:%M"),
             },
-            "eventConstraint": "businessHours",
+            # Inspections can be dragged on inspection days from the day start into the
+            # evening (insureds are often available late), but not onto days off.
+            "eventConstraint": {
+                "daysOfWeek": [js_day[d] for d in active_days],
+                "startTime": start_time_input.strftime("%H:%M"),
+                "endTime": "24:00",
+            },
         }
 
         calendar_css = f"""
@@ -1172,8 +1281,10 @@ if st.session_state.claims_df is not None:
 
                     st.write(f"**Currently:** {fmt_dt(parse_wallclock(current_claim['start_time'])) or 'no time set'}")
 
-                    move_slot = render_slot_picker(selected_claim_id, all_slots, st.session_state.claims_df,
-                                                   now_local, current_start=current_claim["start_time"])
+                    move_slot = render_slot_picker(
+                        selected_claim_id, st.session_state.claims_df, now_local, schedule_settings,
+                        current=(parse_wallclock(current_claim["start_time"]), parse_wallclock(current_claim["end_time"]))
+                    )
                     if move_slot:
                         if st.button("🔁 Move to this slot", type="primary"):
                             book_claim_into_slot(claim_mask, move_slot)
@@ -1189,7 +1300,8 @@ if st.session_state.claims_df is not None:
                         st.rerun()
 
                 elif current_claim["status"] in ["Unscheduled", "Ignored"]:
-                    chosen_slot = render_slot_picker(selected_claim_id, all_slots, st.session_state.claims_df, now_local)
+                    chosen_slot = render_slot_picker(selected_claim_id, st.session_state.claims_df,
+                                                     now_local, schedule_settings)
                     if chosen_slot:
                         selected_target_date_str = chosen_slot["date_str"]
                         if st.button("Book this slot", type="primary"):
