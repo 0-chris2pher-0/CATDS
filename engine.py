@@ -3,6 +3,8 @@ import numpy as np
 import requests
 from datetime import datetime, timedelta
 from ics import Calendar, Event
+from geopy.geocoders import Nominatim
+from geopy.extra.rate_limiter import RateLimiter
 
 HEADER_ALIASES = {
     "claim_num": ["claim claimant", "claim number", "claim #", "claim_id", "claimno", "file #"],
@@ -13,6 +15,9 @@ HEADER_ALIASES = {
     "zip": ["accident location postal code", "zip", "zip code", "postal code"],
     "loss_type": ["accident description", "loss type", "cause of loss", "peril"]
 }
+
+geolocator = Nominatim(user_agent="cat_claims_scheduler")
+geocode_with_delay = RateLimiter(geolocator.geocode, min_delay_seconds=1)
 
 def map_headers(df_columns):
     mapped_keys = {}
@@ -30,6 +35,16 @@ def map_headers(df_columns):
                 break
     return mapped_keys
 
+def geocode_address(full_address):
+    """Real address geocoding via Nominatim with fallback to San Antonio center."""
+    try:
+        location = geocode_with_delay(full_address)
+        if location:
+            return location.latitude, location.longitude
+    except Exception:
+        pass
+    return 29.4241, -98.4936  # Default fallback coordinates
+
 def process_imported_table(df):
     mapping = map_headers(df.columns)
     
@@ -39,7 +54,6 @@ def process_imported_table(df):
         raise ValueError(f"Could not automatically detect columns for: {', '.join(missing)}. Please check table headers.")
 
     processed_claims = []
-    base_lat, base_lon = 29.4241, -98.4936  # Default center fallback (San Antonio)
 
     for idx, row in df.iterrows():
         full_address = f"{row.get(mapping.get('street', ''), '')}, {row.get(mapping.get('city', ''), '')}, {row.get(mapping.get('state', ''), '')} {row.get(mapping.get('zip', ''), '')}".strip()
@@ -47,9 +61,7 @@ def process_imported_table(df):
         claim_num = str(row.get(mapping.get("claim_num"), f"CLM-{idx+1}"))
         insured = str(row.get(mapping.get("insured_name"), "Unknown Insured"))
         
-        # Spatial scatter offset for map visualization
-        offset_lat = base_lat + ((idx % 7) - 3) * 0.015 + ((idx % 3) * 0.005)
-        offset_lon = base_lon + (((idx * 2) % 7) - 3) * 0.015 - ((idx % 4) * 0.004)
+        lat, lon = geocode_address(full_address)
 
         claim_record = {
             "claim_id": claim_num,
@@ -62,8 +74,9 @@ def process_imported_table(df):
             "start_time": None,
             "end_time": None,
             "scheduled_date": None,
-            "lat": offset_lat,
-            "lon": offset_lon
+            "inspection_time": "",
+            "lat": lat,
+            "lon": lon
         }
         processed_claims.append(claim_record)
         
@@ -73,7 +86,6 @@ def generate_available_slots(start_date, end_date, active_days, inspections_per_
     slots = []
     current_date = start_date
     day_name_map = {0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri", 5: "Sat", 6: "Sun"}
-    
     window_minutes = int(window_hrs * 60)
 
     while current_date <= end_date:
@@ -96,13 +108,13 @@ def is_slot_conflicting(slot, claims_df, current_claim_id=None):
         
     scheduled_claims = claims_df[claims_df["status"] == "Scheduled"]
     if current_claim_id:
-        scheduled_claims = scheduled_claims[scheduled_claims["claim_id"] != current_claim_id]
+        scheduled_claims = scheduled_claims[scheduled_claims["claim_id"] != str(current_claim_id)]
 
     slot_start = datetime.fromisoformat(slot["start"])
     slot_end = datetime.fromisoformat(slot["end"])
 
     for _, row in scheduled_claims.iterrows():
-        if pd.isna(row["start_time"]) or pd.isna(row["end_time"]):
+        if pd.isna(row["start_time"]) or pd.isna(row["end_time"]) or not row["start_time"]:
             continue
         c_start = datetime.fromisoformat(str(row["start_time"]))
         c_end = datetime.fromisoformat(str(row["end_time"]))
@@ -112,14 +124,9 @@ def is_slot_conflicting(slot, claims_df, current_claim_id=None):
     return False
 
 def calculate_distance(lat1, lon1, lat2, lon2):
-    """Euclidean distance fallback in degrees."""
     return np.sqrt((lat1 - lat2)**2 + (lon1 - lon2)**2)
 
 def get_drive_time_and_distance(lat1, lon1, lat2, lon2):
-    """
-    Calculates driving duration (minutes) and distance (miles) using OSRM routing.
-    Falls back to straight-line estimation if OSRM is unreachable.
-    """
     url = f"http://router.project-osrm.org/route/v1/driving/{lon1},{lat1};{lon2},{lat2}?overview=false"
     try:
         response = requests.get(url, timeout=2)
@@ -127,24 +134,18 @@ def get_drive_time_and_distance(lat1, lon1, lat2, lon2):
             data = response.json()
             if data.get("code") == "Ok" and len(data.get("routes", [])) > 0:
                 route = data["routes"][0]
-                duration_mins = round(route["duration"] / 60.0, 1)    # seconds to minutes
-                distance_miles = round(route["distance"] / 1609.34, 1) # meters to miles
+                duration_mins = round(route["duration"] / 60.0, 1)
+                distance_miles = round(route["distance"] / 1609.34, 1)
                 return duration_mins, distance_miles
     except Exception:
         pass
     
-    # Fallback approximation (~69 miles per degree, assuming 30 mph average drive)
     approx_deg = calculate_distance(lat1, lon1, lat2, lon2)
     approx_miles = round(approx_deg * 69.0, 1)
     approx_mins = round(approx_miles * 2.0, 1)
     return approx_mins, approx_miles
 
 def get_recommendations_for_day(claims_df, target_date_str, hotel_coords=(29.4241, -98.4936)):
-    """
-    Returns unscheduled claims ordered by drive time to:
-    1. The last scheduled claim anchor on the target date.
-    2. Hotel base location if target date is clear.
-    """
     if claims_df is None or claims_df.empty:
         return pd.DataFrame()
 
