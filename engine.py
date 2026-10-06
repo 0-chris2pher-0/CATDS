@@ -8,6 +8,7 @@ import streamlit as st
 from collections import Counter
 from datetime import datetime, date, timedelta, timezone
 from typing import List, Dict, Any, Optional, Tuple
+from urllib.parse import quote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
@@ -142,6 +143,42 @@ def format_slot_time(dt: Optional[datetime]) -> str:
     return dt.strftime("%a %m/%d %I:%M %p") if dt else ""
 
 
+# --- NAVIGATION LINKS ---
+
+def build_navigation_links(address: Any, lat: Any = None, lon: Any = None, prefer_coords: bool = False) -> Dict[str, str]:
+    """
+    Returns turn-by-turn directions links for Google Maps and Apple Maps.
+    Uses the street ADDRESS when available so Google/Apple apply their own
+    rooftop-accurate geocoding (more reliable than our free geocoded pin).
+    Falls back to lat/lon if there's no address.
+    On phones these open the Google Maps / Apple Maps apps when installed.
+    """
+    addr = str(address).strip() if address is not None else ""
+    has_coords = False
+    try:
+        has_coords = lat is not None and lon is not None and pd.notna(lat) and pd.notna(lon)
+    except (TypeError, ValueError):
+        pass
+    if prefer_coords and has_coords:
+        # The rep placed this pin by hand, so it beats the street address.
+        dest = f"{float(lat)},{float(lon)}"
+    elif addr and addr.lower() != "nan":
+        dest = addr
+    else:
+        try:
+            if lat is None or lon is None or pd.isna(lat) or pd.isna(lon):
+                return {}
+        except (TypeError, ValueError):
+            return {}
+        dest = f"{float(lat)},{float(lon)}"
+
+    q = quote(dest)
+    return {
+        "google": f"https://www.google.com/maps/dir/?api=1&destination={q}",
+        "apple": f"https://maps.apple.com/?daddr={q}",
+    }
+
+
 # --- PRIORITY NORMALIZATION ---
 
 def normalize_priority(val: Any) -> Optional[int]:
@@ -166,162 +203,291 @@ def normalize_priority(val: Any) -> Optional[int]:
         return None
 
 
-# --- OPTION 4: US CENSUS BATCH & STRUCTURED GEOCODING UTILITIES ---
+# --- GEOCODING (free sources only) ---
+# Lookup chain per address, most to least precise:
+#   1. US Census batch (all addresses in one request)
+#   2. US Census single-line lookup (does its own address parsing)
+#   3. OpenStreetMap / Nominatim structured lookup, then free-text lookup
+#   4. ZIP code area, then city area (approximate, flagged for review)
+#   5. Not found (no pin; flagged so the rep can place it manually)
+# Every claim gets a geo_quality label so the map can show how each pin was placed.
+
+GEO_EXACT = "Exact address"
+GEO_CENSUS_APPROX = "Close address match"
+GEO_OSM = "OpenStreetMap match"
+GEO_ZIP = "ZIP area (approx.)"
+GEO_CITY = "City area (approx.)"
+GEO_NOT_FOUND = "Not found"
+GEO_MANUAL = "Set by rep"
+GEO_IMPORTED = "From import file"
+GEO_UNKNOWN = "Unknown"
+
+# Pins a rep should double-check or place by hand
+GEO_NEEDS_REVIEW = {GEO_ZIP, GEO_CITY, GEO_NOT_FOUND}
+
+# Nominatim's usage policy asks for a real contact. Set NOMINATIM_CONTACT in
+# Streamlit secrets (Manage app > Settings > Secrets), or edit the fallback below.
+_NOMINATIM_CONTACT_FALLBACK = "replace-with-your-email@example.com"
+
+
+def _nominatim_headers() -> Dict[str, str]:
+    try:
+        contact = st.secrets.get("NOMINATIM_CONTACT", _NOMINATIM_CONTACT_FALLBACK)
+    except Exception:
+        contact = _NOMINATIM_CONTACT_FALLBACK
+    return {"User-Agent": f"CATClaimsSchedulerApp/5.0 ({contact})"}
+
+
+_last_nominatim_call = [0.0]
+
+
+def _nominatim_throttle():
+    """Nominatim allows at most 1 request per second."""
+    wait = 1.05 - (time.time() - _last_nominatim_call[0])
+    if wait > 0:
+        time.sleep(wait)
+    _last_nominatim_call[0] = time.time()
+
+
+def clean_address_for_geocoding(address: Any) -> str:
+    """
+    Strips things geocoders choke on: unit numbers (Apt 4, Unit B, #12, Lot 7),
+    parenthetical notes ("(rear house)"), and messy spacing/commas.
+    The original address is kept for display and directions.
+    """
+    if address is None:
+        return ""
+    s = str(address).strip()
+    if not s or s.lower() == "nan":
+        return ""
+    s = re.sub(r"\(.*?\)", " ", s)
+    s = re.sub(
+        r"\b(?:apt|apartment|unit|suite|bldg|building|trlr|trailer|spc|space|lot|rm|room)\b\.?\s*#?\s*[\w\-]+",
+        " ", s, flags=re.IGNORECASE
+    )
+    s = re.sub(r"#\s*[\w\-]+", " ", s)
+    s = re.sub(r"\s+", " ", s)
+    s = re.sub(r"\s*,\s*", ", ", s)
+    s = re.sub(r"(?:,\s*){2,}", ", ", s)
+    return s.strip(" ,")
+
+
+def _normalize_state(value: Any) -> str:
+    s = str(value or "").strip().upper()
+    if s == "NAN":
+        return ""
+    return STATE_NAMES.get(s, s)
+
 
 def parse_us_address(address_str: str, fallback_state: str = "") -> Tuple[str, str, str, str]:
     """
-    Parses a raw address string into (Street, City, State, Zip) components.
+    Parses a raw address into (street, city, state, zip), reading from the END
+    of the address, where ZIP and state reliably sit. Handles:
+      "123 Oak St, San Antonio, TX 78201"
+      "123 Oak St, San Antonio TX 78201"
+      "123 Oak St, New Braunfels, Texas"
     """
-    clean_addr = str(address_str).strip()
-    if not clean_addr or clean_addr.lower() == "nan":
+    clean = clean_address_for_geocoding(address_str)
+    fallback_state = _normalize_state(fallback_state)
+    if not clean:
         return "", "", fallback_state, ""
 
-    parts = [p.strip() for p in clean_addr.split(",") if p.strip()]
-    street, city, state, zip_code = "", "", fallback_state, ""
+    parts = [p.strip() for p in clean.split(",") if p.strip()]
+    zip_code, state = "", ""
 
-    if len(parts) >= 3:
-        street = parts[0]
-        city = parts[1]
-        state_zip_part = parts[2].split()
-        if len(state_zip_part) >= 1:
-            state = state_zip_part[0]
-        if len(state_zip_part) >= 2:
-            zip_code = state_zip_part[1]
-    elif len(parts) == 2:
-        street = parts[0]
-        city_st = parts[1].split()
-        if len(city_st) >= 1:
-            city = city_st[0]
-        if len(city_st) >= 2:
-            state = city_st[1]
-    else:
-        street = clean_addr
+    # Peel ZIP, then state, off the end (they may be in their own comma parts)
+    for _ in range(2):
+        if not parts:
+            break
+        tokens = parts[-1].split()
+        if not zip_code and tokens and re.fullmatch(r"\d{5}(?:-\d{4})?", tokens[-1]):
+            zip_code = tokens.pop()[:5]
+        if not state and tokens:
+            two = " ".join(tokens[-2:]).upper() if len(tokens) >= 2 else ""
+            if two in STATE_NAMES:
+                state = STATE_NAMES[two]
+                tokens = tokens[:-2]
+            elif tokens[-1].upper() in STATE_TIMEZONES:
+                state = tokens.pop().upper()
+            elif tokens[-1].upper() in STATE_NAMES:
+                state = STATE_NAMES[tokens.pop().upper()]
+        if tokens:
+            parts[-1] = " ".join(tokens)
+        else:
+            parts.pop()
+        if zip_code and state:
+            break
 
-    return street, city, state, zip_code
+    street = parts[0] if parts else ""
+    city = parts[-1] if len(parts) >= 2 else ""
+    return street, city, state or fallback_state, zip_code
 
 
-def census_batch_geocode(parsed_addresses: List[Tuple[int, str, str, str, str]]) -> Dict[int, Tuple[float, float]]:
+def census_batch_geocode(parsed_addresses: List[Tuple[int, str, str, str, str]]) -> Dict[int, Tuple[float, float, str]]:
     """
-    Sends structured addresses to the US Census Bureau Batch Geocoder in a single request.
-    Returns a mapping of row_index -> (lat, lon).
+    Sends structured addresses to the US Census Bureau Batch Geocoder in one request.
+    Returns row_index -> (lat, lon, quality).
     """
     if not parsed_addresses:
         return {}
 
+    import csv
     csv_buffer = io.StringIO()
+    writer = csv.writer(csv_buffer, quoting=csv.QUOTE_ALL)
     for row_id, street, city, state, zip_code in parsed_addresses:
-        s_clean = street.replace('"', '')
-        c_clean = city.replace('"', '')
-        st_clean = state.replace('"', '')
-        z_clean = zip_code.replace('"', '')
-        csv_buffer.write(f'"{row_id}","{s_clean}","{c_clean}","{st_clean}","{z_clean}"\n')
-
-    csv_buffer.seek(0)
+        writer.writerow([row_id, street, city, state, zip_code])
 
     results = {}
     try:
-        url = "https://geocoding.geo.census.gov/geocoder/locations/addressbatch"
-        files = {
-            'addressFile': ('addresses.csv', csv_buffer.getvalue(), 'text/csv')
-        }
-        data = {
-            'benchmark': 'Public_AR_Current',
-            'vintage': 'Current_Current'
-        }
-        
-        response = requests.post(url, files=files, data=data, timeout=30)
-        
+        response = requests.post(
+            "https://geocoding.geo.census.gov/geocoder/locations/addressbatch",
+            files={"addressFile": ("addresses.csv", csv_buffer.getvalue(), "text/csv")},
+            data={"benchmark": "Public_AR_Current", "vintage": "Current_Current"},
+            timeout=120
+        )
         if response.status_code == 200:
-            lines = response.text.strip().split("\n")
-            for line in lines:
-                parts = [p.strip('"') for p in line.split('","')]
-                if len(parts) >= 6:
-                    row_id_str = parts[0].strip('"')
-                    match_status = parts[2].strip('"')
-                    
-                    if match_status == "Match" and len(parts) >= 6:
-                        coords_str = parts[5].strip('"')
-                        if "," in coords_str:
-                            lon_str, lat_str = coords_str.split(",")
-                            try:
-                                row_id = int(row_id_str)
-                                results[row_id] = (float(lat_str), float(lon_str))
-                            except ValueError:
-                                pass
+            # Columns: id, input address, match status, match type, matched address, "lon,lat", ...
+            for fields in csv.reader(io.StringIO(response.text)):
+                if len(fields) >= 6 and fields[2] == "Match" and "," in fields[5]:
+                    try:
+                        lon_str, lat_str = fields[5].split(",")
+                        quality = GEO_EXACT if fields[3] == "Exact" else GEO_CENSUS_APPROX
+                        results[int(fields[0])] = (float(lat_str), float(lon_str), quality)
+                    except ValueError:
+                        pass
     except Exception as e:
-        st.warning(f"US Census Batch API request failed: {e}")
+        st.warning(f"The US Census batch lookup didn't respond ({e}). Trying addresses one at a time.")
 
     return results
 
 
 @st.cache_data(show_spinner=False)
-def geocode_single_address_fallback(address: str, state: str = None) -> Tuple[float, float]:
-    """
-    Fallback single-address lookup using Nominatim for rows missed by Census batch.
-    """
-    clean_addr = str(address).strip()
-    if not clean_addr or clean_addr.lower() == "nan":
-        return 29.4241 + np.random.uniform(-0.02, 0.02), -98.4936 + np.random.uniform(-0.02, 0.02)
+def _census_oneline(address: str) -> Optional[Tuple[float, float, str]]:
+    """Census single-line lookup. Network errors raise (so they aren't cached)."""
+    resp = requests.get(
+        "https://geocoding.geo.census.gov/geocoder/locations/onelineaddress",
+        params={"address": address, "benchmark": "Public_AR_Current", "format": "json"},
+        timeout=10
+    )
+    resp.raise_for_status()
+    matches = resp.json().get("result", {}).get("addressMatches", [])
+    if not matches:
+        return None
+    c = matches[0]["coordinates"]
+    return float(c["y"]), float(c["x"]), GEO_CENSUS_APPROX if len(matches) > 1 else GEO_EXACT
 
+
+@st.cache_data(show_spinner=False)
+def _nominatim(params_items: Tuple[Tuple[str, str], ...]) -> Optional[Tuple[float, float]]:
+    """Nominatim lookup. Free-text (q) and structured fields are never mixed."""
+    _nominatim_throttle()
+    params = dict(params_items)
+    params.update({"format": "json", "limit": "1", "countrycodes": "us"})
+    resp = requests.get("https://nominatim.openstreetmap.org/search",
+                        params=params, headers=_nominatim_headers(), timeout=8)
+    resp.raise_for_status()
+    data = resp.json()
+    if not data:
+        return None
+    return float(data[0]["lat"]), float(data[0]["lon"])
+
+
+def _try(fn, *args):
     try:
-        url = "https://nominatim.openstreetmap.org/search"
-        params = {
-            "q": clean_addr,
-            "format": "json",
-            "limit": 1,
-            "countrycodes": "us"
-        }
-        if state and str(state).strip() and str(state).lower() != "nan":
-            params["state"] = str(state).strip()
-
-        headers = {"User-Agent": "CATClaimsSchedulerApp/4.0 (contact@example.com)"}
-        resp = requests.get(url, params=params, headers=headers, timeout=6)
-        if resp.status_code == 200:
-            data = resp.json()
-            if data and len(data) > 0:
-                return float(data[0]["lat"]), float(data[0]["lon"])
+        return fn(*args)
     except Exception:
-        pass
-
-    return 29.4241 + np.random.uniform(-0.02, 0.02), -98.4936 + np.random.uniform(-0.02, 0.02)
+        return None
 
 
-def batch_geocode_addresses(address_state_list: List[Tuple[str, Optional[str]]]) -> List[Tuple[float, float]]:
+def geocode_single_address(address: str, state: str = "") -> Tuple[Optional[float], Optional[float], str]:
     """
-    Fast, hybrid geocoding: US Census Batch API (instant) with single-address fallbacks.
+    Runs the fallback chain for one address that the Census batch missed.
+    Returns (lat, lon, quality); lat/lon are None if nothing was found.
+    """
+    street, city, st_abbr, zip_code = parse_us_address(address, fallback_state=state)
+    oneline = ", ".join(p for p in [street, city, f"{st_abbr} {zip_code}".strip()] if p)
+
+    if oneline:
+        hit = _try(_census_oneline, oneline)
+        if hit:
+            return hit
+
+    if street and (city or zip_code):
+        fields = [("street", street), ("city", city), ("state", st_abbr), ("postalcode", zip_code)]
+        hit = _try(_nominatim, tuple((k, v) for k, v in fields if v))
+        if hit:
+            return hit[0], hit[1], GEO_OSM
+
+    if oneline:
+        hit = _try(_nominatim, (("q", oneline),))
+        if hit:
+            return hit[0], hit[1], GEO_OSM
+
+    if zip_code:
+        hit = _try(_nominatim, (("postalcode", zip_code),))
+        if hit:
+            return hit[0], hit[1], GEO_ZIP
+
+    if city:
+        fields = [("city", city), ("state", st_abbr)]
+        hit = _try(_nominatim, tuple((k, v) for k, v in fields if v))
+        if hit:
+            return hit[0], hit[1], GEO_CITY
+
+    return None, None, GEO_NOT_FOUND
+
+
+def batch_geocode_addresses(address_state_list: List[Tuple[str, Optional[str]]]) -> List[Tuple[Optional[float], Optional[float], str]]:
+    """
+    Geocodes a list of (address, state) pairs. Returns (lat, lon, quality) per item;
+    lat/lon are None when an address couldn't be found (no random placeholder pins).
     """
     total = len(address_state_list)
     if total == 0:
         return []
 
-    progress_bar = st.progress(0, text="Standardizing & geocoding addresses via US Census API...")
+    progress_bar = st.progress(0.0, text="Looking up addresses with the US Census...")
 
-    parsed_items = []
-    for idx, item in enumerate(address_state_list):
-        if isinstance(item, tuple):
-            addr, st_val = item
-        else:
-            addr, st_val = item, ""
-        
-        street, city, state, zip_code = parse_us_address(addr, fallback_state=st_val or "")
-        parsed_items.append((idx, street, city, state, zip_code))
+    items = []
+    for item in address_state_list:
+        addr, st_val = item if isinstance(item, tuple) else (item, "")
+        items.append((addr, st_val or ""))
 
-    census_results = census_batch_geocode(parsed_items)
-    progress_bar.progress(0.7, text="Processing Census matches & executing fallbacks...")
+    parsed = [(idx, *parse_us_address(addr, fallback_state=st_val)) for idx, (addr, st_val) in enumerate(items)]
+    census_results = census_batch_geocode(parsed)
 
-    final_coords = []
-    for idx, item in enumerate(address_state_list):
+    misses = [i for i in range(total) if i not in census_results]
+    final = []
+    done_misses = 0
+    for idx, (addr, st_val) in enumerate(items):
         if idx in census_results:
-            final_coords.append(census_results[idx])
+            final.append(census_results[idx])
         else:
-            addr = item[0] if isinstance(item, tuple) else item
-            st_val = item[1] if isinstance(item, tuple) else None
-            coords = geocode_single_address_fallback(addr, state=st_val)
-            final_coords.append(coords)
-            time.sleep(1.0)
+            done_misses += 1
+            progress_bar.progress(
+                min(0.3 + 0.7 * done_misses / max(len(misses), 1), 1.0),
+                text=f"Retrying {done_misses} of {len(misses)} addresses the Census couldn't match..."
+            )
+            final.append(geocode_single_address(addr, st_val))
 
     progress_bar.empty()
-    return final_coords
+    return final
+
+
+def parse_coordinates(text: Any) -> Optional[Tuple[float, float]]:
+    """
+    Pulls a lat/lon pair out of pasted text: "29.4241, -98.4936",
+    or a Google Maps link containing "@29.4241,-98.4936" or "q=29.4241,-98.4936".
+    """
+    if not text:
+        return None
+    m = re.search(r"(-?\d{1,2}\.\d+)\s*,\s*(-?\d{1,3}\.\d+)", str(text))
+    if not m:
+        return None
+    lat, lon = float(m.group(1)), float(m.group(2))
+    if -90 <= lat <= 90 and -180 <= lon <= 180:
+        return lat, lon
+    return None
 
 
 @st.cache_data(show_spinner=False)
@@ -518,9 +684,9 @@ def process_imported_table(df: pd.DataFrame) -> pd.DataFrame:
     processed_rows = []
     for m in metadata:
         if m["pre_lat"] is not None:
-            lat, lon = m["pre_lat"], m["pre_lon"]
+            lat, lon, quality = m["pre_lat"], m["pre_lon"], GEO_IMPORTED
         else:
-            lat, lon = geocoded_coords[geo_idx]
+            lat, lon, quality = geocoded_coords[geo_idx]
             geo_idx += 1
 
         row_dict = dict(m)
@@ -528,6 +694,7 @@ def process_imported_table(df: pd.DataFrame) -> pd.DataFrame:
         del row_dict["pre_lon"]
         row_dict["lat"] = lat
         row_dict["lon"] = lon
+        row_dict["geo_quality"] = quality
         processed_rows.append(row_dict)
 
     return pd.DataFrame(processed_rows)
@@ -634,6 +801,8 @@ def get_recommendations_for_slot(
         return None, anchor_info
 
     prev_stop = find_previous_stop(claims_df, slot)
+    if prev_stop is not None and (pd.isna(prev_stop["lat"]) or pd.isna(prev_stop["lon"])):
+        prev_stop = None  # previous stop has no pin yet; fall back to the hotel
     if prev_stop is not None:
         anchor_lat, anchor_lon = float(prev_stop["lat"]), float(prev_stop["lon"])
         prev_end = parse_wallclock(prev_stop["end_time"])
@@ -667,9 +836,13 @@ def get_recommendations_for_slot(
     if candidates.empty:
         return None, anchor_info
 
+    anchor_ok = pd.notna(anchor_lat) and pd.notna(anchor_lon)
     miles_list, mins_list = [], []
     for _, row in candidates.iterrows():
-        miles, mins = get_osrm_route(float(anchor_lat), float(anchor_lon), float(row["lat"]), float(row["lon"]))
+        if anchor_ok and pd.notna(row["lat"]) and pd.notna(row["lon"]):
+            miles, mins = get_osrm_route(float(anchor_lat), float(anchor_lon), float(row["lat"]), float(row["lon"]))
+        else:
+            miles, mins = None, None  # no pin yet: listed after claims with drive times
         miles_list.append(miles)
         mins_list.append(mins)
 
@@ -689,9 +862,10 @@ def get_recommendations_for_slot(
     # Unranked claims get +inf so ranked priorities always sort first;
     # drive time is the tie-breaker within a rank and among unranked claims.
     candidates["prio_sort_key"] = [float(r) if r is not None else float("inf") for r in ranks]
+    candidates["drive_sort_key"] = [float(m) if m is not None else float("inf") for m in mins_list]
     candidates = candidates.sort_values(
-        by=["prio_sort_key", "drive_time_mins"], ascending=[True, True], kind="mergesort"
-    ).drop(columns=["prio_sort_key"])
+        by=["prio_sort_key", "drive_sort_key"], ascending=[True, True], kind="mergesort"
+    ).drop(columns=["prio_sort_key", "drive_sort_key"])
 
     return candidates, anchor_info
 
