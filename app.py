@@ -308,12 +308,14 @@ if st.session_state.claims_df is not None:
     recs = get_recommendations_for_day(st.session_state.claims_df, target_date_str=selected_target_date_str)
     
     if recs is not None and not recs.empty:
-        for idx, rec_row in recs.head(5).iterrows():
+        for idx, rec_row in recs.head(5).reset_index(drop=True).iterrows():
             col_rec1, col_rec2 = st.columns([3, 1])
             with col_rec1:
                 anchor_label = "anchor claim" if rec_row.get("anchor_type") == "anchor_claim" else "hotel base"
                 st.markdown(f"**[{rec_row['claim_id']}] {rec_row['insured_name']}** — *{rec_row['full_address']}* (⏱️ `{rec_row['drive_time_mins']} mins` from {anchor_label})")
             with col_rec2:
-                if st.button("Select to Manage", key=f"btn_rec_{rec_row['claim_id']}"):
+                # Unique button key incorporating row index and claim ID to prevent StreamlitDuplicateElementKey
+                unique_key = f"btn_rec_{idx}_{rec_row['claim_id']}"
+                if st.button("Select to Manage", key=unique_key):
                     st.session_state["selected_claim_id"] = str(rec_row["claim_id"])
                     st.rerun()
