@@ -13,6 +13,7 @@ from engine import (
     export_claims_to_ics,
     is_slot_conflicting,
     batch_geocode_addresses,
+    improve_with_openstreetmap,
     normalize_priority,
     geocode_hotel_address,
     detect_deployment_timezone,
@@ -407,8 +408,31 @@ if st.session_state.claims_df is not None:
     )
 
     if review_mask.any():
-        st.warning(f"{int(review_mask.sum())} claim(s) have an approximate or missing location. "
-                   "Turn on **Fix pin locations** in the Map tab to place them.")
+        n_review = int(review_mask.sum())
+        wc1, wc2 = st.columns([3, 1.2], vertical_alignment="center")
+        with wc1:
+            st.warning(f"{n_review} claim(s) have an approximate or missing location. Try a deeper lookup, "
+                       "or turn on **Fix pin locations** in the Map tab to place them yourself.")
+        with wc2:
+            if st.button(f"🔎 Deeper lookup for {n_review} (about {max(1, round(n_review * 2 / 60))} min)",
+                         use_container_width=True,
+                         help="Checks OpenStreetMap for these addresses. It's slower because OpenStreetMap "
+                              "allows one lookup per second. Pins you placed by hand aren't touched."):
+                idxs = df.index[review_mask].tolist()
+                addrs = [(df.at[i, "full_address"], df.at[i, "state"] if "state" in df.columns else "") for i in idxs]
+                better = improve_with_openstreetmap(addrs)
+                improved = 0
+                for i, hit in zip(idxs, better):
+                    if hit:
+                        st.session_state.claims_df.at[i, "lat"] = hit[0]
+                        st.session_state.claims_df.at[i, "lon"] = hit[1]
+                        st.session_state.claims_df.at[i, "geo_quality"] = hit[2]
+                        improved += 1
+                st.session_state.map_nonce += 1
+                st.session_state.editor_version += 1
+                st.toast(f"Improved {improved} of {n_review} pins" if improved else
+                         "OpenStreetMap couldn't improve these. Place them in the Map tab.")
+                st.rerun()
 
     st.markdown("---")
 
@@ -431,12 +455,18 @@ if st.session_state.claims_df is not None:
         scheduled_claims = df[df["status"] == "Scheduled"].copy()
         scheduled_claims["_start_dt"] = [parse_wallclock(v) for v in scheduled_claims["start_time"]]
         scheduled_claims["_end_dt"] = [parse_wallclock(v) for v in scheduled_claims["end_time"]]
-        scheduled_claims = scheduled_claims[
-            [s is not None and e is not None for s, e in zip(scheduled_claims["_start_dt"], scheduled_claims["_end_dt"])]
-        ]
+        # Boolean Series (not a plain list): with zero scheduled claims, an empty list
+        # would select zero COLUMNS instead of zero rows and drop "_start_dt".
+        has_times = pd.Series(
+            [s is not None and e is not None for s, e in zip(scheduled_claims["_start_dt"], scheduled_claims["_end_dt"])],
+            index=scheduled_claims.index, dtype=bool
+        )
+        scheduled_claims = scheduled_claims.loc[has_times]
 
         # --- NEXT UP ---
-        upcoming = scheduled_claims[[s > now_local for s in scheduled_claims["_start_dt"]]]
+        is_upcoming = pd.Series([s > now_local for s in scheduled_claims["_start_dt"]],
+                                index=scheduled_claims.index, dtype=bool)
+        upcoming = scheduled_claims.loc[is_upcoming]
         upcoming = upcoming.sort_values("_start_dt") if not upcoming.empty else upcoming
         next_id = str(upcoming.iloc[0]["claim_id"]) if not upcoming.empty else None
 
