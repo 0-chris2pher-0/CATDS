@@ -1284,4 +1284,964 @@ if st.session_state.claims_df is not None:
 
             .fc .fc-daygrid-day-number {{ color: {C_MUTED}; font-family: {MONO}; }}
 
+            .fc-event {{ font-family: {MONO}; font-size: 0.76rem; }}
+
+            .fc-event.past-event {{
+
+                background-image: repeating-linear-gradient(
+
+                    45deg, rgba(255,255,255,0.10) 0 5px, transparent 5px 10px) !important;
+
+            }}
+
+            .fc-event.next-event {{ box-shadow: 0 0 14px rgba(232, 163, 23, 0.55); }}
+
+            """
+
+ 
+
+        cal_event = calendar(
+
+            events=calendar_events,
+
+            options=calendar_options,
+
+            custom_css=calendar_css,
+
+            # Only click and drag/resize. The default also reports "eventsSet" on every
+
+            # render, which reruns the whole app and keeps rebuilding the map.
+
+            callbacks=["eventClick", "eventChange"],
+
+            key="claims_calendar"
+
+        ) or {}
+
+ 
+
+        # --- CLICK A BLOCK: directions + manage ---
+
+        clicked = (cal_event.get("eventClick") or {}).get("event") or {}
+
+        clicked_id = str(clicked.get("id") or "")
+
+        if clicked_id:
+
+            c_rows = df[(df["claim_id"].astype(str) == clicked_id) & (df["status"] == "Scheduled")]
+
+            if not c_rows.empty:
+
+                c_row = c_rows.iloc[0]
+
+                with st.container(border=True):
+
+                    st.markdown(f"""
+
+<div class="cat-card selected">
+
+  <div class="cat-card-kicker">Selected inspection</div>
+
+  <div class="cat-card-title">{esc(c_row['claim_id'])} - {esc(c_row['insured_name'])}</div>
+
+  <div class="cat-card-sub">{fmt_dt(parse_wallclock(c_row['start_time']))}<br>{esc(c_row['full_address'])}</div>
+
+</div>""", unsafe_allow_html=True)
+
+                    render_nav_buttons(c_row["full_address"], c_row["lat"], c_row["lon"], c_row["geo_quality"])
+
+                    if st.button("Manage this claim", key=f"cal_manage_{clicked_id}"):
+
+                        st.session_state["selected_claim_id"] = clicked_id
+
+                        st.rerun()
+
+ 
+
+        # --- DRAG / RESIZE A BLOCK ---
+
+        # The calendar keeps returning its last event on every rerun, so only
+
+        # apply a given change once (otherwise the app can loop on reruns).
+
+        if cal_event.get("eventChange"):
+
+            changed_event = cal_event["eventChange"]["event"]
+
+            change_sig = (str(changed_event.get("id")), changed_event.get("start"), changed_event.get("end"))
+
+            if st.session_state.get("last_calendar_change") != change_sig:
+
+                st.session_state["last_calendar_change"] = change_sig
+
+                cid = str(changed_event["id"])
+
+                new_start = parse_wallclock(changed_event["start"])
+
+                new_end = parse_wallclock(changed_event.get("end")) or (new_start + timedelta(hours=window_hrs))
+
+ 
+
+                c_mask = st.session_state.claims_df["claim_id"].astype(str) == cid
+
+                st.session_state.claims_df.loc[c_mask, "start_time"] = new_start.isoformat()
+
+                st.session_state.claims_df.loc[c_mask, "end_time"] = new_end.isoformat()
+
+                st.session_state.claims_df.loc[c_mask, "scheduled_date"] = new_start.strftime("%Y-%m-%d")
+
+                st.session_state.claims_df.loc[c_mask, "inspection_time"] = new_start.strftime("%H:%M")
+
+                st.session_state.editor_version += 1
+
+                st.toast(f"Moved {cid} to {fmt_dt(new_start)}")
+
+                st.rerun()
+
+ 
+
+    # -----------------------------------------------------------------
+
+    # MAP
+
+    # Runs as a fragment: clicking or panning the map reruns only this
+
+    # section, not the whole page, so the map isn't rebuilt by unrelated
+
+    # parts of the app while you're fixing pins.
+
+    # -----------------------------------------------------------------
+
+    @st.fragment
+
+    def render_map_tab():
+
+        mdf = st.session_state.claims_df
+
+        m_review = mdf["geo_quality"].isin(GEO_NEEDS_REVIEW)
+
+ 
+
+        fix_mode = st.toggle(
+
+            "Fix pin locations",
+
+            key="pin_fix_mode",
+
+            help="Zoom to a claim on the satellite view, click the right roof, and save. "
+
+                 "Or paste coordinates from Google Maps."
+
+        )
+
+ 
+
+        fix_row = None
+
+        if fix_mode:
+
+            # Claims that need a check come first
+
+            fix_order = mdf.assign(_ok=~m_review).sort_values("_ok", kind="mergesort")
+
+            fix_map = {}
+
+            for _, r in fix_order.iterrows():
+
+                flag = "⚠️ " if r["geo_quality"] in GEO_NEEDS_REVIEW else ""
+
+                fix_map[f"{flag}{r['claim_id']} - {r['insured_name']} ({r['geo_quality']})"] = str(r["claim_id"])
+
+            fix_label = st.selectbox("Claim to fix", list(fix_map.keys()), key="pin_fix_claim")
+
+            fix_id = fix_map[fix_label]
+
+            fix_row = mdf[mdf["claim_id"].astype(str) == fix_id].iloc[0]
+
+            st.caption(f"{fix_row['full_address']}")
+
+ 
+
+        valid_coords_df = mdf[(mdf["status"] != "Ignored") & (mdf["lat"].notna()) & (mdf["lon"].notna())]
+
+ 
+
+        if fix_row is not None and pd.notna(fix_row["lat"]) and pd.notna(fix_row["lon"]):
+
+            map_center, map_zoom = [float(fix_row["lat"]), float(fix_row["lon"])], 18
+
+        elif fix_row is not None and hotel_coords:
+
+            map_center, map_zoom = list(hotel_coords), 13
+
+        elif not valid_coords_df.empty:
+
+            map_center, map_zoom = [valid_coords_df["lat"].mean(), valid_coords_df["lon"].mean()], 10
+
+        else:
+
+            map_center, map_zoom = [29.4241, -98.4936], 10
+
+ 
+
+        m = folium.Map(location=map_center, zoom_start=map_zoom, tiles=None, max_zoom=20)
+
+ 
+
+        esri_satellite_url = https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}
+
+        if CONSOLE:
+
+            street_layer = folium.TileLayer("CartoDB dark_matter", name="Street map", show=not fix_mode, max_zoom=20)
+
+        else:
+
+            street_layer = folium.TileLayer("OpenStreetMap", name="Street map", show=not fix_mode, max_zoom=20)
+
+        satellite_layer = folium.TileLayer(tiles=esri_satellite_url, attr="Esri World Imagery",
+
+                                           name="Satellite", show=fix_mode, max_zoom=20, max_native_zoom=19)
+
+        # The first base layer added is the one shown; satellite first when fixing pins
+
+        for layer in ([satellite_layer, street_layer] if fix_mode else [street_layer, satellite_layer]):
+
+            layer.add_to(m)
+
+ 
+
+        day_colors = ["blue", "green", "purple", "darkblue", "darkred", "cadetblue", "darkgreen", "pink"]
+
+        scheduled_dates = sorted([d for d in mdf[mdf["status"] == "Scheduled"]["scheduled_date"].unique() if d])
+
+        date_color_map = {d: day_colors[i % len(day_colors)] for i, d in enumerate(scheduled_dates)}
+
+ 
+
+        bounds = []
+
+        for _, row in mdf.iterrows():
+
+            if row["status"] == "Ignored" or pd.isna(row["lat"]) or pd.isna(row["lon"]):
+
+                continue
+
+ 
+
+            lat = float(row["lat"])
+
+            lon = float(row["lon"])
+
+            needs_review = row["geo_quality"] in GEO_NEEDS_REVIEW
+
+            is_fix_target = fix_row is not None and str(row["claim_id"]) == str(fix_row["claim_id"])
+
+ 
+
+            # Pin style:
+
+            #   color = status (red = unscheduled; scheduled = one color per day)
+
+            #   "!"   = location needs checking (approximate)
+
+            #   none  = unscheduled with a good location; check = scheduled with a good location
+
+            if is_fix_target:
+
+                marker_color, icon_type = "orange", "screenshot"
+
+            elif row["status"] == "Unscheduled":
+
+                marker_color = "red"
+
+                icon_type = "exclamation-sign" if needs_review else ""
+
+            else:
+
+                marker_color = date_color_map.get(row.get("scheduled_date"), "blue")
+
+                icon_type = "exclamation-sign" if needs_review else "ok-sign"
+
+ 
+
+            nav = build_navigation_links(row["full_address"], lat, lon, prefer_coords=(row["geo_quality"] == GEO_MANUAL))
+
+            links_html = " &nbsp; ".join(
+
+                f'<a href="{url}" target="_blank" rel="noopener">{name}</a>'
+
+                for name, url in [("Google Maps", nav.get("google")), ("Apple Maps", nav.get("apple"))] if url
+
+            )
+
+            folium.Marker(
+
+                location=[lat, lon],
+
+                popup=folium.Popup(
+
+                    f"<b>{esc(row['claim_id'])}</b><br>{esc(row['insured_name'])}<br>{esc(row['full_address'])}"
+
+                    f"<br><span style='color:#52637A'>Location: {esc(row['geo_quality'])}</span><br>{links_html}",
+
+                    max_width=280
+
+                ),
+
+                tooltip=f"{row['claim_id']} - {row['insured_name']}" + (" (location needs checking)" if needs_review else ""),
+
+                icon=folium.Icon(color=marker_color, icon=icon_type)
+
+            ).add_to(m)
+
+ 
+
+            bounds.append([lat, lon])
+
+ 
+
+        if hotel_coords:
+
+            folium.Marker(
+
+                location=list(hotel_coords),
+
+                popup=f"<b>Hotel base</b><br>{esc(hotel_address)}",
+
+                tooltip="Hotel base",
+
+                icon=folium.Icon(color="black", icon="home")
+
+            ).add_to(m)
+
+            bounds.append(list(hotel_coords))
+
+ 
+
+        if bounds and not fix_mode:
+
+            m.fit_bounds(bounds, padding=(30, 30))
+
+ 
+
+        folium.LayerControl().add_to(m)
+
+ 
+
+        map_key = f"claims_map_{st.session_state.map_nonce}_{fix_row['claim_id'] if fix_row is not None else 'all'}"
+
+ 
+
+        # In fix mode, show a crosshair where you last clicked. It's drawn as a separate
+
+        # layer so the map updates in place instead of reloading and losing your zoom.
+
+        preview_group = None
+
+        if fix_mode:
+
+            prev_state = st.session_state.get(map_key) or {}
+
+            prev_click = prev_state.get("last_clicked") if isinstance(prev_state, dict) else None
+
+            preview_group = folium.FeatureGroup(name="Selected spot")
+
+            if prev_click:
+
+                folium.CircleMarker(
+
+                    location=[prev_click["lat"], prev_click["lng"]],
+
+                    radius=9, color="#FFFFFF", weight=3, fill=True,
+
+                    fill_color=AMBER, fill_opacity=0.9,
+
+                    tooltip="New spot (not saved yet)"
+
+                ).add_to(preview_group)
+
+ 
+
+        try:
+
+            map_state = st_folium(m, width=1100, height=540, key=map_key,
+
+                                  returned_objects=["last_clicked"],
+
+                                  feature_group_to_add=preview_group) or {}
+
+        except TypeError:
+
+            # Older streamlit-folium without feature_group_to_add
+
+            map_state = st_folium(m, width=1100, height=540, key=map_key,
+
+                                  returned_objects=["last_clicked"]) or {}
+
+ 
+
+        st.caption("Red pins are unscheduled. Scheduled pins are colored by day, with a check mark. "
+
+                   "A **!** means the location is approximate and should be checked.")
+
+ 
+
+        if fix_mode and fix_row is not None:
+
+            fc1, fc2 = st.columns(2)
+
+            with fc1:
+
+                clicked_pt = map_state.get("last_clicked")
+
+                if clicked_pt:
+
+                    st.markdown(f"Selected spot  \n`{clicked_pt['lat']:.6f}, {clicked_pt['lng']:.6f}`")
+
+                    if st.button(f"Move {fix_row['claim_id']} pin here", type="primary"):
+
+                        save_manual_pin(fix_row["claim_id"], clicked_pt["lat"], clicked_pt["lng"])
+
+                        st.rerun()
+
+                else:
+
+                    st.caption("Click the map to choose the spot for this claim.")
+
+            with fc2:
+
+                pasted = st.text_input("Or paste coordinates or a Google Maps link",
+
+                                       key=f"paste_coords_{fix_row['claim_id']}",
+
+                                       placeholder="29.4241, -98.4936")
+
+                if st.button("Save pasted location", key=f"save_paste_{fix_row['claim_id']}"):
+
+                    coords = parse_coordinates(pasted)
+
+                    if coords:
+
+                        save_manual_pin(fix_row["claim_id"], coords[0], coords[1])
+
+                        st.rerun()
+
+                    else:
+
+                        st.error("No coordinates found. Paste something like 29.4241, -98.4936 "
+
+                                 "or a Google Maps link that contains them.")
+
+ 
+
+    with tab_map:
+
+        render_map_tab()
+
+ 
+
+    st.markdown("---")
+
+ 
+
+    # --- MANAGEMENT & CLAIMS POOL ---
+
+    col_left, col_right = st.columns([1.5, 1])
+
+ 
+
+    with col_left:
+
+        st.subheader("Claims pool")
+
+        st.caption("Edit **Priority** (1 = highest, blank = unranked) or set **Status** to Unscheduled or Ignored. "
+
+                   "Changes save automatically and re-sort the recommendations below.")
+
+ 
+
+        if st.session_state.get("editor_notice"):
+
+            st.warning(st.session_state.pop("editor_notice"))
+
+ 
+
+        show_status = st.multiselect("Show statuses", ["Unscheduled", "Scheduled", "Ignored"], default=["Unscheduled", "Scheduled"])
+
+        filtered_df = df[df["status"].isin(show_status)].copy()
+
+        filtered_df["priority"] = filtered_df["priority"].astype("Int64")  # nullable int: shows "2", not "2.0"
+
+ 
+
+        editor_cols = ["claim_id", "insured_name", "full_address", "priority", "status", "scheduled_date", "inspection_time", "geo_quality"]
+
+        editor_key = f"claims_editor_{st.session_state.editor_version}_{'_'.join(sorted(show_status))}"
+
+ 
+
+        edited_df = st.data_editor(
+
+            filtered_df[editor_cols],
+
+            key=editor_key,
+
+            disabled=["claim_id", "insured_name", "full_address", "scheduled_date", "inspection_time", "geo_quality"],
+
+            column_config={
+
+                "claim_id": st.column_config.TextColumn("Claim"),
+
+                "insured_name": st.column_config.TextColumn("Insured"),
+
+                "full_address": st.column_config.TextColumn("Address"),
+
+                "scheduled_date": st.column_config.TextColumn("Date"),
+
+                "inspection_time": st.column_config.TextColumn("Time"),
+
+                "geo_quality": st.column_config.TextColumn("Location", help="How the map pin was placed."),
+
+                "priority": st.column_config.NumberColumn(
+
+                    "Priority",
+
+                    help="1 = highest. Leave blank for unranked claims.",
+
+                    min_value=1,
+
+                    step=1,
+
+                    format="%d"
+
+                ),
+
+                "status": st.column_config.SelectboxColumn(
+
+                    "Status",
+
+                    options=["Unscheduled", "Scheduled", "Ignored"],
+
+                    required=True,
+
+                    help="Use 'Confirm & Lock Slot' on the right to schedule a claim."
+
+                ),
+
+            },
+
+            hide_index=True,
+
+            use_container_width=True
+
+        )
+
+ 
+
+        # --- SYNC EDITOR CHANGES BACK INTO SESSION STATE ---
+
+        # edited_df keeps the same index as claims_df, so rows map back directly.
+
+        changes_made = False
+
+        blocked_claims = []
+
+ 
+
+        for row_idx in edited_df.index:
+
+            old_row = filtered_df.loc[row_idx]
+
+            new_row = edited_df.loc[row_idx]
+
+ 
+
+            old_prio = normalize_priority(old_row["priority"])
+
+            new_prio = normalize_priority(new_row["priority"])
+
+            if new_prio != old_prio:
+
+                st.session_state.claims_df.at[row_idx, "priority"] = new_prio if new_prio is not None else float("nan")
+
+                changes_made = True
+
+ 
+
+            if new_row["status"] != old_row["status"]:
+
+                if new_row["status"] in ("Unscheduled", "Ignored"):
+
+                    st.session_state.claims_df.at[row_idx, "status"] = new_row["status"]
+
+                    st.session_state.claims_df.at[row_idx, "start_time"] = None
+
+                    st.session_state.claims_df.at[row_idx, "end_time"] = None
+
+                    st.session_state.claims_df.at[row_idx, "scheduled_date"] = ""
+
+                    st.session_state.claims_df.at[row_idx, "inspection_time"] = ""
+
+                    changes_made = True
+
+                elif new_row["status"] == "Scheduled":
+
+                    # Scheduling needs a time slot, so it isn't allowed from the table.
+
+                    blocked_claims.append(str(old_row["claim_id"]))
+
+ 
+
+        if blocked_claims:
+
+            st.session_state["editor_notice"] = (
+
+                f"Claim(s) {', '.join(blocked_claims)} weren't scheduled. Select the claim on the right "
+
+                "and use **Confirm & Lock Slot** to pick a time."
+
+            )
+
+ 
+
+        if changes_made or blocked_claims:
+
+            st.session_state.editor_version += 1
+
+            st.rerun()
+
+ 
+
+    selected_target_date_str = start_date.strftime("%Y-%m-%d")
+
+ 
+
+    with col_right:
+
+        st.subheader("Manage a claim")
+
+        claim_options = df["display_label"].tolist()
+
+ 
+
+        if "managed_claim_select" not in st.session_state or st.session_state["managed_claim_select"] not in claim_options:
+
+            st.session_state["managed_claim_select"] = claim_options[0]
+
+ 
+
+        if "selected_claim_id" in st.session_state and st.session_state["selected_claim_id"]:
+
+            matching = [opt for opt in claim_options if opt.startswith(str(st.session_state["selected_claim_id"]) + " -")]
+
+            if matching:
+
+                st.session_state["managed_claim_select"] = matching[0]
+
+            del st.session_state["selected_claim_id"]
+
+ 
+
+        selected_label = st.selectbox(
+
+            "Claim",
+
+            claim_options,
+
+            key="managed_claim_select"
+
+        )
+
+ 
+
+        if selected_label:
+
+            selected_claim_id = selected_label.split(" - ")[0].strip()
+
+            claim_mask = st.session_state.claims_df["claim_id"].astype(str) == selected_claim_id
+
+           
+
+            if claim_mask.any():
+
+                current_claim = st.session_state.claims_df[claim_mask].iloc[0]
+
+               
+
+                loc_note = current_claim["geo_quality"]
+
+                if loc_note in GEO_NEEDS_REVIEW:
+
+                    loc_note = f":orange[⚠️ {loc_note}]. Fix it in the Map tab."
+
+                st.markdown(
+
+                    f"**Claim:** `{current_claim['claim_id']}`  \n"
+
+                    f"**Insured:** {current_claim['insured_name']}  \n"
+
+                    f"**Address:** {current_claim['full_address']}  \n"
+
+                    f"**Location:** {loc_note}  \n"
+
+                    f"**Status:** `{current_claim['status']}`"
+
+                )
+
+                render_nav_buttons(current_claim["full_address"], current_claim["lat"], current_claim["lon"], current_claim["geo_quality"])
+
+               
+
+                st.markdown("---")
+
+ 
+
+                if current_claim["status"] == "Scheduled":
+
+                    if current_claim["scheduled_date"]:
+
+                        selected_target_date_str = str(current_claim["scheduled_date"])
+
+ 
+
+                    st.write(f"**Currently:** {fmt_dt(parse_wallclock(current_claim['start_time'])) or 'no time set'}")
+
+ 
+
+                    move_slots = [
+
+                        s for s in all_slots
+
+                        if parse_wallclock(s["start"]) > now_local
+
+                        and not is_slot_conflicting(s, st.session_state.claims_df, current_claim_id=selected_claim_id)
+
+                        and s["start"] != str(current_claim["start_time"])
+
+                    ]
+
+                    if move_slots:
+
+                        move_label = st.selectbox("Move to an open slot", [s["slot_label"] for s in move_slots], key="move_slot_select")
+
+                        move_slot = next(s for s in move_slots if s["slot_label"] == move_label)
+
+                        if st.button("🔁 Move to this slot"):
+
+                            book_claim_into_slot(claim_mask, move_slot)
+
+                            st.rerun()
+
+ 
+
+                    if st.button("Remove from schedule"):
+
+                        st.session_state.claims_df.loc[claim_mask, "status"] = "Unscheduled"
+
+                        st.session_state.claims_df.loc[claim_mask, "start_time"] = None
+
+                        st.session_state.claims_df.loc[claim_mask, "end_time"] = None
+
+                        st.session_state.claims_df.loc[claim_mask, "scheduled_date"] = ""
+
+                        st.session_state.claims_df.loc[claim_mask, "inspection_time"] = ""
+
+                        st.session_state.editor_version += 1
+
+                        st.rerun()
+
+ 
+
+                elif current_claim["status"] in ["Unscheduled", "Ignored"]:
+
+                    unbooked_slots = [s for s in all_slots if parse_wallclock(s["start"]) > now_local and not is_slot_conflicting(s, st.session_state.claims_df, current_claim_id=selected_claim_id)]
+
+                   
+
+                    if unbooked_slots:
+
+                        slot_labels = [s["slot_label"] for s in unbooked_slots]
+
+                        selected_slot_label = st.selectbox("Open slot", slot_labels, index=0, key="book_slot_select")
+
+                        chosen_slot = next(s for s in unbooked_slots if s["slot_label"] == selected_slot_label)
+
+                        selected_target_date_str = chosen_slot["date_str"]
+
+                       
+
+                        if st.button("Book this slot", type="primary"):
+
+                            book_claim_into_slot(claim_mask, chosen_slot)
+
+                            st.rerun()
+
+ 
+
+    # -----------------------------------------------------------------
+
+    # RECOMMENDATIONS
+
+    # -----------------------------------------------------------------
+
+    st.markdown("---")
+
+    st.subheader("Fill an opening")
+
+ 
+
+    open_slots = [
+
+        s for s in all_slots
+
+        if parse_wallclock(s["start"]) > now_local
+
+        and not is_slot_conflicting(s, st.session_state.claims_df, current_claim_id="")
+
+    ]
+
+ 
+
+    if not open_slots:
+
+        st.info("No open slots left in this date range. Extend the end date or add inspections per day in the sidebar.")
+
+    else:
+
+        rc1, rc2 = st.columns([1.3, 1])
+
+        with rc1:
+
+            # Default to the first opening on the date in context (selected claim / chosen slot)
+
+            default_idx = next((i for i, s in enumerate(open_slots) if s["date_str"] == selected_target_date_str), 0)
+
+            opening_label = st.selectbox("Opening", [s["slot_label"] for s in open_slots], index=default_idx)
+
+            opening = next(s for s in open_slots if s["slot_label"] == opening_label)
+
+        with rc2:
+
+            pool_choice = st.radio(
+
+                "Show",
+
+                ["Unscheduled", "Scheduled (reschedule)", "Both"],
+
+                horizontal=True,
+
+                key="rec_pool",
+
+                help="Scheduled claims are shown as candidates to move into this opening. "
+
+                     "Inspections that have already started are left out."
+
+            )
+
+        include = {
+
+            "Unscheduled": ("Unscheduled",),
+
+            "Scheduled (reschedule)": ("Scheduled",),
+
+            "Both": ("Unscheduled", "Scheduled"),
+
+        }[pool_choice]
+
+ 
+
+        recs, anchor_info = get_recommendations_for_slot(
+
+            st.session_state.claims_df,
+
+            opening,
+
+            hotel_coords=hotel_coords,
+
+            include_statuses=include,
+
+            now_local=now_local
+
+        )
+
+ 
+
+        st.caption(f"Drive times from **{anchor_info['label']}**. Ranked claims (❗) come first by priority; "
+
+                   "drive time breaks ties and orders unranked claims.")
+
+ 
+
+        if recs is None or recs.empty:
+
+            st.info("No claims match this opening. Try showing both unscheduled and scheduled claims.")
+
+        else:
+
+            opening_time = parse_wallclock(opening["start"]).strftime("%I:%M %p").lstrip("0")
+
+            for idx, rec_row in recs.head(5).reset_index(drop=True).iterrows():
+
+                with st.container(border=True):
+
+                    col_rec1, col_rec2, col_rec3 = st.columns([3, 0.9, 0.7], vertical_alignment="center")
+
+                    with col_rec1:
+
+                        claim_label = f"{rec_row['claim_id']} - {rec_row['insured_name']}"
+
+                        rank = normalize_priority(rec_row.get("priority_rank"))
+
+ 
+
+                        # Ranked claim: bold red ❗ badge; unranked: no badge, proximity only
+
+                        title = f":red[**❗ P{rank}**] **{claim_label}**" if rank is not None else f"**{claim_label}**"
+
+                        if rec_row["rec_type"] == "Reschedule":
+
+                            title += f" :blue[🔁 currently {rec_row['current_slot']}]"
+
+ 
+
+                        if pd.notna(rec_row["drive_time_mins"]) and rec_row["drive_time_mins"] is not None:
+
+                            approx = "≈ " if rec_row["geo_quality"] in GEO_NEEDS_REVIEW else ""
+
+                            drive_txt = f"⏱️ {approx}{int(rec_row['drive_time_mins'])} min · {rec_row['drive_miles']} mi"
+
+                        else:
+
+                            drive_txt = ":orange[📍 No map pin yet. Set it in the Map tab.]"
+
+ 
+
+                        st.markdown(f"{title}  \n{rec_row['full_address']}  \n{drive_txt}")
+
+                    with col_rec2:
+
+                        action = f"🔁 Move to {opening_time}" if rec_row["rec_type"] == "Reschedule" else f"📌 Book {opening_time}"
+
+                        if st.button(action, key=f"btn_book_{idx}_{rec_row['claim_id']}", use_container_width=True,
+
+                                     type="primary" if idx == 0 else "secondary"):
+
+                            mask = st.session_state.claims_df["claim_id"].astype(str) == str(rec_row["claim_id"])
+
+                            book_claim_into_slot(mask, opening)
+
+                            st.toast(f"Booked {rec_row['claim_id']} for {opening_label}")
+
+                            st.rerun()
+
+                    with col_rec3:
+
+                        if st.button("Manage", key=f"btn_rec_{idx}_{rec_row['claim_id']}", use_container_width=True):
+
+                            st.session_state["selected_claim_id"] = str(rec_row["claim_id"])
+
+                            st.rerun()
+
+
+
 
