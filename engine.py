@@ -1266,10 +1266,13 @@ def plan_draft_schedule(claims_df: pd.DataFrame, S: Dict[str, Any], hotel_coords
 
     1. Openings: free time on each inspection day around CONFIRMED appointments only
        (current drafts are being replaced), in blocks of the window length.
-    2. Ranked claims first: priority 1, 2, 3... go to the earliest days in the fill order.
+    2. Ranked claims first: priority 1, 2, 3... always go to the earliest days with room
+       (whatever the fill direction), spread across the first two days with room when
+       they're far apart, and take the earliest times on their day, in rank order.
     3. Unranked on-site claims are grouped by area, one day at a time: each day grows
        around its confirmed stops (or a new seed claim) by adding the nearest claim.
-    4. Live video claims and claims without a pin fill the remaining openings.
+    4. Live video claims, claims without a pin, and claims whose location still needs
+       a check fill the remaining openings last (and are listed in the summary).
     5. Each day is ordered as a route: every opening gets the claim with the shortest
        drive from the previous stop (or the hotel), using real drive times.
     """
@@ -1307,7 +1310,8 @@ def plan_draft_schedule(claims_df: pd.DataFrame, S: Dict[str, Any], hotel_coords
     for _, r in plan_candidates(claims_df).iterrows():
         rank = normalize_priority(r.get("priority"))
         items.append({"cid": str(r["claim_id"]), "rank": rank if rank is not None else math.inf,
-                      "video": is_video(r.get("activity_type")), "loc": _loc(r)})
+                      "video": is_video(r.get("activity_type")), "loc": _loc(r),
+                      "check": str(r.get("geo_quality", "")) in GEO_NEEDS_REVIEW})
 
     cap = {d: len(day_slots[d]) for d in days}
     members: Dict[date, List[Dict[str, Any]]] = {d: [] for d in days}
@@ -1321,16 +1325,43 @@ def plan_draft_schedule(claims_df: pd.DataFrame, S: Dict[str, Any], hotel_coords
         return False
 
     ranked = sorted([i for i in items if i["rank"] != math.inf], key=lambda i: i["rank"])
-    unranked_site = [i for i in items if i["rank"] == math.inf and not i["video"] and i["loc"]]
-    leftovers = [i for i in items if i["rank"] == math.inf and (i["video"] or not i["loc"])]
-    unplaced = [i for i in ranked if not place(i)]
+    unranked_site = [i for i in items if i["rank"] == math.inf and not i["video"] and i["loc"] and not i["check"]]
+    leftovers = ([i for i in items if i["rank"] == math.inf and not i["video"] and i["loc"] and i["check"]] +
+                 [i for i in items if i["rank"] == math.inf and (i["video"] or not i["loc"])])
+
+    # Priorities go to the earliest days with room, whatever the fill direction. Among the
+    # first two such days, each goes where it sits closest to that day's other stops; a day
+    # with no stops yet "costs" SPREAD_MILES, so far-apart priorities spread out while
+    # nearby ones share a day.
+    SPREAD_MILES = 10.0
+    chrono_days = sorted(days)
+    unplaced = []
+    for it in ranked:
+        open_days = [d for d in chrono_days if cap[d] > 0][:2]
+        if not open_days:
+            unplaced.append(it)
+            continue
+
+        def day_cost(d):
+            if not it["loc"] or it["video"]:
+                return 0.0
+            stops = [m["loc"] for m in members[d] if m["loc"] and not m["video"]] + [a[2] for a in anchors[d]]
+            return min((_miles(it["loc"], s) for s in stops), default=SPREAD_MILES)
+        best_day = min(open_days, key=lambda d: (round(day_cost(d), 1), chrono_days.index(d)))
+        members[best_day].append(it)
+        cap[best_day] -= 1
 
     # Area grouping for unranked on-site claims
     pool = list(unranked_site)
     center = hotel_coords
     if not center and pool:
         center = (sum(i["loc"][0] for i in pool) / len(pool), sum(i["loc"][1] for i in pool) / len(pool))
-    for d in days:
+    # Days that already hold a priority claim or a confirmed stop collect their neighbors
+    # first; empty days follow in the fill order.
+    def has_stops(d):
+        return any(m["loc"] and not m["video"] for m in members[d]) or bool(anchors[d])
+    cluster_order = [d for d in days if has_stops(d)] + [d for d in days if not has_stops(d)]
+    for d in cluster_order:
         while cap[d] > 0 and pool:
             pts = [m["loc"] for m in members[d] if m["loc"] and not m["video"]] + [a[2] for a in anchors[d]]
             if pts:
@@ -1350,12 +1381,15 @@ def plan_draft_schedule(claims_df: pd.DataFrame, S: Dict[str, Any], hotel_coords
     drafts = []
     for n, d in enumerate(days, start=1):
         step(0.45 + 0.5 * n / max(len(days), 1), f"Ordering {d.strftime('%a %b %d')}...")
-        todo_site = [m for m in members[d] if m["loc"] and not m["video"]]
-        todo_other = [m for m in members[d] if not (m["loc"] and not m["video"])]
+        todo_rank = sorted([m for m in members[d] if m["rank"] != math.inf], key=lambda m: m["rank"])
+        todo_site = [m for m in members[d] if m["rank"] == math.inf and m["loc"] and not m["video"] and not m["check"]]
+        todo_other = [m for m in members[d] if m["rank"] == math.inf and not (m["loc"] and not m["video"] and not m["check"])]
         for t in day_slots[d]:
-            if not todo_site and not todo_other:
+            if not todo_rank and not todo_site and not todo_other:
                 break
-            if todo_site:
+            if todo_rank:
+                pick = todo_rank.pop(0)
+            elif todo_site:
                 prev = None
                 past_stops = [a for a in anchors[d] if a[1] <= t]
                 past_drafts = [x for x in drafts if x["_date"] == d and x["_end"] <= t and x["_loc"]]
@@ -1373,15 +1407,33 @@ def plan_draft_schedule(claims_df: pd.DataFrame, S: Dict[str, Any], hotel_coords
                 pick = todo_other.pop(0)
             end_t = t + (timedelta(hours=VIDEO_DEFAULT_HRS) if pick["video"] else window)
             drafts.append({"claim_id": pick["cid"], "start": t.isoformat(), "end": end_t.isoformat(),
-                           "_date": d, "_end": end_t, "_loc": None if pick["video"] else pick["loc"]})
+                           "_date": d, "_start": t, "_end": end_t, "_loc": None if pick["video"] else pick["loc"],
+                           "_check": pick["check"]})
+
+    # Long drives: a drive that uses more than a third of the window leaves less time to
+    # inspect (the window includes travel). Flag them, don't block them.
+    long_drives = []
+    window_min = S["window_hrs"] * 60
+    for d in days:
+        stops = sorted([(a[0], a[2], None) for a in anchors[d]] +
+                       [(x["_start"], x["_loc"], x["claim_id"]) for x in drafts if x["_date"] == d and x["_loc"]],
+                       key=lambda s: s[0])
+        for (s_a, loc_a, cid_a), (s_b, loc_b, cid_b) in zip(stops, stops[1:]):
+            mins = get_osrm_route(loc_a[0], loc_a[1], loc_b[0], loc_b[1])[1]
+            if mins > window_min / 3 and (cid_a or cid_b):
+                long_drives.append({"date": d.strftime("%a %b %d"), "from": cid_a or "a confirmed stop",
+                                    "to": cid_b or "a confirmed stop", "mins": int(mins),
+                                    "left_min": int(max(window_min - mins, 0))})
 
     step(1.0, "Done")
     days_used = len({x["_date"] for x in drafts})
+    needs_check = [x["claim_id"] for x in drafts if x["_check"]]
     for x in drafts:
-        for k in ("_date", "_end", "_loc"):
+        for k in ("_date", "_start", "_end", "_loc", "_check"):
             x.pop(k, None)
     summary = {"placed": len(drafts), "days": days_used, "unplaced": [i["cid"] for i in unplaced],
-               "openings": sum(len(s) for s in day_slots.values()), "claims": len(items)}
+               "openings": sum(len(s) for s in day_slots.values()), "claims": len(items),
+               "needs_check": needs_check, "long_drives": long_drives}
     return drafts, summary
 
 
@@ -1615,6 +1667,10 @@ def get_recommendations_for_slot(
     # Live video claims fit any opening, so they list after on-site claims of the same
     # rank (ahead of claims still missing a pin)
     candidates["drive_sort_key"] = [1e8 if v else k for v, k in zip(video_flags, candidates["drive_sort_key"])]
+    # Claims whose location still needs a check list after claims with good locations
+    if "geo_quality" in candidates.columns:
+        candidates["drive_sort_key"] = [k + 5e7 if (q in GEO_NEEDS_REVIEW and k < 1e8) else k
+                                        for q, k in zip(candidates["geo_quality"], candidates["drive_sort_key"])]
     candidates = candidates.sort_values(
         by=["prio_sort_key", "drive_sort_key"], ascending=[True, True], kind="mergesort"
     ).drop(columns=["prio_sort_key", "drive_sort_key"])
