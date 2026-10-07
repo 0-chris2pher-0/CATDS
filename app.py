@@ -618,93 +618,67 @@ def esc(value):
 
 # =====================================================================
 # SIDEBAR
+#   Your progress (daily) > Deployment > Daily schedule > Preferences > Tools
+#   Settings live in collapsible sections, each with a one-line summary.
 # =====================================================================
-st.sidebar.header("Schedule settings")
-st.sidebar.caption("Switch between Field (light) and Console (dark) themes in the ⋮ menu at the top right, under Settings.")
-hotel_address = st.sidebar.text_input(
-    "Hotel base location", value="",
-    placeholder="Street, city, state, ZIP",
-    help="Where you're staying. The first stop of each day is measured from here, and with "
-         "Least added driving, the last stop of the day favors claims on the way back."
-)
-hotel_coords = geocode_hotel_address(hotel_address)
-if not hotel_address.strip():
-    st.sidebar.caption("Add your hotel address so each day's first drive time starts there.")
-elif hotel_coords is None:
-    st.sidebar.warning("Couldn't find the hotel address. The first stop of each day will use "
-                       "the center of your claims for drive times.")
+sb = st.sidebar
 
-col_d1, col_d2 = st.sidebar.columns(2)
-start_date = col_d1.date_input("Start date", date.today())
-end_date = col_d2.date_input("End date", date.today() + timedelta(days=5))
+# --- YOUR PROGRESS (top: used every day) ---
+sb.subheader("Your progress")
+saved_file = sb.file_uploader("📂 Load saved progress", type=["csv"], key="load_state_csv")
+if saved_file is not None:
+    # Only load a given file once. Without this check the saved CSV would be
+    # re-read on every rerun and overwrite any edits.
+    file_sig = (saved_file.name, saved_file.size)
+    if st.session_state.get("loaded_state_sig") != file_sig:
+        try:
+            st.session_state.claims_df = pd.read_csv(saved_file)
+            st.session_state.loaded_state_sig = file_sig
+            st.session_state.editor_version += 1
+            st.session_state.map_nonce += 1
+            sb.success("Progress restored.")
+        except Exception as e:
+            sb.error(f"Couldn't load that file: {e}")
+save_slot = sb.empty()   # the Save button is drawn at the end of the run, so it saves the latest changes
 
-active_days = st.sidebar.multiselect(
-    "Inspection days",
-    ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
-    default=["Mon", "Tue", "Wed", "Thu", "Fri"]
-)
+# --- DEPLOYMENT ---
+sb.subheader("Deployment")
+dep_summary = sb.empty()
+with sb.expander("Edit deployment", expanded=not st.session_state.get("hotel_address", "").strip()):
+    hotel_address = st.text_input(
+        "Hotel base location", value="", key="hotel_address",
+        placeholder="Street, city, state, ZIP",
+        help="Where you're staying. The first stop of each day is measured from here, and with "
+             "Least added driving, the last stop of the day favors claims on the way back."
+    )
+    hotel_coords = geocode_hotel_address(hotel_address)
+    if not hotel_address.strip():
+        st.caption("Add your hotel address so each day's first drive time starts there.")
+    elif hotel_coords is None:
+        st.warning("Couldn't find the hotel address. The first stop of each day will use "
+                   "the center of your claims for drive times.")
 
-inspections_per_day = st.sidebar.slider(
-    "Inspections per day", 1, 8, 3,
-    help="Sets the length of your working day: day start time + this many windows."
-)
+    col_d1, col_d2 = st.columns(2)
+    start_date = col_d1.date_input("Start date", date.today(), key="start_date")
+    end_date = col_d2.date_input("End date", date.today() + timedelta(days=5), key="end_date")
 
-window_hrs = st.sidebar.number_input(
-    "Window length (hours)",
-    help="Default inspection length. Openings are suggested in blocks of this length, "
-         "but you can book any start time and length.",
-    min_value=0.25,
-    max_value=8.00,
-    value=2.50,
-    step=0.25
-)
+    active_days = st.multiselect(
+        "Inspection days", ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
+        default=["Mon", "Tue", "Wed", "Thu", "Fri"], key="active_days"
+    )
 
-_times30 = time_options(30)
-start_time_input = st.sidebar.selectbox(
-    "Day start time", _times30, index=_times30.index(datetime.strptime("08:00", "%H:%M").time()),
-    format_func=fmt_time12, key="day_start_time"
-)
-latest_end_input = st.sidebar.selectbox(
-    "Latest end for suggested openings", _times30,
-    index=_times30.index(datetime.strptime("19:00", "%H:%M").time()),
-    format_func=fmt_time12, key="latest_end_time",
-    help="Suggested openings never run past this time. You can still book later by hand "
-         "if the insured is available."
-)
-
-rec_mode_label = st.sidebar.radio(
-    "Recommendations",
-    ["Closest to previous stop (faster)", "Least added driving (smarter, may take longer)"],
-    key="rec_mode",
-    help="Closest: ranks claims by drive time from where you'll be before the opening. "
-         "Least added driving: also counts the drive to where you're going next (your next "
-         "inspection, or the hotel at the end of the day), so claims on the way rank higher. "
-         "It looks up about twice as many drive times, so it can be slower."
-)
-REC_MODE = "detour" if rec_mode_label.startswith("Least") else "fast"
-
-fill_label = st.sidebar.radio(
-    "Fill your schedule from",
-    ["Start of deployment (earliest days first)", "End of deployment (latest days first)"],
-    key="fill_direction",
-    help="Changes the order of suggested openings. Within each day, suggestions still "
-         "run morning to afternoon. You can always pick any day and time yourself."
-)
-FILL_LATEST_FIRST = fill_label.startswith("End")
-
-# --- DEPLOYMENT TIME ZONE ---
-# All schedule times are local to the deployment; this zone is used for the
-# Outlook export and for knowing which inspections are already in the past.
-detected_tz, detected_source = detect_deployment_timezone(st.session_state.claims_df, hotel_address)
-detected_label = next((k for k, v in US_TIMEZONES.items() if v == detected_tz), detected_tz)
-tz_choices = [f"Auto-detect ({detected_label})"] + list(US_TIMEZONES.keys())
-tz_choice = st.sidebar.selectbox(
-    "Deployment time zone",
-    tz_choices,
-    index=0,
-    help=f"Auto-detected from {detected_source}. Override if the deployment is in a split-zone "
-         "area (e.g. El Paso, the Florida panhandle, western Kansas/Nebraska/Dakotas)."
-)
+    # All schedule times are local to the deployment; this zone is used for the
+    # Outlook export and for knowing which inspections are already in the past.
+    detected_tz, detected_source = detect_deployment_timezone(st.session_state.claims_df, hotel_address)
+    detected_label = next((k for k, v in US_TIMEZONES.items() if v == detected_tz), detected_tz)
+    tz_choices = [f"Auto-detect ({detected_label})"] + list(US_TIMEZONES.keys())
+    if st.session_state.get("tz_choice") not in tz_choices:
+        st.session_state.pop("tz_choice", None)
+    tz_choice = st.selectbox(
+        "Deployment time zone", tz_choices, index=0, key="tz_choice",
+        help=f"Auto-detected from {detected_source}. Override if the deployment is in a split-zone "
+             "area (e.g. El Paso, the Florida panhandle, western Kansas/Nebraska/Dakotas)."
+    )
 deployment_tz = detected_tz if tz_choice.startswith("Auto-detect") else US_TIMEZONES[tz_choice]
 tz_display = detected_label if tz_choice.startswith("Auto-detect") else tz_choice
 
@@ -713,10 +687,72 @@ try:
     now_local = datetime.now(deployment_zone).replace(tzinfo=None)
     ics_tz = deployment_tz
 except Exception:
-    st.sidebar.error("Time zone data isn't installed. Run `pip install tzdata` (needed on Windows). "
-                     "Until then, calendar exports use floating local times.")
+    sb.error("Time zone data isn't installed. Run `pip install tzdata` (needed on Windows). "
+             "Until then, calendar exports use floating local times.")
     now_local = datetime.now()
     ics_tz = None
+
+_day_order = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+_days_txt = ", ".join(d for d in _day_order if d in active_days) or "no inspection days"
+if active_days == ["Mon", "Tue", "Wed", "Thu", "Fri"]:
+    _days_txt = "Mon to Fri"
+dep_summary.caption(
+    f"{start_date.strftime('%b %d')} to {end_date.strftime('%b %d')}, {_days_txt}, {tz_display} time"
+    + ("" if hotel_address.strip() else ". **Hotel not set.**")
+)
+
+# --- DAILY SCHEDULE ---
+sb.subheader("Daily schedule")
+day_summary = sb.empty()
+_times30 = time_options(30)
+with sb.expander("Edit daily schedule", expanded=False):
+    start_time_input = st.selectbox(
+        "Day start time", _times30, index=_times30.index(datetime.strptime("08:00", "%H:%M").time()),
+        format_func=fmt_time12, key="day_start_time"
+    )
+    inspections_per_day = st.slider(
+        "Inspections per day", 1, 8, 3, key="per_day",
+        help="Sets the length of your working day: day start time + this many windows."
+    )
+    window_hrs = st.number_input(
+        "Window length (hours)", min_value=0.25, max_value=8.00, value=2.50, step=0.25, key="window_hrs",
+        help="Starts at the inspection time and covers inspection, estimate, payment and travel. "
+             "Suggested openings use this length, but you can book any start time and length."
+    )
+    latest_end_input = st.selectbox(
+        "Latest end for suggested openings", _times30,
+        index=_times30.index(datetime.strptime("19:00", "%H:%M").time()),
+        format_func=fmt_time12, key="latest_end_time",
+        help="Suggested openings never run past this time. You can still book later by hand "
+             "if the insured is available."
+    )
+day_summary.caption(f"Starts {fmt_time12(start_time_input)}, {inspections_per_day} x {window_hrs:g}-hour windows, "
+                    f"suggestions end by {fmt_time12(latest_end_input)}")
+
+# --- PREFERENCES ---
+sb.subheader("Preferences")
+pref_summary = sb.empty()
+with sb.expander("Edit preferences", expanded=False):
+    rec_mode_label = st.radio(
+        "Recommendations",
+        ["Closest to previous stop (faster)", "Least added driving (smarter, may take longer)"],
+        key="rec_mode",
+        help="Closest: ranks claims by drive time from where you'll be before the opening. "
+             "Least added driving: also counts the drive to where you're going next (your next "
+             "inspection, or the hotel at the end of the day), so claims on the way rank higher. "
+             "It looks up about twice as many drive times, so it can be slower."
+    )
+    fill_label = st.radio(
+        "Fill your schedule from",
+        ["Start of deployment (earliest days first)", "End of deployment (latest days first)"],
+        key="fill_direction",
+        help="Changes the order of suggested openings and drafts. Priority claims still go to the "
+             "earliest days. Within each day, suggestions run morning to afternoon."
+    )
+REC_MODE = "detour" if rec_mode_label.startswith("Least") else "fast"
+FILL_LATEST_FIRST = fill_label.startswith("End")
+pref_summary.caption(f"{'Least added driving' if REC_MODE == 'detour' else 'Closest to previous stop'}, "
+                     f"filling from the {'end' if FILL_LATEST_FIRST else 'start'} of the deployment")
 
 # Openings come from the real bookings: any free time inside each day's working
 # window, in blocks of the default window length starting at the earliest free time.
@@ -731,63 +767,11 @@ all_slots = order_openings(compute_openings(
     st.session_state.claims_df, now=now_local, latest_end=latest_end_input, include_drafts=True
 ), latest_days_first=FILL_LATEST_FIRST)
 
-# --- PLAN MY SCHEDULE ---
-st.sidebar.markdown("---")
-st.sidebar.subheader("Plan my schedule")
-if st.session_state.claims_df is None:
-    st.sidebar.caption("Import claims to build a draft schedule.")
-else:
-    _cdf = st.session_state.claims_df
-    _n_drafts = int((_cdf["status"] == "Draft").sum()) if "status" in _cdf.columns else 0
-    cap = capacity_report(_cdf, schedule_settings, now_local)
-    st.sidebar.caption(
-        "Builds draft appointments for your unscheduled claims, grouped by area and ordered as routes. "
-        "Confirmed appointments never move. Confirm each draft after the insured agrees."
-    )
-    if cap["shortfall"]:
-        msg = (f"**{cap['claims']} claims to place, but only {cap['openings']} openings fit your settings. "
-               f"{cap['shortfall']} claim(s) won't be scheduled.** To fit everyone, you could:\n")
-        msg += "\n".join(f"- {label}" + (f": +{extra} openings" if extra else "") for label, extra in cap["suggestions"])
-        msg += "\n\nIf you plan anyway, the highest-priority claims are placed first."
-        st.sidebar.warning(msg)
-    elif cap["claims"]:
-        st.sidebar.caption(f"{cap['claims']} claim(s) to place, {cap['openings']} openings available.")
-
-    p1, p2 = st.sidebar.columns(2)
-    plan_label = "Re-plan drafts" if _n_drafts else "Plan my schedule"
-    if p1.button(plan_label, type="primary", use_container_width=True, disabled=cap["claims"] == 0,
-                 help="Builds draft appointments for your unscheduled claims (and replaces current drafts). "
-                      "This can take up to a minute for large lists."):
-        bar = st.sidebar.progress(0.0, text="Starting...")
-        drafts, summary = plan_draft_schedule(_cdf, schedule_settings, hotel_coords, now_local,
-                                              latest_first=FILL_LATEST_FIRST,
-                                              progress=lambda f, t: bar.progress(min(max(f, 0.0), 1.0), text=t))
-        bar.empty()
-        for cid in _cdf.loc[_cdf["status"] == "Draft", "claim_id"].astype(str).tolist():
-            set_claim_times(cid, "Unscheduled")
-        for dft in drafts:
-            set_claim_times(dft["claim_id"], "Draft", {"start": dft["start"], "end": dft["end"],
-                                                       "date_str": dft["start"][:10]})
-        st.session_state["plan_summary"] = summary
-        st.session_state.editor_version += 1
-        st.session_state.map_nonce += 1
-        st.rerun()
-    if p2.button("Clear drafts", use_container_width=True, disabled=_n_drafts == 0,
-                 help="Removes all unconfirmed draft appointments. Confirmed ones stay."):
-        for cid in _cdf.loc[_cdf["status"] == "Draft", "claim_id"].astype(str).tolist():
-            set_claim_times(cid, "Unscheduled")
-        st.session_state.pop("plan_summary", None)
-        st.session_state.editor_version += 1
-        st.session_state.map_nonce += 1
-        st.rerun()
-
-# --- MAP TOOLS & SAVED PROGRESS ---
-st.sidebar.markdown("---")
-st.sidebar.subheader("Map & saved progress")
-
+# --- TOOLS ---
 if st.session_state.claims_df is not None:
-    if st.sidebar.button("🔄 Re-check all addresses", type="secondary",
-                         help="Looks up every address again. Pins you placed or confirmed are kept."):
+    sb.subheader("Tools")
+    if sb.button("🔄 Re-check all addresses", type="secondary",
+                 help="Looks up every address again. Pins you placed or confirmed are kept."):
         cdf = st.session_state.claims_df
         if "geo_quality" not in cdf.columns:
             cdf["geo_quality"] = GEO_UNKNOWN
@@ -801,31 +785,6 @@ if st.session_state.claims_df is not None:
                 cdf.at[i, "geo_quality"] = quality
         st.session_state.map_nonce += 1
         st.rerun()
-
-    st.sidebar.markdown(" ")
-    csv_bytes = st.session_state.claims_df.to_csv(index=False).encode('utf-8')
-    st.sidebar.download_button(
-        label="📥 Save progress",
-        data=csv_bytes,
-        file_name=f"cat_scheduler_state_{date.today().strftime('%Y%m%d')}.csv",
-        mime="text/csv"
-    )
-
-saved_file = st.sidebar.file_uploader("📂 Load saved progress", type=["csv"], key="load_state_csv")
-if saved_file is not None:
-    # Only load a given file once. Without this check the saved CSV would be
-    # re-read on every rerun and overwrite any edits.
-    file_sig = (saved_file.name, saved_file.size)
-    if st.session_state.get("loaded_state_sig") != file_sig:
-        try:
-            loaded_df = pd.read_csv(saved_file)
-            st.session_state.claims_df = loaded_df
-            st.session_state.loaded_state_sig = file_sig
-            st.session_state.editor_version += 1
-            st.session_state.map_nonce += 1
-            st.sidebar.success("Progress restored.")
-        except Exception as e:
-            st.sidebar.error(f"Couldn't load that file: {e}")
 
 
 # =====================================================================
@@ -1044,24 +1003,94 @@ if st.session_state.claims_df is not None:
         unsafe_allow_html=True
     )
 
-    summ = st.session_state.get("plan_summary")
-    if summ:
-        line = f"Drafted {summ['placed']} appointment(s) across {summ['days']} day(s)."
-        if summ["unplaced"]:
-            line += (f" {len(summ['unplaced'])} claim(s) didn't fit and stay Unscheduled: "
-                     + ", ".join(summ["unplaced"][:12]) + ("..." if len(summ["unplaced"]) > 12 else "") + ".")
-        line += " Confirm each draft after the insured agrees: select it in the calendar or under Manage a claim."
-        s1, s2 = st.columns([6, 1], vertical_alignment="center")
-        s1.success(line)
-        if s2.button("Dismiss", key="dismiss_plan"):
-            st.session_state.pop("plan_summary", None)
+    # --- STEP 1: LOCATION CHECK (before planning) ---
+    if review_mask.any():
+        flagged = df[review_mask]
+        with st.container(border=True):
+            st.markdown(f"### ⚠️ Before planning: {len(flagged)} claim(s) need a location check")
+            st.markdown(
+                "These pins are only placed at a ZIP code or town center, or weren't found at all. "
+                "Until they're checked, drive times and routes involving them can be way off, and "
+                "the planner schedules them **last**."
+            )
+            st.caption(", ".join(f"{r['claim_id']} ({r['geo_quality']})" for _, r in flagged.head(10).iterrows())
+                       + (f", and {len(flagged) - 10} more" if len(flagged) > 10 else ""))
+
+            def start_fixing():
+                st.session_state["pin_fix_mode"] = True
+            st.button("📍 Start fixing locations", type="primary", on_click=start_fixing,
+                      help="Turns on Fix pin locations. Then open the Map tab below.")
+            if st.session_state.get("pin_fix_mode"):
+                st.info("Fix pin locations is on. Open the **Map** tab below to confirm or move each pin.")
+
+    # --- STEP 2: PLAN MY SCHEDULE ---
+    n_drafts = int((df["status"] == "Draft").sum())
+    cap = capacity_report(df, schedule_settings, now_local)
+    with st.container(border=True):
+        pc1, pc2, pc3 = st.columns([3, 1.1, 0.9], vertical_alignment="center")
+        with pc1:
+            st.markdown("**Plan my schedule**")
+            st.caption("Builds draft appointments for your unscheduled claims: priorities first, then grouped "
+                       "by area and ordered as routes. Confirmed appointments never move. Confirm each draft "
+                       "after the insured agrees. Can take up to a minute for large lists.")
+        plan_clicked = pc2.button("Re-plan drafts" if n_drafts else "Plan my schedule", type="primary",
+                                  use_container_width=True, disabled=cap["claims"] == 0)
+        clear_clicked = pc3.button("Clear drafts", use_container_width=True, disabled=n_drafts == 0,
+                                   help="Removes all unconfirmed drafts. Confirmed appointments stay.")
+
+        if cap["shortfall"]:
+            msg = (f"**{cap['claims']} claims to place, but only {cap['openings']} openings fit your settings. "
+                   f"{cap['shortfall']} claim(s) won't be scheduled.** To fit everyone, you could:\n")
+            msg += "\n".join(f"- {label}" + (f": +{extra} openings" if extra else "") for label, extra in cap["suggestions"])
+            msg += "\n\nIf you plan anyway, the highest-priority claims are placed first."
+            st.warning(msg)
+        elif cap["claims"]:
+            st.caption(f"{cap['claims']} claim(s) to place, {cap['openings']} openings available.")
+
+        if plan_clicked:
+            bar = st.progress(0.0, text="Starting...")
+            drafts, summary = plan_draft_schedule(df, schedule_settings, hotel_coords, now_local,
+                                                  latest_first=FILL_LATEST_FIRST,
+                                                  progress=lambda f, t: bar.progress(min(max(f, 0.0), 1.0), text=t))
+            bar.empty()
+            for cid in df.loc[df["status"] == "Draft", "claim_id"].astype(str).tolist():
+                set_claim_times(cid, "Unscheduled")
+            for dft in drafts:
+                set_claim_times(dft["claim_id"], "Draft", {"start": dft["start"], "end": dft["end"],
+                                                           "date_str": dft["start"][:10]})
+            st.session_state["plan_summary"] = summary
+            st.session_state.editor_version += 1
+            st.session_state.map_nonce += 1
             st.rerun()
+        if clear_clicked:
+            for cid in df.loc[df["status"] == "Draft", "claim_id"].astype(str).tolist():
+                set_claim_times(cid, "Unscheduled")
+            st.session_state.pop("plan_summary", None)
+            st.session_state.editor_version += 1
+            st.session_state.map_nonce += 1
+            st.rerun()
+
+        summ = st.session_state.get("plan_summary")
+        if summ:
+            line = f"Drafted {summ['placed']} appointment(s) across {summ['days']} day(s)."
+            if summ["unplaced"]:
+                line += (f" {len(summ['unplaced'])} claim(s) didn't fit and stay Unscheduled: "
+                         + ", ".join(summ["unplaced"][:12]) + ("..." if len(summ["unplaced"]) > 12 else "") + ".")
+            line += " Confirm each draft after the insured agrees: select it in the calendar or under Manage a claim."
+            st.success(line)
+            if summ.get("needs_check"):
+                st.warning(f"Placed last because their location still needs a check: {', '.join(summ['needs_check'])}. "
+                           "Fix their pins, then re-plan for better routes.")
+            for ld in summ.get("long_drives", []):
+                st.warning(f"{ld['date']}: {ld['mins']}-minute drive from {ld['from']} to {ld['to']} leaves about "
+                           f"{ld['left_min'] // 60} hr {ld['left_min'] % 60} min of your {window_hrs:g}-hour window. "
+                           "Consider moving one to another day, or using longer windows.")
+            if st.button("Dismiss summary", key="dismiss_plan"):
+                st.session_state.pop("plan_summary", None)
+                st.rerun()
+
     if st.session_state.get("draft_notice"):
         st.info(st.session_state.pop("draft_notice"))
-
-    if review_mask.any():
-        st.warning(f"{int(review_mask.sum())} claim(s) have an approximate or missing location. "
-                   "Turn on **Fix pin locations** in the Map tab to confirm or move them.")
 
     st.markdown("---")
 
@@ -1137,7 +1166,10 @@ if st.session_state.claims_df is not None:
                 "overlap": False,
             }
             if row["status"] == "Draft":
-                nxt_txt = f" · {drive_next[cid]} min to next" if cid in drive_next else ""
+                nxt_txt = ""
+                if cid in drive_next:
+                    long_drive = drive_next[cid] > window_hrs * 60 / 3
+                    nxt_txt = f" · {'⚠️ ' if long_drive else ''}{drive_next[cid]} min to next"
                 event.update({
                     "title": f"Draft · [{cid}] {row['insured_name']}{nxt_txt}",
                     "classNames": ["draft-event"],
@@ -2007,3 +2039,18 @@ if st.session_state.claims_df is not None:
                         if st.button("Manage", key=f"btn_rec_{idx}_{rec_row['claim_id']}", use_container_width=True):
                             st.session_state["selected_claim_id"] = str(rec_row["claim_id"])
                             st.rerun()
+
+
+# =====================================================================
+# SAVE PROGRESS (drawn last into the slot at the top of the sidebar,
+# so the file always includes this run's changes)
+# =====================================================================
+if st.session_state.claims_df is not None:
+    save_slot.download_button(
+        label="📥 Save progress",
+        data=st.session_state.claims_df.to_csv(index=False).encode("utf-8"),
+        file_name=f"cat_scheduler_state_{date.today().strftime('%Y%m%d')}.csv",
+        mime="text/csv",
+        use_container_width=True,
+        help="Downloads everything: claims, schedule, drafts, priorities, contact details and pin fixes."
+    )
