@@ -31,6 +31,17 @@ from engine import (
     parse_coordinates,
     build_navigation_links,
     US_TIMEZONES,
+    ACTIVITY_ONSITE,
+    ACTIVITY_VIDEO,
+    ACTIVITY_OPTIONS,
+    VIDEO_DEFAULT_HRS,
+    NOTE_MAX_CHARS,
+    is_video,
+    clean_text,
+    normalize_phone,
+    split_12h,
+    parse_date_time_12h,
+    build_export_table,
     GEO_MANUAL,
     GEO_CONFIRMED,
     GEO_REP_VERIFIED,
@@ -208,8 +219,29 @@ if "map_nonce" not in st.session_state:
     st.session_state.map_nonce = 0
 
 
+def time_options(step_min=15):
+    """Times of day in 12-hour order, for dropdowns (Streamlit's time box can show 24-hour)."""
+    return [datetime.min.replace(hour=m // 60, minute=m % 60).time() for m in range(0, 24 * 60, step_min)]
+
+
+def fmt_time12(t):
+    return datetime.combine(date.today(), t).strftime("%I:%M %p").lstrip("0")
+
+
 def book_claim_into_slot(claim_mask, slot):
-    """Schedules (or reschedules) the claim(s) in claim_mask into the given slot."""
+    """
+    Schedules (or reschedules) the claim(s) in claim_mask into the given slot.
+    The first booking is recorded as the initial contact and is never overwritten
+    by a reschedule (it can be edited in the claims pool).
+    """
+    cdf = st.session_state.claims_df
+    for i in cdf.index[claim_mask]:
+        if "first_booked_at" not in cdf.columns:
+            cdf["first_booked_at"] = ""
+        if not clean_text(cdf.at[i, "first_booked_at"]):
+            cdf.at[i, "first_booked_at"] = now_local.replace(second=0, microsecond=0).isoformat()
+        if "activity_type" not in cdf.columns or not clean_text(cdf.at[i, "activity_type"]):
+            cdf.at[i, "activity_type"] = ACTIVITY_ONSITE
     st.session_state.claims_df.loc[claim_mask, "status"] = "Scheduled"
     st.session_state.claims_df.loc[claim_mask, "start_time"] = slot["start"]
     st.session_state.claims_df.loc[claim_mask, "end_time"] = slot["end"]
@@ -257,7 +289,15 @@ def _set_state(key, value):
     st.session_state[key] = value
 
 
-def render_slot_picker(claim_id, claims_df, now, settings, current=None):
+def round_time_15(t):
+    if t is None:
+        return datetime.strptime("08:00", "%H:%M").time()
+    total = (t.hour * 60 + t.minute + 14) // 15 * 15
+    total = min(total, 23 * 60 + 45)
+    return datetime.min.replace(hour=total // 60, minute=total % 60).time()
+
+
+def render_slot_picker(claim_id, claims_df, now, settings, current=None, default_hrs=None):
     """
     Booking picker. Shows the next opening; with the calendar toggle on, shows a month
     view colored by real availability, then the chosen day's bookings and open time.
@@ -268,10 +308,11 @@ def render_slot_picker(claim_id, claims_df, now, settings, current=None):
     cid = str(claim_id)
     S = settings
     busy = get_busy_intervals(claims_df, exclude_claim_id=cid)
+    length_hrs = float(default_hrs or S["window_hrs"])
     openings = order_openings(
         compute_openings(S["start_date"], S["end_date"], S["active_days"], S["day_start"],
                          S["per_day"], S["window_hrs"], claims_df, now=now, exclude_claim_id=cid,
-                         latest_end=S["latest_end"]),
+                         latest_end=S["latest_end"], duration_hrs=length_hrs),
         latest_days_first=S.get("latest_first", False)
     )
 
@@ -318,8 +359,10 @@ def render_slot_picker(claim_id, claims_df, now, settings, current=None):
         st.session_state[time_key] = first_free_start(st.session_state[day_key]).time()
     if time_key not in st.session_state:
         st.session_state[time_key] = first_free_start(st.session_state[day_key]).time()
-    if dur_key not in st.session_state:
-        st.session_state[dur_key] = float(S["window_hrs"])
+    # Default length: the window setting, or 1 hour for live video (resets if the type changes)
+    if dur_key not in st.session_state or st.session_state.get(f"pick_dur_basis_{cid}") != length_hrs:
+        st.session_state[dur_key] = length_hrs
+        st.session_state[f"pick_dur_basis_{cid}"] = length_hrs
     sel_day = st.session_state[day_key]
 
     # Months covered by the date range
@@ -400,7 +443,10 @@ def render_slot_picker(claim_id, claims_df, now, settings, current=None):
                            on_click=_set_state, args=(time_key, t.time()))
 
     t1, t2 = st.columns(2)
-    t1.time_input("Start time", key=time_key, step=timedelta(minutes=15))
+    _t15 = time_options(15)
+    if st.session_state.get(time_key) not in _t15:
+        st.session_state[time_key] = round_time_15(st.session_state.get(time_key))
+    t1.selectbox("Start time", _t15, key=time_key, format_func=fmt_time12)
     t2.number_input("Length (hours)", key=dur_key, min_value=0.25, max_value=8.0, step=0.25)
 
     start_dt = datetime.combine(day_d, st.session_state[time_key])
@@ -556,9 +602,15 @@ window_hrs = st.sidebar.number_input(
     step=0.25
 )
 
-start_time_input = st.sidebar.time_input("Day start time", value=datetime.strptime("08:00", "%H:%M").time())
-latest_end_input = st.sidebar.time_input(
-    "Latest end for suggested openings", value=datetime.strptime("19:00", "%H:%M").time(),
+_times30 = time_options(30)
+start_time_input = st.sidebar.selectbox(
+    "Day start time", _times30, index=_times30.index(datetime.strptime("08:00", "%H:%M").time()),
+    format_func=fmt_time12, key="day_start_time"
+)
+latest_end_input = st.sidebar.selectbox(
+    "Latest end for suggested openings", _times30,
+    index=_times30.index(datetime.strptime("19:00", "%H:%M").time()),
+    format_func=fmt_time12, key="latest_end_time",
     help="Suggested openings never run past this time. You can still book later by hand "
          "if the insured is available."
 )
@@ -746,6 +798,11 @@ if uploaded_file is not None:
                                 added = geocode_claim_rows(plan["new"])
                             st.session_state.claims_df = pd.concat(
                                 [st.session_state.claims_df, added], ignore_index=True)
+                        for fill in plan.get("contact_fills", []):
+                            fmask = st.session_state.claims_df["claim_id"].astype(str) == fill["claim_id"]
+                            for field in ("phone", "email"):
+                                if fill.get(field):
+                                    st.session_state.claims_df.loc[fmask, field] = fill[field]
                         queue = ([{"type": "address", **c} for c in plan["address_changes"]] +
                                  [{"type": "missing", "claim_id": cid} for cid in plan["missing"]])
                         st.session_state.review_queue = queue
@@ -845,6 +902,11 @@ if st.session_state.claims_df is not None:
         cdf["priority"] = None
     if "geo_quality" not in cdf.columns:
         cdf["geo_quality"] = GEO_UNKNOWN
+    for text_col in ["phone", "email", "activity_type", "contact_note", "first_booked_at", "last_exported"]:
+        if text_col not in cdf.columns:
+            cdf[text_col] = ""
+        cdf[text_col] = cdf[text_col].apply(clean_text).astype(object)
+    cdf["phone"] = cdf["phone"].apply(normalize_phone)
     cdf["geo_quality"] = cdf["geo_quality"].fillna(GEO_UNKNOWN).astype(str)
     cdf["lat"] = pd.to_numeric(cdf["lat"], errors="coerce")
     cdf["lon"] = pd.to_numeric(cdf["lon"], errors="coerce")
@@ -955,6 +1017,10 @@ if st.session_state.claims_df is not None:
                     "borderColor": "#B7800F",
                     "textColor": "#111827",
                 })
+            elif is_video(row.get("activity_type")):
+                # Live video: a lighter shade of the inspection blue
+                event.update({"title": f"📹 {event['title']}", "backgroundColor": "#8DB0DC",
+                              "borderColor": SCHEDULED_BLUE, "textColor": "#0F1E2E"})
             else:
                 event.update({"backgroundColor": SCHEDULED_BLUE, "borderColor": STEEL})
             calendar_events.append(event)
@@ -1033,6 +1099,9 @@ if st.session_state.claims_df is not None:
             # current-time line are correct for the deployment.
             "now": now_local.isoformat(),
             "nowIndicator": True,
+            # 12-hour times
+            "eventTimeFormat": {"hour": "numeric", "minute": "2-digit", "meridiem": "short"},
+            "slotLabelFormat": {"hour": "numeric", "minute": "2-digit", "meridiem": "short"},
             # Gray shading outside your usual working hours and on non-inspection days
             "businessHours": {
                 "daysOfWeek": [js_day[d] for d in active_days],
@@ -1268,7 +1337,8 @@ if st.session_state.claims_df is not None:
                 icon_type = "exclamation-sign" if needs_review else ""
             else:
                 marker_color = date_color_map.get(row.get("scheduled_date"), "blue")
-                icon_type = "exclamation-sign" if needs_review else "ok-sign"
+                icon_type = "exclamation-sign" if needs_review else (
+                    "facetime-video" if is_video(row.get("activity_type")) else "ok-sign")
 
             nav = build_navigation_links(row["full_address"], lat, lon, prefer_coords=(row["geo_quality"] in GEO_REP_VERIFIED))
             links_html = " &nbsp; ".join(
@@ -1375,84 +1445,182 @@ if st.session_state.claims_df is not None:
 
     with col_left:
         st.subheader("Claims pool")
-        st.caption("Edit **Priority** (1 = highest, blank = unranked) or set **Status** to Unscheduled or Ignored. "
-                   "Changes save automatically and re-sort the recommendations below.")
+        st.caption("Edit priority, status, contact details and notes right in the table. Click a column "
+                   "header to sort. Check **Export** to choose claims for the claim platform export below.")
 
         if st.session_state.get("editor_notice"):
             st.warning(st.session_state.pop("editor_notice"))
 
+        if "export_ids" not in st.session_state:
+            st.session_state.export_ids = set()
+
         show_status = st.multiselect("Show statuses", ["Unscheduled", "Scheduled", "Ignored"], default=["Unscheduled", "Scheduled"])
-        filtered_df = df[df["status"].isin(show_status)].copy()
-        filtered_df["priority"] = filtered_df["priority"].astype("Int64")  # nullable int: shows "2", not "2.0"
+        view = df[df["status"].isin(show_status)]
 
-        editor_cols = ["claim_id", "insured_name", "full_address", "priority", "status", "scheduled_date", "inspection_time", "geo_quality"]
+        # Table shown to the rep: friendly columns, using the claim platform's header names
+        def last_exported_label(v):
+            dt = parse_wallclock(v)
+            return dt.strftime("%m/%d/%Y %I:%M %p") if dt else ""
+
+        rows = {}
+        for i, r in view.iterrows():
+            contact_dt = parse_wallclock(r.get("first_booked_at"))
+            act_dt = parse_wallclock(r.get("start_time")) if r["status"] == "Scheduled" else None
+            c_date, c_time, c_ap = split_12h(contact_dt)
+            a_date, a_time, a_ap = split_12h(act_dt)
+            rows[i] = {
+                "Export": str(r["claim_id"]) in st.session_state.export_ids,
+                "Claim": str(r["claim_id"]),
+                "Insured": r["insured_name"],
+                "Address": r["full_address"],
+                "Priority": normalize_priority(r["priority"]),
+                "Status": r["status"],
+                "Phone Number": r.get("phone", ""),
+                "Email": r.get("email", ""),
+                "Type of Contact": "Initial contact" if contact_dt else "",
+                "Date Contact Completed": c_date,
+                "Time Contact Completed": c_time,
+                "Contact AM or PM": c_ap,
+                "Type of Activity": r.get("activity_type", ""),
+                "Date Activity Completed": a_date,
+                "Time Activity Completed": a_time,
+                "Activity AM or PM": a_ap,
+                "Initial Contact Note": r.get("contact_note", ""),
+                "Location": r["geo_quality"],
+                "Last Exported": last_exported_label(r.get("last_exported")),
+            }
+        table = pd.DataFrame.from_dict(rows, orient="index")
+        if not table.empty:
+            table["Priority"] = pd.to_numeric(table["Priority"], errors="coerce").astype("Int64")
+
         editor_key = f"claims_editor_{st.session_state.editor_version}_{'_'.join(sorted(show_status))}"
-
-        edited_df = st.data_editor(
-            filtered_df[editor_cols],
+        edited = st.data_editor(
+            table,
             key=editor_key,
-            disabled=["claim_id", "insured_name", "full_address", "scheduled_date", "inspection_time", "geo_quality"],
+            disabled=["Claim", "Insured", "Address", "Type of Contact", "Date Activity Completed",
+                      "Time Activity Completed", "Activity AM or PM", "Location", "Last Exported"],
             column_config={
-                "claim_id": st.column_config.TextColumn("Claim"),
-                "insured_name": st.column_config.TextColumn("Insured"),
-                "full_address": st.column_config.TextColumn("Address"),
-                "scheduled_date": st.column_config.TextColumn("Date"),
-                "inspection_time": st.column_config.TextColumn("Time"),
-                "geo_quality": st.column_config.TextColumn("Location", help="How the map pin was placed."),
-                "priority": st.column_config.NumberColumn(
-                    "Priority",
-                    help="1 = highest. Leave blank for unranked claims.",
-                    min_value=1,
-                    step=1,
-                    format="%d"
-                ),
-                "status": st.column_config.SelectboxColumn(
-                    "Status",
-                    options=["Unscheduled", "Scheduled", "Ignored"],
-                    required=True,
-                    help="Use 'Confirm & Lock Slot' on the right to schedule a claim."
-                ),
+                "Export": st.column_config.CheckboxColumn("Export", help="Include in the claim platform export."),
+                "Priority": st.column_config.NumberColumn("Priority", help="1 = highest. Leave blank for unranked claims.",
+                                                          min_value=1, step=1, format="%d"),
+                "Status": st.column_config.SelectboxColumn(
+                    "Status", options=["Unscheduled", "Scheduled", "Ignored"], required=True,
+                    help="Schedule a claim from Manage a claim, so it gets a real time."),
+                "Type of Contact": st.column_config.TextColumn(
+                    "Type of Contact", help="Initial contact, once a contact date and time are recorded."),
+                "Date Contact Completed": st.column_config.TextColumn(
+                    "Date Contact Completed", help="Recorded when the claim is first booked. Format: 10/07/2026"),
+                "Time Contact Completed": st.column_config.TextColumn("Time Contact Completed", help="Format: 2:15"),
+                "Contact AM or PM": st.column_config.SelectboxColumn("Contact AM or PM", options=["", "AM", "PM"]),
+                "Type of Activity": st.column_config.SelectboxColumn("Type of Activity", options=[""] + ACTIVITY_OPTIONS),
+                "Date Activity Completed": st.column_config.TextColumn(
+                    "Date Activity Completed", help="The inspection date, from the schedule."),
+                "Time Activity Completed": st.column_config.TextColumn(
+                    "Time Activity Completed", help="The inspection start time, from the schedule."),
+                "Initial Contact Note": st.column_config.TextColumn(
+                    "Initial Contact Note", max_chars=NOTE_MAX_CHARS, width="large"),
+                "Location": st.column_config.TextColumn("Location", help="How the map pin was placed."),
             },
             hide_index=True,
             use_container_width=True
         )
 
-        # --- SYNC EDITOR CHANGES BACK INTO SESSION STATE ---
-        # edited_df keeps the same index as claims_df, so rows map back directly.
-        changes_made = False
-        blocked_claims = []
+        # --- SYNC TABLE EDITS BACK INTO THE CLAIMS ---
+        # The table keeps the claims' row index, so each edited row maps straight back.
+        cdf = st.session_state.claims_df
+        changes_made, blocked_claims, bad_times = False, [], []
 
-        for row_idx in edited_df.index:
-            old_row = filtered_df.loc[row_idx]
-            new_row = edited_df.loc[row_idx]
+        for row_idx in edited.index:
+            old, new = table.loc[row_idx], edited.loc[row_idx]
+            cid = str(old["Claim"])
 
-            old_prio = normalize_priority(old_row["priority"])
-            new_prio = normalize_priority(new_row["priority"])
+            if bool(new["Export"]) != bool(old["Export"]):
+                (st.session_state.export_ids.add if new["Export"] else st.session_state.export_ids.discard)(cid)
+
+            old_prio, new_prio = normalize_priority(old["Priority"]), normalize_priority(new["Priority"])
             if new_prio != old_prio:
-                st.session_state.claims_df.at[row_idx, "priority"] = new_prio if new_prio is not None else float("nan")
+                cdf.at[row_idx, "priority"] = new_prio if new_prio is not None else float("nan")
                 changes_made = True
 
-            if new_row["status"] != old_row["status"]:
-                if new_row["status"] in ("Unscheduled", "Ignored"):
-                    st.session_state.claims_df.at[row_idx, "status"] = new_row["status"]
-                    st.session_state.claims_df.at[row_idx, "start_time"] = None
-                    st.session_state.claims_df.at[row_idx, "end_time"] = None
-                    st.session_state.claims_df.at[row_idx, "scheduled_date"] = ""
-                    st.session_state.claims_df.at[row_idx, "inspection_time"] = ""
+            if new["Status"] != old["Status"]:
+                if new["Status"] in ("Unscheduled", "Ignored"):
+                    cdf.at[row_idx, "status"] = new["Status"]
+                    cdf.at[row_idx, "start_time"] = None
+                    cdf.at[row_idx, "end_time"] = None
+                    cdf.at[row_idx, "scheduled_date"] = ""
+                    cdf.at[row_idx, "inspection_time"] = ""
                     changes_made = True
-                elif new_row["status"] == "Scheduled":
-                    # Scheduling needs a time slot, so it isn't allowed from the table.
-                    blocked_claims.append(str(old_row["claim_id"]))
+                elif new["Status"] == "Scheduled":
+                    blocked_claims.append(cid)
 
+            for col, field, fix in [("Phone Number", "phone", normalize_phone),
+                                    ("Email", "email", clean_text),
+                                    ("Type of Activity", "activity_type", clean_text),
+                                    ("Initial Contact Note", "contact_note", lambda v: clean_text(v)[:NOTE_MAX_CHARS])]:
+                if clean_text(new[col]) != clean_text(old[col]):
+                    cdf.at[row_idx, field] = fix(new[col])
+                    changes_made = True
+
+            contact_cols = ["Date Contact Completed", "Time Contact Completed", "Contact AM or PM"]
+            if any(clean_text(new[c]) != clean_text(old[c]) for c in contact_cols):
+                dt, err = parse_date_time_12h(*(new[c] for c in contact_cols))
+                if err:
+                    bad_times.append(f"{cid}: {err}")
+                else:
+                    cdf.at[row_idx, "first_booked_at"] = dt.isoformat() if dt else ""
+                    changes_made = True
+
+        notices = []
         if blocked_claims:
-            st.session_state["editor_notice"] = (
-                f"Claim(s) {', '.join(blocked_claims)} weren't scheduled. Select the claim on the right "
-                "and use **Confirm & Lock Slot** to pick a time."
-            )
+            notices.append(f"Claim(s) {', '.join(blocked_claims)} weren't scheduled. Select the claim under "
+                           "Manage a claim to pick a time.")
+        if bad_times:
+            notices.append("Contact date or time not saved. " + "; ".join(bad_times) + ".")
+        if notices:
+            st.session_state["editor_notice"] = " ".join(notices)
 
-        if changes_made or blocked_claims:
+        if changes_made or blocked_claims or bad_times:
             st.session_state.editor_version += 1
             st.rerun()
+
+        # --- EXPORT FOR THE CLAIM PLATFORM ---
+        valid_ids = {str(c) for c in cdf["claim_id"]}
+        st.session_state.export_ids &= valid_ids
+        n_sel = len(st.session_state.export_ids)
+
+        def select_contacted():
+            st.session_state.export_ids = {str(c) for c, f in zip(st.session_state.claims_df["claim_id"],
+                                                                st.session_state.claims_df["first_booked_at"])
+                                           if clean_text(f)}
+            st.session_state.editor_version += 1
+
+        def clear_selection():
+            st.session_state.export_ids = set()
+            st.session_state.editor_version += 1
+
+        def mark_exported(ids):
+            stamp = now_local.replace(second=0, microsecond=0).isoformat()
+            m = st.session_state.claims_df["claim_id"].astype(str).isin(ids)
+            st.session_state.claims_df.loc[m, "last_exported"] = stamp
+            st.session_state.editor_version += 1
+
+        e1, e2, e3 = st.columns([1.2, 0.8, 1.3], vertical_alignment="center")
+        e1.button("Select claims with initial contact", on_click=select_contacted, use_container_width=True)
+        e2.button("Clear selection", on_click=clear_selection, use_container_width=True, disabled=n_sel == 0)
+        export_ids = sorted(st.session_state.export_ids)
+        e3.download_button(
+            f"⬇️ Export {n_sel} for claim platform",
+            data=build_export_table(cdf, export_ids).to_csv(index=False).encode("utf-8"),
+            file_name=f"claim_platform_export_{now_local.strftime('%Y%m%d_%H%M')}.csv",
+            mime="text/csv",
+            type="primary",
+            disabled=n_sel == 0,
+            use_container_width=True,
+            on_click=mark_exported,
+            args=(export_ids,),
+        )
+        st.caption("Save progress (in the sidebar) still saves everything. This export holds only the claim "
+                   "platform columns for the selected claims, and stamps them with the export time.")
 
     # Default day for "Fill an opening": the first suggested opening in the chosen fill order
     selected_target_date_str = all_slots[0]["date_str"] if all_slots else start_date.strftime("%Y-%m-%d")
@@ -1494,7 +1662,34 @@ if st.session_state.claims_df is not None:
                     f"**Status:** `{current_claim['status']}`"
                 )
                 render_nav_buttons(current_claim["full_address"], current_claim["lat"], current_claim["lon"], current_claim["geo_quality"])
-                
+
+                # --- Initial contact details (all optional) ---
+                ck = f"contact_{selected_claim_id}_{st.session_state.editor_version}"
+                first_dt = parse_wallclock(current_claim.get("first_booked_at"))
+                with st.expander("Initial contact", expanded=False):
+                    st.caption(
+                        f"Initial contact: **{first_dt.strftime('%m/%d/%Y %I:%M %p')}** (recorded when first booked)"
+                        if first_dt else "Initial contact is recorded automatically the first time this claim is booked."
+                    )
+                    phone_in = st.text_input("Best contact number", value=current_claim.get("phone", ""), key=f"{ck}_phone")
+                    email_in = st.text_input("Email", value=current_claim.get("email", ""), key=f"{ck}_email")
+                    cur_act = current_claim.get("activity_type") or ACTIVITY_ONSITE
+                    act_in = st.selectbox("Type of activity", ACTIVITY_OPTIONS, key=f"{ck}_act",
+                                          index=ACTIVITY_OPTIONS.index(cur_act) if cur_act in ACTIVITY_OPTIONS else 0,
+                                          help="Live video inspections default to 1 hour and don't count as "
+                                               "a location for drive times.")
+                    note_in = st.text_area("Initial Contact Discussion & Notes", value=current_claim.get("contact_note", ""),
+                                           max_chars=NOTE_MAX_CHARS, key=f"{ck}_note", height=120)
+                    if st.button("Save contact details", key=f"{ck}_save"):
+                        st.session_state.claims_df.loc[claim_mask, "phone"] = normalize_phone(phone_in)
+                        st.session_state.claims_df.loc[claim_mask, "email"] = email_in.strip()
+                        st.session_state.claims_df.loc[claim_mask, "activity_type"] = act_in
+                        st.session_state.claims_df.loc[claim_mask, "contact_note"] = note_in.strip()[:NOTE_MAX_CHARS]
+                        st.session_state.editor_version += 1
+                        st.toast(f"Contact details saved for {selected_claim_id}")
+                        st.rerun()
+                claim_length = VIDEO_DEFAULT_HRS if is_video(current_claim.get("activity_type")) else None
+
                 st.markdown("---")
 
                 if current_claim["status"] == "Scheduled":
@@ -1505,7 +1700,8 @@ if st.session_state.claims_df is not None:
 
                     move_slot = render_slot_picker(
                         selected_claim_id, st.session_state.claims_df, now_local, schedule_settings,
-                        current=(parse_wallclock(current_claim["start_time"]), parse_wallclock(current_claim["end_time"]))
+                        current=(parse_wallclock(current_claim["start_time"]), parse_wallclock(current_claim["end_time"])),
+                        default_hrs=claim_length
                     )
                     if move_slot:
                         if st.button("🔁 Move to this slot", type="primary"):
@@ -1523,7 +1719,7 @@ if st.session_state.claims_df is not None:
 
                 elif current_claim["status"] in ["Unscheduled", "Ignored"]:
                     chosen_slot = render_slot_picker(selected_claim_id, st.session_state.claims_df,
-                                                     now_local, schedule_settings)
+                                                     now_local, schedule_settings, default_hrs=claim_length)
                     if chosen_slot:
                         selected_target_date_str = chosen_slot["date_str"]
                         if st.button("Book this slot", type="primary"):
@@ -1611,6 +1807,8 @@ if st.session_state.claims_df is not None:
                                 if rec_row.get("late_for_next"):
                                     drive_txt += (f"  \n:orange[⚠️ {int(rec_row['drive_to_next_mins'])} min drive to "
                                                   f"{nxt['label']}. You may be late.]")
+                        elif rec_row.get("is_video"):
+                            drive_txt = "📹 Live video inspection, no drive needed (books 1 hour)"
                         else:
                             drive_txt = ":orange[📍 No map pin yet. Set it in the Map tab.]"
 
@@ -1620,7 +1818,10 @@ if st.session_state.claims_df is not None:
                         if st.button(action, key=f"btn_book_{idx}_{rec_row['claim_id']}", use_container_width=True,
                                      type="primary" if idx == 0 else "secondary"):
                             mask = st.session_state.claims_df["claim_id"].astype(str) == str(rec_row["claim_id"])
-                            book_claim_into_slot(mask, opening)
+                            slot_to_book = opening
+                            if rec_row.get("is_video"):
+                                slot_to_book = make_slot(parse_wallclock(opening["start"]), VIDEO_DEFAULT_HRS)
+                            book_claim_into_slot(mask, slot_to_book)
                             st.toast(f"Booked {rec_row['claim_id']} for {opening_label}")
                             st.rerun()
                     with col_rec3:
