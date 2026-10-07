@@ -10,6 +10,8 @@ from datetime import datetime, date, timedelta
 from streamlit_calendar import calendar
 from engine import (
     process_imported_table,
+    build_merge_plan,
+    geocode_claim_rows,
     compute_openings,
     compute_day_gaps,
     get_busy_intervals,
@@ -449,6 +451,23 @@ def render_slot_picker(claim_id, claims_df, now, settings, current=None):
     return slot
 
 
+def core_view_points(points, share=0.9, min_points=5):
+    """
+    Returns the share of points (default 90%) closest to the middle of the group,
+    plus how many were left out. Far-off pins (a bad address, a claim across the state)
+    stay on the map but don't force the view to zoom way out.
+    """
+    if len(points) < min_points:
+        return points, 0
+    lats = sorted(p[0] for p in points)
+    lons = sorted(p[1] for p in points)
+    mid_lat, mid_lon = lats[len(lats) // 2], lons[len(lons) // 2]   # median resists outliers
+    lon_scale = math.cos(math.radians(mid_lat))
+    ranked = sorted(points, key=lambda p: (p[0] - mid_lat) ** 2 + ((p[1] - mid_lon) * lon_scale) ** 2)
+    keep = max(min_points, math.ceil(len(points) * share))
+    return ranked[:keep], len(points) - keep
+
+
 def render_nav_buttons(address, lat, lon, geo_quality=None):
     """Shows 'Google Maps' and 'Apple Maps' directions buttons side by side."""
     links = build_navigation_links(address, lat, lon, prefer_coords=(geo_quality in GEO_REP_VERIFIED))
@@ -474,9 +493,16 @@ def esc(value):
 # =====================================================================
 st.sidebar.header("Schedule settings")
 st.sidebar.caption("Switch between Field (light) and Console (dark) themes in the ⋮ menu at the top right, under Settings.")
-hotel_address = st.sidebar.text_input("Hotel base location", "1100 San Pedro Ave, San Antonio, TX")
+hotel_address = st.sidebar.text_input(
+    "Hotel base location", value="",
+    placeholder="Street, city, state, ZIP",
+    help="Where you're staying. The first stop of each day is measured from here, and with "
+         "Least added driving, the last stop of the day favors claims on the way back."
+)
 hotel_coords = geocode_hotel_address(hotel_address)
-if hotel_address.strip() and hotel_coords is None:
+if not hotel_address.strip():
+    st.sidebar.caption("Add your hotel address so each day's first drive time starts there.")
+elif hotel_coords is None:
     st.sidebar.warning("Couldn't find the hotel address. The first stop of each day will use "
                        "the center of your claims for drive times.")
 
@@ -637,16 +663,147 @@ st.markdown(f"""
 # IMPORT
 # =====================================================================
 st.subheader("Import claims")
+if st.session_state.claims_df is not None:
+    st.caption("To add an updated claims list, upload it here. Claims you already have keep their "
+               "schedule, priority, and pin fixes. Starting a new session? Load your saved progress first.")
 uploaded_file = st.file_uploader("Upload a CSV or Excel claims list", type=["csv", "xlsx"])
 
-if uploaded_file is not None and st.session_state.claims_df is None:
-    try:
-        with st.spinner("Reading the claims list and looking up addresses..."):
-            raw_df = pd.read_csv(uploaded_file) if uploaded_file.name.endswith(".csv") else pd.read_excel(uploaded_file)
-            st.session_state.claims_df = process_imported_table(raw_df)
-            st.rerun()
-    except Exception as e:
-        st.error(f"Couldn't read that file: {e}")
+
+def read_claims_file(f):
+    return pd.read_csv(f) if f.name.lower().endswith(".csv") else pd.read_excel(f)
+
+
+if uploaded_file is not None:
+    upload_sig = (uploaded_file.name, uploaded_file.size)
+
+    if st.session_state.claims_df is None:
+        # First list of the session: import everything
+        try:
+            with st.spinner("Reading the claims list and looking up addresses..."):
+                st.session_state.claims_df = process_imported_table(read_claims_file(uploaded_file))
+                st.session_state.processed_upload_sig = upload_sig
+                st.rerun()
+        except Exception as e:
+            st.error(f"Couldn't read that file: {e}")
+
+    elif st.session_state.get("processed_upload_sig") != upload_sig:
+        # An updated list while claims are loaded: compare first, change nothing yet
+        if st.session_state.get("merge_plan_sig") != upload_sig:
+            try:
+                st.session_state.merge_plan = build_merge_plan(st.session_state.claims_df,
+                                                               read_claims_file(uploaded_file))
+                st.session_state.merge_plan_sig = upload_sig
+            except Exception as e:
+                st.error(f"Couldn't read that file: {e}")
+                st.session_state.merge_plan = None
+
+        plan = st.session_state.get("merge_plan")
+        if plan is not None:
+            n_new, n_chg, n_miss = len(plan["new"]), len(plan["address_changes"]), len(plan["missing"])
+            if n_new == n_chg == n_miss == 0:
+                st.info(f"This list matches the claims you already have ({plan['unchanged']} claims). Nothing to update.")
+                st.session_state.processed_upload_sig = upload_sig
+            else:
+                with st.container(border=True):
+                    st.markdown(f"**Updated claims list: {uploaded_file.name}**")
+                    st.markdown(
+                        f"- **{n_new}** new claim(s) to add\n"
+                        f"- **{n_chg}** address change(s) to review\n"
+                        f"- **{n_miss}** claim(s) not in this list, to review\n"
+                        f"- {plan['unchanged']} claim(s) unchanged"
+                    )
+                    st.caption("New claims are added right away. Address changes and missing claims are "
+                               "reviewed one at a time after you apply. Nothing changes until then.")
+                    a1, a2 = st.columns(2)
+                    if a1.button("Apply update", type="primary", use_container_width=True):
+                        if plan["new"]:
+                            with st.spinner(f"Looking up {n_new} new address(es)..."):
+                                added = geocode_claim_rows(plan["new"])
+                            st.session_state.claims_df = pd.concat(
+                                [st.session_state.claims_df, added], ignore_index=True)
+                        queue = ([{"type": "address", **c} for c in plan["address_changes"]] +
+                                 [{"type": "missing", "claim_id": cid} for cid in plan["missing"]])
+                        st.session_state.review_queue = queue
+                        st.session_state.review_total = len(queue)
+                        st.session_state.processed_upload_sig = upload_sig
+                        st.session_state.merge_plan = None
+                        st.session_state.editor_version += 1
+                        st.session_state.map_nonce += 1
+                        st.toast(f"Added {n_new} new claim(s)" if n_new else "Update applied")
+                        st.rerun()
+                    if a2.button("Not now", use_container_width=True):
+                        st.session_state.processed_upload_sig = upload_sig
+                        st.session_state.merge_plan = None
+                        st.rerun()
+
+
+# --- Review flagged claims from an updated list, one at a time ---
+review_queue = st.session_state.get("review_queue") or []
+if review_queue and st.session_state.claims_df is not None:
+    cdf = st.session_state.claims_df
+    item = review_queue[0]
+    cid = str(item["claim_id"])
+    match = cdf[cdf["claim_id"].astype(str) == cid]
+
+    def finish_review_item():
+        st.session_state.review_queue = st.session_state.review_queue[1:]
+        st.session_state.editor_version += 1
+        st.session_state.map_nonce += 1
+
+    if match.empty:
+        finish_review_item()   # claim no longer exists; skip it
+        st.rerun()
+
+    row = match.iloc[0]
+    position = st.session_state.get("review_total", len(review_queue)) - len(review_queue) + 1
+    sched_note = ""
+    if row["status"] == "Scheduled":
+        s_dt = parse_wallclock(row.get("start_time"))
+        sched_note = f"It's scheduled for **{fmt_dt(s_dt)}**." if s_dt else "It's scheduled."
+
+    with st.container(border=True):
+        st.caption(f"Reviewing updated list: {position} of {st.session_state.get('review_total', len(review_queue))}")
+
+        if item["type"] == "missing":
+            st.markdown(f"**{cid} - {row['insured_name']}** isn't in the new list. "
+                        f"It may have been closed or reassigned. {sched_note}")
+            st.caption(row["full_address"])
+            b1, b2 = st.columns(2)
+            if b1.button("Keep", use_container_width=True, key=f"rv_keep_{cid}",
+                         help="Leaves this claim in your pool and schedule as it is."):
+                finish_review_item()
+                st.rerun()
+            remove_label = "Remove from pool and schedule" if row["status"] == "Scheduled" else "Remove from pool"
+            if b2.button(remove_label, type="primary", use_container_width=True, key=f"rv_remove_{cid}"):
+                st.session_state.claims_df = cdf[cdf["claim_id"].astype(str) != cid].reset_index(drop=True)
+                finish_review_item()
+                st.toast(f"Removed {cid}")
+                st.rerun()
+
+        else:
+            st.markdown(f"**{cid} - {row['insured_name']}** has a new address in this list. {sched_note}")
+            st.markdown(f"Current: {item['old_address']}  \nNew: **{item['new_address']}**")
+            if row.get("geo_quality") in GEO_REP_VERIFIED:
+                st.caption(f"You {'placed' if row['geo_quality'] == GEO_MANUAL else 'confirmed'} this pin by hand. "
+                           "Updating looks up the new address and replaces your pin.")
+            b1, b2 = st.columns(2)
+            if b1.button("Ignore", use_container_width=True, key=f"rv_ignore_{cid}",
+                         help="Keeps the current address and pin."):
+                finish_review_item()
+                st.rerun()
+            if b2.button("Update address", type="primary", use_container_width=True, key=f"rv_update_{cid}"):
+                with st.spinner("Looking up the new address..."):
+                    lat, lon, quality = batch_geocode_addresses([(item["new_address"], item.get("new_state", ""))])[0]
+                mask = cdf["claim_id"].astype(str) == cid
+                st.session_state.claims_df.loc[mask, "full_address"] = item["new_address"]
+                if item.get("new_state"):
+                    st.session_state.claims_df.loc[mask, "state"] = item["new_state"]
+                st.session_state.claims_df.loc[mask, "lat"] = lat
+                st.session_state.claims_df.loc[mask, "lon"] = lon
+                st.session_state.claims_df.loc[mask, "geo_quality"] = quality
+                finish_review_item()
+                st.toast(f"Address updated for {cid}")
+                st.rerun()
 
 
 # =====================================================================
@@ -1098,10 +1255,20 @@ if st.session_state.claims_df is not None:
                 tooltip="Hotel base",
                 icon=folium.Icon(color="black", icon="home")
             ).add_to(m)
-            bounds.append(list(hotel_coords))
 
+        # Default view: fit about 90% of the claim pins, so one or two far-off pins
+        # don't zoom the map way out. The hotel is included when it's within that area.
+        hidden_pins = 0
         if bounds and not fix_mode:
-            m.fit_bounds(bounds, padding=(30, 30))
+            view_pts, hidden_pins = core_view_points(bounds)
+            if hotel_coords and view_pts:
+                lat_lo, lat_hi = min(p[0] for p in view_pts), max(p[0] for p in view_pts)
+                lon_lo, lon_hi = min(p[1] for p in view_pts), max(p[1] for p in view_pts)
+                pad_lat, pad_lon = (lat_hi - lat_lo) * 0.25, (lon_hi - lon_lo) * 0.25
+                if (lat_lo - pad_lat <= hotel_coords[0] <= lat_hi + pad_lat and
+                        lon_lo - pad_lon <= hotel_coords[1] <= lon_hi + pad_lon):
+                    view_pts = view_pts + [list(hotel_coords)]
+            m.fit_bounds(view_pts, padding=(30, 30))
 
         folium.LayerControl().add_to(m)
 
@@ -1133,6 +1300,8 @@ if st.session_state.claims_df is not None:
 
         st.caption("Red pins are unscheduled. Scheduled pins are colored by day, with a check mark. "
                    "A **!** means the location is approximate and should be checked.")
+        if hidden_pins:
+            st.caption(f"{hidden_pins} pin(s) far from the rest are outside this view. Zoom out to see them.")
 
         if fix_mode and fix_row is not None:
             has_pin = pd.notna(fix_row["lat"]) and pd.notna(fix_row["lon"])
