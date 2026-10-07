@@ -468,6 +468,31 @@ def core_view_points(points, share=0.9, min_points=5):
     return ranked[:keep], len(points) - keep
 
 
+def view_center_zoom(points, width_px=900, height_px=540, padding_px=50, max_zoom=16):
+    """
+    Center and zoom level that fit all points on a web map of the given size.
+    Computed directly (instead of fit_bounds) so the map opens on this view.
+    """
+    lats = [p[0] for p in points]
+    lons = [p[1] for p in points]
+    north, south, east, west = max(lats), min(lats), max(lons), min(lons)
+    center = [(north + south) / 2, (east + west) / 2]
+
+    def lat_rad(lat):
+        s = math.sin(math.radians(lat))
+        return max(min(math.log((1 + s) / (1 - s)) / 2, math.pi), -math.pi) / 2
+
+    lat_frac = (lat_rad(north) - lat_rad(south)) / math.pi
+    lon_frac = (east - west) / 360.0
+    w, h = max(width_px - 2 * padding_px, 100), max(height_px - 2 * padding_px, 100)
+    zooms = [max_zoom]
+    if lat_frac > 0:
+        zooms.append(math.log2(h / 256.0 / lat_frac))
+    if lon_frac > 0:
+        zooms.append(math.log2(w / 256.0 / lon_frac))
+    return center, max(3, int(math.floor(min(zooms))))
+
+
 def render_nav_buttons(address, lat, lon, geo_quality=None):
     """Shows 'Google Maps' and 'Apple Maps' directions buttons side by side."""
     links = build_navigation_links(address, lat, lon, prefer_coords=(geo_quality in GEO_REP_VERIFIED))
@@ -1180,13 +1205,28 @@ if st.session_state.claims_df is not None:
             st.caption(f"{fix_row['full_address']}")
 
         valid_coords_df = mdf[(mdf["status"] != "Ignored") & (mdf["lat"].notna()) & (mdf["lon"].notna())]
+        hidden_pins = 0
 
         if fix_row is not None and pd.notna(fix_row["lat"]) and pd.notna(fix_row["lon"]):
             map_center, map_zoom = [float(fix_row["lat"]), float(fix_row["lon"])], 18
         elif fix_row is not None and hotel_coords:
             map_center, map_zoom = list(hotel_coords), 13
         elif not valid_coords_df.empty:
-            map_center, map_zoom = [valid_coords_df["lat"].mean(), valid_coords_df["lon"].mean()], 10
+            # Default view: the ~90% of pins nearest the middle of the group, so a
+            # far-off pin or two doesn't zoom the map way out. The hotel is included
+            # when it's in or near that area.
+            all_pts = valid_coords_df[["lat", "lon"]].astype(float).values.tolist()
+            view_pts, hidden_pins = core_view_points(all_pts)
+            if hotel_coords:
+                lat_lo, lat_hi = min(p[0] for p in view_pts), max(p[0] for p in view_pts)
+                lon_lo, lon_hi = min(p[1] for p in view_pts), max(p[1] for p in view_pts)
+                pad_lat, pad_lon = (lat_hi - lat_lo) * 0.25, (lon_hi - lon_lo) * 0.25
+                if (lat_lo - pad_lat <= hotel_coords[0] <= lat_hi + pad_lat and
+                        lon_lo - pad_lon <= hotel_coords[1] <= lon_hi + pad_lon):
+                    view_pts = view_pts + [list(hotel_coords)]
+            map_center, map_zoom = view_center_zoom(view_pts)
+        elif hotel_coords:
+            map_center, map_zoom = list(hotel_coords), 12
         else:
             map_center, map_zoom = [29.4241, -98.4936], 10
 
@@ -1256,19 +1296,6 @@ if st.session_state.claims_df is not None:
                 icon=folium.Icon(color="black", icon="home")
             ).add_to(m)
 
-        # Default view: fit about 90% of the claim pins, so one or two far-off pins
-        # don't zoom the map way out. The hotel is included when it's within that area.
-        hidden_pins = 0
-        if bounds and not fix_mode:
-            view_pts, hidden_pins = core_view_points(bounds)
-            if hotel_coords and view_pts:
-                lat_lo, lat_hi = min(p[0] for p in view_pts), max(p[0] for p in view_pts)
-                lon_lo, lon_hi = min(p[1] for p in view_pts), max(p[1] for p in view_pts)
-                pad_lat, pad_lon = (lat_hi - lat_lo) * 0.25, (lon_hi - lon_lo) * 0.25
-                if (lat_lo - pad_lat <= hotel_coords[0] <= lat_hi + pad_lat and
-                        lon_lo - pad_lon <= hotel_coords[1] <= lon_hi + pad_lon):
-                    view_pts = view_pts + [list(hotel_coords)]
-            m.fit_bounds(view_pts, padding=(30, 30))
 
         folium.LayerControl().add_to(m)
 
