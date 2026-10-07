@@ -179,6 +179,113 @@ def build_navigation_links(address: Any, lat: Any = None, lon: Any = None, prefe
     }
 
 
+# --- CONTACT, ACTIVITY & EXPORT FIELDS ---
+
+ACTIVITY_ONSITE = "Scheduled On-Site Inspection"
+ACTIVITY_VIDEO = "Scheduled Live Video Inspection"
+ACTIVITY_OPTIONS = [ACTIVITY_ONSITE, ACTIVITY_VIDEO]
+VIDEO_DEFAULT_HRS = 1.0
+NOTE_MAX_CHARS = 500
+
+# Exact column headers for the claim platform export, in order
+EXPORT_HEADERS = [
+    "Claim Number", "Insured Name", "Phone Number", "Email", "Type of Contact",
+    "Date Contact Completed", "Time Contact Completed", "Contact AM or PM",
+    "Type of Activity", "Date Activity Completed", "Time Activity Completed", "Activity AM or PM",
+    "Initial Contact Note",
+]
+
+
+def is_video(activity: Any) -> bool:
+    return str(activity or "").strip() == ACTIVITY_VIDEO
+
+
+def _blank(value: Any) -> bool:
+    if value is None:
+        return True
+    try:
+        if pd.isna(value):
+            return True
+    except (TypeError, ValueError):
+        pass
+    return str(value).strip() in ("", "nan", "None", "NaT")
+
+
+def clean_text(value: Any) -> str:
+    return "" if _blank(value) else str(value).strip()
+
+
+def normalize_phone(value: Any) -> str:
+    """Formats 10-digit US numbers as (210) 555-0142; leaves anything else as typed."""
+    raw = clean_text(value)
+    if raw.endswith(".0"):
+        raw = raw[:-2]
+    digits = re.sub(r"\D", "", raw)
+    if len(digits) == 11 and digits.startswith("1"):
+        digits = digits[1:]
+    if len(digits) == 10:
+        return f"({digits[:3]}) {digits[3:6]}-{digits[6:]}"
+    return raw
+
+
+def split_12h(dt: Optional[datetime]) -> Tuple[str, str, str]:
+    """datetime -> ('10/07/2026', '2:15', 'PM'); blanks if None."""
+    if not dt:
+        return "", "", ""
+    return dt.strftime("%m/%d/%Y"), dt.strftime("%I:%M").lstrip("0"), dt.strftime("%p")
+
+
+def parse_date_time_12h(date_str: Any, time_str: Any, ampm: Any) -> Tuple[Optional[datetime], Optional[str]]:
+    """
+    ('10/07/2026', '2:15', 'PM') -> datetime. Returns (None, None) when all are blank,
+    or (None, error message) when something can't be read.
+    """
+    d, t, ap = clean_text(date_str), clean_text(time_str), clean_text(ampm).upper()
+    if not d and not t and not ap:
+        return None, None
+    try:
+        day = datetime.strptime(d, "%m/%d/%Y").date()
+    except ValueError:
+        return None, f"'{d}' isn't a date like 10/07/2026"
+    if not t:
+        return datetime.combine(day, datetime.min.time()), None
+    m = re.fullmatch(r"(\d{1,2})(?::(\d{2}))?\s*(AM|PM)?", t.upper())
+    if not m:
+        return None, f"'{t}' isn't a time like 2:15"
+    hour, minute = int(m.group(1)), int(m.group(2) or 0)
+    ap = m.group(3) or ap
+    if ap not in ("AM", "PM") or not (1 <= hour <= 12) or minute > 59:
+        return None, "Use a time like 2:15 with AM or PM"
+    hour = hour % 12 + (12 if ap == "PM" else 0)
+    return datetime.combine(day, datetime.min.time()).replace(hour=hour, minute=minute), None
+
+
+def build_export_table(claims_df: pd.DataFrame, claim_ids: Optional[List[str]] = None) -> pd.DataFrame:
+    """Rows for the claim platform, with the exact EXPORT_HEADERS columns."""
+    df = claims_df
+    if claim_ids is not None:
+        wanted = {str(c) for c in claim_ids}
+        df = df[df["claim_id"].astype(str).isin(wanted)]
+    rows = []
+    for _, r in df.iterrows():
+        contact_dt = parse_wallclock(r.get("first_booked_at"))
+        activity_dt = parse_wallclock(r.get("start_time")) if r.get("status") == "Scheduled" else None
+        c_date, c_time, c_ap = split_12h(contact_dt)
+        a_date, a_time, a_ap = split_12h(activity_dt)
+        rows.append({
+            "Claim Number": str(r["claim_id"]),
+            "Insured Name": clean_text(r.get("insured_name")),
+            "Phone Number": normalize_phone(r.get("phone")),
+            "Email": clean_text(r.get("email")),
+            "Type of Contact": "Initial contact" if contact_dt else "",
+            "Date Contact Completed": c_date, "Time Contact Completed": c_time, "Contact AM or PM": c_ap,
+            "Type of Activity": clean_text(r.get("activity_type")) if activity_dt or clean_text(r.get("activity_type")) else "",
+            "Date Activity Completed": a_date, "Time Activity Completed": a_time, "Activity AM or PM": a_ap,
+            "Initial Contact Note": clean_text(r.get("contact_note"))[:NOTE_MAX_CHARS],
+        })
+    return pd.DataFrame(rows, columns=EXPORT_HEADERS)
+
+
 # --- PRIORITY NORMALIZATION ---
 
 def normalize_priority(val: Any) -> Optional[int]:
@@ -663,6 +770,8 @@ def parse_claims_table(df: pd.DataFrame) -> List[Dict[str, Any]]:
     zip_col = None
     full_addr_col = None
     priority_col = None
+    phone_col = None
+    email_col = None
 
     claim_pattern = re.compile(r'^[A-Za-z]{2,5}\d+[\-\_]?\d*$', re.IGNORECASE)
     
@@ -684,6 +793,14 @@ def parse_claims_table(df: pd.DataFrame) -> List[Dict[str, Any]]:
             break
 
     for low_c, orig_c in col_map.items():
+        if not email_col and ("email" in low_c or "e-mail" in low_c):
+            email_col = orig_c
+        elif not phone_col and any(k in low_c for k in ["phone", "mobile", "cell", "telephone", "contact number"]):
+            phone_col = orig_c
+
+    for low_c, orig_c in col_map.items():
+        if orig_c in (phone_col, email_col):
+            continue
         if not insured_col and any(k in low_c for k in ["insured", "customer", "policyholder", "client", "name"]):
             insured_col = orig_c
         elif not street_col and any(k in low_c for k in ["street", "address 1", "addr1", "address_line_1", "loss_street", "property_street", "location", "site"]):
@@ -746,6 +863,12 @@ def parse_claims_table(df: pd.DataFrame) -> List[Dict[str, Any]]:
             "end_time": None,
             "scheduled_date": "",
             "inspection_time": "",
+            "phone": normalize_phone(row[phone_col]) if phone_col else "",
+            "email": clean_text(row[email_col]) if email_col else "",
+            "activity_type": "",
+            "contact_note": "",
+            "first_booked_at": "",
+            "last_exported": "",
             "pre_lat": pre_lat,
             "pre_lon": pre_lon
         })
@@ -811,11 +934,18 @@ def build_merge_plan(existing_df: pd.DataFrame, new_raw_df: pd.DataFrame) -> Dic
 
     existing = {str(r["claim_id"]).strip(): r for _, r in existing_df.iterrows()}
 
-    new_rows, changes, unchanged = [], [], 0
+    new_rows, changes, unchanged, contact_fills = [], [], 0, []
     for cid, m in incoming.items():
         if cid not in existing:
             new_rows.append(m)
             continue
+        # Fill phone/email only where the rep hasn't entered one
+        fill = {}
+        for field in ("phone", "email"):
+            if _blank(existing[cid].get(field)) and m.get(field):
+                fill[field] = m[field]
+        if fill:
+            contact_fills.append({"claim_id": cid, **fill})
         old_addr = existing[cid].get("full_address", "")
         if _address_key(old_addr) != _address_key(m["full_address"]):
             changes.append({
@@ -829,7 +959,8 @@ def build_merge_plan(existing_df: pd.DataFrame, new_raw_df: pd.DataFrame) -> Dic
             unchanged += 1
 
     missing = [cid for cid in existing if cid not in incoming]
-    return {"new": new_rows, "address_changes": changes, "missing": missing, "unchanged": unchanged}
+    return {"new": new_rows, "address_changes": changes, "missing": missing, "unchanged": unchanged,
+            "contact_fills": contact_fills}
 
 
 # --- SLOT GENERATION & CONFLICT CHECKING ---
@@ -952,7 +1083,7 @@ def _slot_dict(s_dt: datetime, e_dt: datetime) -> Dict[str, Any]:
 def compute_openings(start_date: date, end_date: date, active_days: List[str], day_start_time: Any,
                      inspections_per_day: int, window_hrs: float, claims_df: Optional[pd.DataFrame],
                      now: Optional[datetime] = None, exclude_claim_id: Any = None,
-                     latest_end: Any = None) -> List[Dict[str, Any]]:
+                     latest_end: Any = None, duration_hrs: Optional[float] = None) -> List[Dict[str, Any]]:
     """
     Suggested openings: inside each free gap, back-to-back blocks of the default window
     length, starting at the earliest free time. Example: day 8:00-3:30, 2.5 h windows,
@@ -960,7 +1091,7 @@ def compute_openings(start_date: date, end_date: date, active_days: List[str], d
     Same shape as generate_available_slots, so the rest of the app can use either.
     """
     busy = get_busy_intervals(claims_df, exclude_claim_id)
-    duration = timedelta(hours=window_hrs)
+    duration = timedelta(hours=duration_hrs or window_hrs)
     openings = []
     day = start_date
     while day <= end_date:
@@ -1026,6 +1157,8 @@ def find_previous_stop(claims_df: pd.DataFrame, slot: Dict[str, Any]) -> Optiona
         (claims_df["status"] == "Scheduled") &
         (claims_df["scheduled_date"].astype(str) == slot["date_str"])
     ]
+    if "activity_type" in same_day.columns:   # live video inspections don't move the rep
+        same_day = same_day[~same_day["activity_type"].apply(is_video)]
     best_row, best_end = None, None
     for _, row in same_day.iterrows():
         c_end = parse_wallclock(row["end_time"])
@@ -1041,6 +1174,8 @@ def find_next_stop(claims_df: pd.DataFrame, slot: Dict[str, Any]) -> Optional[pd
         (claims_df["status"] == "Scheduled") &
         (claims_df["scheduled_date"].astype(str) == slot["date_str"])
     ]
+    if "activity_type" in same_day.columns:
+        same_day = same_day[~same_day["activity_type"].apply(is_video)]
     best_row, best_start = None, None
     for _, row in same_day.iterrows():
         c_start = parse_wallclock(row["start_time"])
@@ -1138,8 +1273,12 @@ def get_recommendations_for_slot(
 
     anchor_ok = pd.notna(anchor_lat) and pd.notna(anchor_lon)
     miles_list, mins_list = [], []
-    for _, row in candidates.iterrows():
-        if anchor_ok and pd.notna(row["lat"]) and pd.notna(row["lon"]):
+    video_flags = [is_video(v) for v in (candidates["activity_type"] if "activity_type" in candidates.columns
+                                         else [""] * len(candidates))]
+    for (_, row), video in zip(candidates.iterrows(), video_flags):
+        if video:
+            miles, mins = None, None  # live video: no drive
+        elif anchor_ok and pd.notna(row["lat"]) and pd.notna(row["lon"]):
             miles, mins = get_osrm_route(float(anchor_lat), float(anchor_lon), float(row["lat"]), float(row["lon"]))
         else:
             miles, mins = None, None  # no pin yet: listed after claims with drive times
@@ -1156,7 +1295,7 @@ def get_recommendations_for_slot(
         slot_end = parse_wallclock(slot["end"])
         gap_mins = ((next_info["start"] - slot_end).total_seconds() / 60) if next_info["start"] else None
         for (_, row), d1 in zip(candidates.iterrows(), mins_list):
-            if d1 is None:
+            if d1 is None:  # live video or no pin
                 detour_list.append(None); to_next_list.append(None); late_list.append(False)
                 continue
             _, d2 = get_osrm_route(float(row["lat"]), float(row["lon"]), next_info["lat"], next_info["lon"])
@@ -1171,6 +1310,7 @@ def get_recommendations_for_slot(
     candidates["drive_to_next_mins"] = to_next_list
     candidates["late_for_next"] = late_list
     candidates["anchor_type"] = anchor_info["type"]
+    candidates["is_video"] = video_flags
     candidates["rec_type"] = ["Reschedule" if s == "Scheduled" else "New" for s in candidates["status"]]
     candidates["current_slot"] = [
         format_slot_time(parse_wallclock(t)) if s == "Scheduled" else ""
@@ -1192,6 +1332,9 @@ def get_recommendations_for_slot(
         ]
     else:
         candidates["drive_sort_key"] = [float(m) if m is not None else float("inf") for m in mins_list]
+    # Live video claims fit any opening, so they list after on-site claims of the same
+    # rank (ahead of claims still missing a pin)
+    candidates["drive_sort_key"] = [1e8 if v else k for v, k in zip(video_flags, candidates["drive_sort_key"])]
     candidates = candidates.sort_values(
         by=["prio_sort_key", "drive_sort_key"], ascending=[True, True], kind="mergesort"
     ).drop(columns=["prio_sort_key", "drive_sort_key"])
@@ -1206,6 +1349,22 @@ def _ics_escape(text: Any) -> str:
     s = str(text) if text is not None else ""
     return (s.replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,")
              .replace("\r\n", "\\n").replace("\n", "\\n"))
+
+
+def _ics_body(row: pd.Series) -> str:
+    """
+    Labeled block for each appointment. Labels always appear (even when blank) in a
+    fixed order, so a bot can read them reliably. The note goes last since it can
+    run several lines. Email addresses and phone numbers are tappable on phones.
+    """
+    lines = [
+        "CLAIM DATA START",
+        f"Phone Number: {normalize_phone(row.get('phone'))}",
+        f"Email: {clean_text(row.get('email'))}",
+        f"Initial Contact Note: {clean_text(row.get('contact_note'))[:NOTE_MAX_CHARS]}",
+        "CLAIM DATA END",
+    ]
+    return "\n".join(lines)
 
 
 def export_claims_to_ics(claims_df: pd.DataFrame, tz_name: Optional[str]) -> str:
@@ -1245,9 +1404,9 @@ def export_claims_to_ics(claims_df: pd.DataFrame, tz_name: Optional[str]) -> str
             f"UID:claim-{_ics_escape(row['claim_id'])}@catscheduler.local",
             f"DTSTAMP:{dtstamp}",
             f"SEQUENCE:{sequence}",
-            f"SUMMARY:{_ics_escape('CAT Inspection - ' + str(row['claim_id']) + ' (' + str(row['insured_name']) + ')')}",
-            f"DESCRIPTION:{_ics_escape('Claim ID: ' + str(row['claim_id']) + chr(10) + 'Insured: ' + str(row['insured_name']))}",
-            f"LOCATION:{_ics_escape(row['full_address'])}",
+            f"SUMMARY:{_ics_escape(('CAT Live Video Inspection - ' if is_video(row.get('activity_type')) else 'CAT Inspection - ') + str(row['claim_id']) + ' (' + str(row['insured_name']) + ')')}",
+            f"DESCRIPTION:{_ics_escape(_ics_body(row))}",
+            f"LOCATION:{_ics_escape(('Live video: ' if is_video(row.get('activity_type')) else '') + str(row['full_address']))}",
             f"DTSTART:{fmt(s_dt)}",
             f"DTEND:{fmt(e_dt)}",
             "END:VEVENT"
