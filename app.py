@@ -1,4 +1,4 @@
-import html
+imimport html
 import math
 import calendar as pycal
 from collections import defaultdict
@@ -42,6 +42,10 @@ from engine import (
     split_12h,
     parse_date_time_12h,
     build_export_table,
+    plan_draft_schedule,
+    capacity_report,
+    best_spot_for_draft,
+    get_osrm_route,
     GEO_MANUAL,
     GEO_CONFIRMED,
     GEO_REP_VERIFIED,
@@ -66,6 +70,7 @@ RED = "#D63E2A"
 SCHEDULED_BLUE = "#2F6DB5"
 IGNORED_GRAY = "#94A3B8"
 ISSUE_ORANGE = "#F07C1B"
+DRAFT_BLUE = "#9DB4CC"
 
 # The theme is switched in the app menu (⋮ > Settings), using the two themes
 # defined in .streamlit/config.toml. Streamlit restyles its own widgets; this
@@ -248,6 +253,51 @@ def book_claim_into_slot(claim_mask, slot):
     st.session_state.claims_df.loc[claim_mask, "scheduled_date"] = slot["date_str"]
     st.session_state.claims_df.loc[claim_mask, "inspection_time"] = parse_wallclock(slot["start"]).strftime("%H:%M")
     st.session_state.editor_version += 1
+    displace_drafts(slot, booked_ids={str(c) for c in cdf.loc[claim_mask, "claim_id"]})
+
+
+def set_claim_times(cid, status, slot=None):
+    """Sets a claim's status and time (or clears the time when slot is None)."""
+    m = st.session_state.claims_df["claim_id"].astype(str) == str(cid)
+    st.session_state.claims_df.loc[m, "status"] = status
+    st.session_state.claims_df.loc[m, "start_time"] = slot["start"] if slot else None
+    st.session_state.claims_df.loc[m, "end_time"] = slot["end"] if slot else None
+    st.session_state.claims_df.loc[m, "scheduled_date"] = slot["date_str"] if slot else ""
+    st.session_state.claims_df.loc[m, "inspection_time"] = (
+        parse_wallclock(slot["start"]).strftime("%H:%M") if slot else "")
+
+
+def displace_drafts(slot, booked_ids):
+    """
+    A confirmed booking takes priority over drafts. Any draft overlapping the new time
+    moves to its best open spot (closest to that day's other stops), or back to
+    Unscheduled if nothing is open.
+    """
+    s0, s1 = parse_wallclock(slot["start"]), parse_wallclock(slot["end"])
+    cdf = st.session_state.claims_df
+    hit = [str(r["claim_id"]) for _, r in cdf[cdf["status"] == "Draft"].iterrows()
+           if str(r["claim_id"]) not in booked_ids and parse_wallclock(r["start_time"]) and parse_wallclock(r["end_time"])
+           and max(s0, parse_wallclock(r["start_time"])) < min(s1, parse_wallclock(r["end_time"]))]
+    notes = []
+    for cid in hit:
+        spot = best_spot_for_draft(st.session_state.claims_df, cid, schedule_settings, hotel_coords,
+                                   now_local, FILL_LATEST_FIRST)
+        if spot:
+            set_claim_times(cid, "Draft", spot)
+            notes.append(f"Draft {cid} moved to {fmt_dt(parse_wallclock(spot['start']))}.")
+        else:
+            set_claim_times(cid, "Unscheduled")
+            notes.append(f"Draft {cid} had no open spot left, so it's back to Unscheduled.")
+    if notes:
+        st.session_state["draft_notice"] = " ".join(notes)
+
+
+def confirm_draft(cid):
+    """Confirms a draft at its current time and records the initial contact."""
+    m = st.session_state.claims_df["claim_id"].astype(str) == str(cid)
+    row = st.session_state.claims_df[m].iloc[0]
+    book_claim_into_slot(m, {"start": row["start_time"], "end": row["end_time"], "date_str": row["scheduled_date"]})
+    st.toast(f"Confirmed {cid}")
 
 
 def save_manual_pin(claim_id, lat, lon):
@@ -307,12 +357,14 @@ def render_slot_picker(claim_id, claims_df, now, settings, current=None, default
     """
     cid = str(claim_id)
     S = settings
-    busy = get_busy_intervals(claims_df, exclude_claim_id=cid)
+    busy = get_busy_intervals(claims_df, exclude_claim_id=cid)              # confirmed: can't overlap
+    busy_all = get_busy_intervals(claims_df, exclude_claim_id=cid, include_drafts=True)
+    drafts_busy = [b for b in busy_all if b.get("draft")]                  # drafts: a booking replaces them
     length_hrs = float(default_hrs or S["window_hrs"])
     openings = order_openings(
         compute_openings(S["start_date"], S["end_date"], S["active_days"], S["day_start"],
                          S["per_day"], S["window_hrs"], claims_df, now=now, exclude_claim_id=cid,
-                         latest_end=S["latest_end"], duration_hrs=length_hrs),
+                         latest_end=S["latest_end"], duration_hrs=length_hrs, include_drafts=True),
         latest_days_first=S.get("latest_first", False)
     )
 
@@ -325,7 +377,7 @@ def render_slot_picker(claim_id, claims_df, now, settings, current=None, default
     while d <= S["end_date"]:
         if d.strftime("%a") in S["active_days"]:
             gaps_by_day[d.isoformat()] = compute_day_gaps(d, S["day_start"], S["per_day"], S["window_hrs"],
-                                                          busy, now, S["latest_end"])
+                                                          busy_all, now, S["latest_end"])
         d += timedelta(days=1)
     openings_by_day = defaultdict(list)
     for o in openings:
@@ -420,8 +472,9 @@ def render_slot_picker(claim_id, claims_df, now, settings, current=None, default
     ws, we = day_window(day_d, S["day_start"], S["per_day"], S["window_hrs"], S["latest_end"])
     st.markdown(f"**{day_d.strftime('%A, %b %d')}** ({tfmt(ws)} - {tfmt(we)} working hours)")
 
-    rows = [(b["start"], f"{tfmt(b['start'])} - {tfmt(b['end'])}", f"Booked: {b['label']}")
-            for b in busy if b["start"].date() == day_d]
+    rows = [(b["start"], f"{tfmt(b['start'])} - {tfmt(b['end'])}",
+             f"Draft (unconfirmed): {b['label']}" if b.get("draft") else f"Booked: {b['label']}")
+            for b in busy_all if b["start"].date() == day_d]
     if current and current[0] and current[0].date() == day_d:
         rows.append((current[0], f"{tfmt(current[0])} - {tfmt(current[1])}", "This claim's current time"))
     rows += [(a, f"{tfmt(a)} - {tfmt(b)}", "Open") for a, b in gaps_by_day[sel_day]]
@@ -493,6 +546,10 @@ def render_slot_picker(claim_id, claims_df, now, settings, current=None, default
 
     if start_dt < ws:
         st.caption(f"Starts before your usual {tfmt(ws)} day start.")
+    replaced = [b for b in drafts_busy if max(start_dt, b["start"]) < min(end_dt, b["end"])]
+    if replaced:
+        st.info("This replaces the draft for " + ", ".join(b["label"] for b in replaced) +
+                ". It will move to its best open spot when you book.")
     st.markdown(f"**Selected:** {start_dt.strftime('%a %b %d')}, {tfmt(start_dt)} - {tfmt(end_dt)}")
     return slot
 
@@ -671,8 +728,58 @@ schedule_settings = {
 }
 all_slots = order_openings(compute_openings(
     start_date, end_date, active_days, start_time_input, inspections_per_day, window_hrs,
-    st.session_state.claims_df, now=now_local, latest_end=latest_end_input
+    st.session_state.claims_df, now=now_local, latest_end=latest_end_input, include_drafts=True
 ), latest_days_first=FILL_LATEST_FIRST)
+
+# --- PLAN MY SCHEDULE ---
+st.sidebar.markdown("---")
+st.sidebar.subheader("Plan my schedule")
+if st.session_state.claims_df is None:
+    st.sidebar.caption("Import claims to build a draft schedule.")
+else:
+    _cdf = st.session_state.claims_df
+    _n_drafts = int((_cdf["status"] == "Draft").sum()) if "status" in _cdf.columns else 0
+    cap = capacity_report(_cdf, schedule_settings, now_local)
+    st.sidebar.caption(
+        "Builds draft appointments for your unscheduled claims, grouped by area and ordered as routes. "
+        "Confirmed appointments never move. Confirm each draft after the insured agrees."
+    )
+    if cap["shortfall"]:
+        msg = (f"**{cap['claims']} claims to place, but only {cap['openings']} openings fit your settings. "
+               f"{cap['shortfall']} claim(s) won't be scheduled.** To fit everyone, you could:\n")
+        msg += "\n".join(f"- {label}" + (f": +{extra} openings" if extra else "") for label, extra in cap["suggestions"])
+        msg += "\n\nIf you plan anyway, the highest-priority claims are placed first."
+        st.sidebar.warning(msg)
+    elif cap["claims"]:
+        st.sidebar.caption(f"{cap['claims']} claim(s) to place, {cap['openings']} openings available.")
+
+    p1, p2 = st.sidebar.columns(2)
+    plan_label = "Re-plan drafts" if _n_drafts else "Plan my schedule"
+    if p1.button(plan_label, type="primary", use_container_width=True, disabled=cap["claims"] == 0,
+                 help="Builds draft appointments for your unscheduled claims (and replaces current drafts). "
+                      "This can take up to a minute for large lists."):
+        bar = st.sidebar.progress(0.0, text="Starting...")
+        drafts, summary = plan_draft_schedule(_cdf, schedule_settings, hotel_coords, now_local,
+                                              latest_first=FILL_LATEST_FIRST,
+                                              progress=lambda f, t: bar.progress(min(max(f, 0.0), 1.0), text=t))
+        bar.empty()
+        for cid in _cdf.loc[_cdf["status"] == "Draft", "claim_id"].astype(str).tolist():
+            set_claim_times(cid, "Unscheduled")
+        for dft in drafts:
+            set_claim_times(dft["claim_id"], "Draft", {"start": dft["start"], "end": dft["end"],
+                                                       "date_str": dft["start"][:10]})
+        st.session_state["plan_summary"] = summary
+        st.session_state.editor_version += 1
+        st.session_state.map_nonce += 1
+        st.rerun()
+    if p2.button("Clear drafts", use_container_width=True, disabled=_n_drafts == 0,
+                 help="Removes all unconfirmed draft appointments. Confirmed ones stay."):
+        for cid in _cdf.loc[_cdf["status"] == "Draft", "claim_id"].astype(str).tolist():
+            set_claim_times(cid, "Unscheduled")
+        st.session_state.pop("plan_summary", None)
+        st.session_state.editor_version += 1
+        st.session_state.map_nonce += 1
+        st.rerun()
 
 # --- MAP TOOLS & SAVED PROGRESS ---
 st.sidebar.markdown("---")
@@ -924,6 +1031,7 @@ if st.session_state.claims_df is not None:
         ("Total claims", len(df), INK),
         ("Unscheduled", int((df["status"] == "Unscheduled").sum()), RED),
         ("Scheduled", scheduled_count, SCHEDULED_BLUE),
+        ("Drafts", int((df["status"] == "Draft").sum()), DRAFT_BLUE),
         ("Ignored", int((df["status"] == "Ignored").sum()), IGNORED_GRAY),
         ("Location issues", int(review_mask.sum()), ISSUE_ORANGE),
     ]
@@ -935,6 +1043,21 @@ if st.session_state.claims_df is not None:
         ) + "</div>",
         unsafe_allow_html=True
     )
+
+    summ = st.session_state.get("plan_summary")
+    if summ:
+        line = f"Drafted {summ['placed']} appointment(s) across {summ['days']} day(s)."
+        if summ["unplaced"]:
+            line += (f" {len(summ['unplaced'])} claim(s) didn't fit and stay Unscheduled: "
+                     + ", ".join(summ["unplaced"][:12]) + ("..." if len(summ["unplaced"]) > 12 else "") + ".")
+        line += " Confirm each draft after the insured agrees: select it in the calendar or under Manage a claim."
+        s1, s2 = st.columns([6, 1], vertical_alignment="center")
+        s1.success(line)
+        if s2.button("Dismiss", key="dismiss_plan"):
+            st.session_state.pop("plan_summary", None)
+            st.rerun()
+    if st.session_state.get("draft_notice"):
+        st.info(st.session_state.pop("draft_notice"))
 
     if review_mask.any():
         st.warning(f"{int(review_mask.sum())} claim(s) have an approximate or missing location. "
@@ -958,7 +1081,7 @@ if st.session_state.claims_df is not None:
     # CALENDAR
     # -----------------------------------------------------------------
     with tab_cal:
-        scheduled_claims = df[df["status"] == "Scheduled"].copy()
+        scheduled_claims = df[df["status"].isin(["Scheduled", "Draft"])].copy()
         scheduled_claims["_start_dt"] = [parse_wallclock(v) for v in scheduled_claims["start_time"]]
         scheduled_claims["_end_dt"] = [parse_wallclock(v) for v in scheduled_claims["end_time"]]
         # Boolean Series (not a plain list): with zero scheduled claims, an empty list
@@ -970,7 +1093,8 @@ if st.session_state.claims_df is not None:
         scheduled_claims = scheduled_claims.loc[has_times]
 
         # --- NEXT UP ---
-        is_upcoming = pd.Series([s > now_local for s in scheduled_claims["_start_dt"]],
+        is_upcoming = pd.Series([s > now_local and st_ == "Scheduled"
+                                 for s, st_ in zip(scheduled_claims["_start_dt"], scheduled_claims["status"])],
                                 index=scheduled_claims.index, dtype=bool)
         upcoming = scheduled_claims.loc[is_upcoming]
         upcoming = upcoming.sort_values("_start_dt") if not upcoming.empty else upcoming
@@ -991,6 +1115,16 @@ if st.session_state.claims_df is not None:
 
         # --- EVENTS: past = hatched, next = amber, others = blue ---
         # Past blocks stay draggable in case the calendar wasn't kept up to date.
+        # Drive time from each draft to the next on-site stop that day (a guide, not a rule)
+        drive_next = {}
+        if not scheduled_claims.empty:
+            for _day, grp in scheduled_claims.groupby(scheduled_claims["_start_dt"].apply(lambda x: x.date())):
+                stops = [r for _, r in grp.sort_values("_start_dt").iterrows()
+                         if not is_video(r.get("activity_type")) and pd.notna(r["lat"]) and pd.notna(r["lon"])]
+                for a, b in zip(stops, stops[1:]):
+                    drive_next[str(a["claim_id"])] = get_osrm_route(float(a["lat"]), float(a["lon"]),
+                                                                    float(b["lat"]), float(b["lon"]))[1]
+
         calendar_events = []
         for _, row in scheduled_claims.iterrows():
             cid = str(row["claim_id"])
@@ -1002,7 +1136,16 @@ if st.session_state.claims_df is not None:
                 # Inspections can't be dragged or resized over each other
                 "overlap": False,
             }
-            if row["_end_dt"] <= now_local:
+            if row["status"] == "Draft":
+                nxt_txt = f" · {drive_next[cid]} min to next" if cid in drive_next else ""
+                event.update({
+                    "title": f"Draft · [{cid}] {row['insured_name']}{nxt_txt}",
+                    "classNames": ["draft-event"],
+                    "backgroundColor": "#2A3A4C" if CONSOLE else "#E6EEF8",
+                    "borderColor": DRAFT_BLUE if CONSOLE else SCHEDULED_BLUE,
+                    "textColor": "#C9D6E4" if CONSOLE else "#1D3A5F",
+                })
+            elif row["_end_dt"] <= now_local:
                 event.update({
                     "classNames": ["past-event"],
                     "backgroundColor": "#3A4654" if CONSOLE else "#A3AFBF",
@@ -1149,6 +1292,7 @@ if st.session_state.claims_df is not None:
             }}
             .fc-event.past-event .fc-event-title {{ text-decoration: line-through; }}
             .fc-event.next-event {{ box-shadow: 0 0 0 3px rgba(232, 163, 23, 0.45); font-weight: 600; }}
+            .fc-event.draft-event {{ border-style: dashed !important; border-width: 2px !important; font-style: italic; }}
         """
         if CONSOLE:
             calendar_css += f"""
@@ -1197,17 +1341,22 @@ if st.session_state.claims_df is not None:
         clicked = (cal_event.get("eventClick") or {}).get("event") or {}
         clicked_id = str(clicked.get("id") or "")
         if clicked_id:
-            c_rows = df[(df["claim_id"].astype(str) == clicked_id) & (df["status"] == "Scheduled")]
+            c_rows = df[(df["claim_id"].astype(str) == clicked_id) & (df["status"].isin(["Scheduled", "Draft"]))]
             if not c_rows.empty:
                 c_row = c_rows.iloc[0]
                 with st.container(border=True):
                     st.markdown(f"""
 <div class="cat-card selected">
-  <div class="cat-card-kicker">Selected inspection</div>
+  <div class="cat-card-kicker">{'Draft appointment (not confirmed yet)' if c_row['status'] == 'Draft' else 'Selected inspection'}</div>
   <div class="cat-card-title">{esc(c_row['claim_id'])} - {esc(c_row['insured_name'])}</div>
   <div class="cat-card-sub">{fmt_dt(parse_wallclock(c_row['start_time']))}<br>{esc(c_row['full_address'])}</div>
 </div>""", unsafe_allow_html=True)
                     render_nav_buttons(c_row["full_address"], c_row["lat"], c_row["lon"], c_row["geo_quality"])
+                    if c_row["status"] == "Draft":
+                        if st.button("✓ Confirm this time", key=f"cal_confirm_{clicked_id}", type="primary",
+                                     help="The insured agreed. Confirms the appointment and records the initial contact."):
+                            confirm_draft(clicked_id)
+                            st.rerun()
                     if st.button("Manage this claim", key=f"cal_manage_{clicked_id}"):
                         st.session_state["selected_claim_id"] = clicked_id
                         st.rerun()
@@ -1313,7 +1462,7 @@ if st.session_state.claims_df is not None:
             layer.add_to(m)
 
         day_colors = ["blue", "green", "purple", "darkblue", "darkred", "cadetblue", "darkgreen", "pink"]
-        scheduled_dates = sorted([d for d in mdf[mdf["status"] == "Scheduled"]["scheduled_date"].unique() if d])
+        scheduled_dates = sorted([d for d in mdf[mdf["status"].isin(["Scheduled", "Draft"])]["scheduled_date"].unique() if d])
         date_color_map = {d: day_colors[i % len(day_colors)] for i, d in enumerate(scheduled_dates)}
 
         bounds = []
@@ -1338,6 +1487,7 @@ if st.session_state.claims_df is not None:
             else:
                 marker_color = date_color_map.get(row.get("scheduled_date"), "blue")
                 icon_type = "exclamation-sign" if needs_review else (
+                    "hourglass" if row["status"] == "Draft" else
                     "facetime-video" if is_video(row.get("activity_type")) else "ok-sign")
 
             nav = build_navigation_links(row["full_address"], lat, lon, prefer_coords=(row["geo_quality"] in GEO_REP_VERIFIED))
@@ -1395,7 +1545,8 @@ if st.session_state.claims_df is not None:
             map_state = st_folium(m, width=1100, height=540, key=map_key,
                                   returned_objects=["last_clicked"]) or {}
 
-        st.caption("Red pins are unscheduled. Scheduled pins are colored by day, with a check mark. "
+        st.caption("Red pins are unscheduled. Scheduled pins are colored by day, with a check mark "
+                   "(an hourglass for drafts not confirmed yet). "
                    "A **!** means the location is approximate and should be checked.")
         if hidden_pins:
             st.caption(f"{hidden_pins} pin(s) far from the rest are outside this view. Zoom out to see them.")
@@ -1454,7 +1605,8 @@ if st.session_state.claims_df is not None:
         if "export_ids" not in st.session_state:
             st.session_state.export_ids = set()
 
-        show_status = st.multiselect("Show statuses", ["Unscheduled", "Scheduled", "Ignored"], default=["Unscheduled", "Scheduled"])
+        show_status = st.multiselect("Show statuses", ["Unscheduled", "Draft", "Scheduled", "Ignored"],
+                                     default=["Unscheduled", "Draft", "Scheduled"])
         view = df[df["status"].isin(show_status)]
 
         # Table shown to the rep: friendly columns, using the claim platform's header names
@@ -1504,8 +1656,9 @@ if st.session_state.claims_df is not None:
                 "Priority": st.column_config.NumberColumn("Priority", help="1 = highest. Leave blank for unranked claims.",
                                                           min_value=1, step=1, format="%d"),
                 "Status": st.column_config.SelectboxColumn(
-                    "Status", options=["Unscheduled", "Scheduled", "Ignored"], required=True,
-                    help="Schedule a claim from Manage a claim, so it gets a real time."),
+                    "Status", options=["Unscheduled", "Draft", "Scheduled", "Ignored"], required=True,
+                    help="Schedule a claim from Manage a claim, so it gets a real time. "
+                         "Changing a Draft to Scheduled confirms it."),
                 "Type of Contact": st.column_config.TextColumn(
                     "Type of Contact", help="Initial contact, once a contact date and time are recorded."),
                 "Date Contact Completed": st.column_config.TextColumn(
@@ -1550,7 +1703,10 @@ if st.session_state.claims_df is not None:
                     cdf.at[row_idx, "scheduled_date"] = ""
                     cdf.at[row_idx, "inspection_time"] = ""
                     changes_made = True
-                elif new["Status"] == "Scheduled":
+                elif new["Status"] == "Scheduled" and old["Status"] == "Draft":
+                    confirm_draft(cid)   # confirms at the drafted time, records initial contact
+                    changes_made = True
+                else:
                     blocked_claims.append(cid)
 
             for col, field, fix in [("Phone Number", "phone", normalize_phone),
@@ -1714,6 +1870,29 @@ if st.session_state.claims_df is not None:
                         st.session_state.claims_df.loc[claim_mask, "end_time"] = None
                         st.session_state.claims_df.loc[claim_mask, "scheduled_date"] = ""
                         st.session_state.claims_df.loc[claim_mask, "inspection_time"] = ""
+                        st.session_state.editor_version += 1
+                        st.rerun()
+
+                elif current_claim["status"] == "Draft":
+                    d_start, d_end = parse_wallclock(current_claim["start_time"]), parse_wallclock(current_claim["end_time"])
+                    if d_start:
+                        selected_target_date_str = d_start.strftime("%Y-%m-%d")
+                    st.markdown(f"**Draft:** {fmt_dt(d_start)} to {d_end.strftime('%I:%M %p').lstrip('0') if d_end else ''}, "
+                                "not confirmed yet")
+                    if st.button("✓ Confirm this time", type="primary", key=f"confirm_{selected_claim_id}",
+                                 help="The insured agreed. Confirms the appointment and records the initial contact."):
+                        confirm_draft(selected_claim_id)
+                        st.rerun()
+                    st.caption("Insured wants a different time? Pick it below, then confirm.")
+                    alt_slot = render_slot_picker(
+                        selected_claim_id, st.session_state.claims_df, now_local, schedule_settings,
+                        current=(d_start, d_end), default_hrs=claim_length
+                    )
+                    if alt_slot and st.button("Confirm at this time", key=f"confirm_alt_{selected_claim_id}"):
+                        book_claim_into_slot(claim_mask, alt_slot)
+                        st.rerun()
+                    if st.button("Send back to Unscheduled", key=f"undraft_{selected_claim_id}"):
+                        set_claim_times(selected_claim_id, "Unscheduled")
                         st.session_state.editor_version += 1
                         st.rerun()
 
