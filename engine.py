@@ -648,7 +648,7 @@ def get_osrm_route(start_lat: float, start_lon: float, end_lat: float, end_lon: 
 
 # --- TABLE INGESTION & PARSING ---
 
-def process_imported_table(df: pd.DataFrame) -> pd.DataFrame:
+def parse_claims_table(df: pd.DataFrame) -> List[Dict[str, Any]]:
     """
     Processes imported CSV/Excel dataframe by detecting formatted claim IDs,
     insured names, full addresses, and priority ranks (leaving blank if unspecified).
@@ -750,6 +750,11 @@ def process_imported_table(df: pd.DataFrame) -> pd.DataFrame:
             "pre_lon": pre_lon
         })
 
+    return metadata
+
+
+def geocode_claim_rows(metadata: List[Dict[str, Any]]) -> pd.DataFrame:
+    """Looks up locations for parsed claim rows (skipping rows with imported lat/lon)."""
     addrs_to_geocode = [
         (m["full_address"], m["state"]) for m in metadata if m["pre_lat"] is None
     ]
@@ -773,6 +778,58 @@ def process_imported_table(df: pd.DataFrame) -> pd.DataFrame:
         processed_rows.append(row_dict)
 
     return pd.DataFrame(processed_rows)
+
+
+def process_imported_table(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Processes an imported CSV/Excel claims list: detects claim IDs, insured names,
+    addresses, and priority ranks, then looks up each location.
+    """
+    return geocode_claim_rows(parse_claims_table(df))
+
+
+# --- UPDATED CLAIMS LISTS ---
+
+def _address_key(address: Any) -> str:
+    """Comparable form of an address: ignores case, punctuation, spacing, and unit numbers."""
+    return re.sub(r"[^A-Z0-9]", "", clean_address_for_geocoding(address).upper())
+
+
+def build_merge_plan(existing_df: pd.DataFrame, new_raw_df: pd.DataFrame) -> Dict[str, Any]:
+    """
+    Compares an updated claims list to the claims already loaded, by claim number.
+    Nothing is changed here. Returns:
+      new:             parsed rows for claims not loaded yet (to add, with lookups)
+      address_changes: [{claim_id, insured_name, old_address, new_address, new_state}]
+      missing:         [claim_id, ...] loaded claims that aren't in the new list
+      unchanged:       count of claims in both lists with the same address
+    """
+    parsed = parse_claims_table(new_raw_df)
+    incoming: Dict[str, Dict[str, Any]] = {}
+    for m in parsed:
+        incoming.setdefault(str(m["claim_id"]).strip(), m)   # first row wins on duplicates
+
+    existing = {str(r["claim_id"]).strip(): r for _, r in existing_df.iterrows()}
+
+    new_rows, changes, unchanged = [], [], 0
+    for cid, m in incoming.items():
+        if cid not in existing:
+            new_rows.append(m)
+            continue
+        old_addr = existing[cid].get("full_address", "")
+        if _address_key(old_addr) != _address_key(m["full_address"]):
+            changes.append({
+                "claim_id": cid,
+                "insured_name": existing[cid].get("insured_name", ""),
+                "old_address": old_addr,
+                "new_address": m["full_address"],
+                "new_state": m.get("state", ""),
+            })
+        else:
+            unchanged += 1
+
+    missing = [cid for cid in existing if cid not in incoming]
+    return {"new": new_rows, "address_changes": changes, "missing": missing, "unchanged": unchanged}
 
 
 # --- SLOT GENERATION & CONFLICT CHECKING ---
