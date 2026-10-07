@@ -642,11 +642,8 @@ if saved_file is not None:
 save_slot = sb.empty()   # the Save button is drawn at the end of the run, so it saves the latest changes
 
 # --- DEPLOYMENT PARAMETERS (deployment + daily schedule) ---
-sb.subheader("Deployment parameters")
-dep_summary = sb.empty()
-day_summary = sb.empty()
 _times30 = time_options(30)
-with sb.expander("Edit deployment parameters", expanded=not st.session_state.get("hotel_address", "").strip()):
+with sb.expander("Deployment parameters", expanded=not st.session_state.get("hotel_address", "").strip()):
     hotel_address = st.text_input(
         "Hotel base location", value="", key="hotel_address",
         placeholder="Street, city, state, ZIP",
@@ -716,22 +713,9 @@ except Exception:
     now_local = datetime.now()
     ics_tz = None
 
-_day_order = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-_days_txt = ", ".join(d for d in _day_order if d in active_days) or "no inspection days"
-if active_days == ["Mon", "Tue", "Wed", "Thu", "Fri"]:
-    _days_txt = "Mon to Fri"
-dep_summary.caption(
-    f"{start_date.strftime('%b %d')} to {end_date.strftime('%b %d')}, {_days_txt}, {tz_display} time"
-    + ("" if hotel_address.strip() else ". **Hotel not set.**")
-)
-
-day_summary.caption(f"Starts {fmt_time12(start_time_input)}, {inspections_per_day} x {window_hrs:g}-hour windows, "
-                    f"suggestions end by {fmt_time12(latest_end_input)}")
 
 # --- PREFERENCES ---
-sb.subheader("Preferences")
-pref_summary = sb.empty()
-with sb.expander("Edit preferences", expanded=False):
+with sb.expander("Preferences", expanded=False):
     rec_mode_label = st.radio(
         "Recommendations",
         ["Closest to previous stop (faster)", "Least added driving (smarter, may take longer)"],
@@ -750,8 +734,6 @@ with sb.expander("Edit preferences", expanded=False):
     )
 REC_MODE = "detour" if rec_mode_label.startswith("Least") else "fast"
 FILL_LATEST_FIRST = fill_label.startswith("End")
-pref_summary.caption(f"{'Least added driving' if REC_MODE == 'detour' else 'Closest to previous stop'}, "
-                     f"filling from the {'end' if FILL_LATEST_FIRST else 'start'} of the deployment")
 
 # Openings come from the real bookings: any free time inside each day's working
 # window, in blocks of the default window length starting at the earliest free time.
@@ -765,26 +747,6 @@ all_slots = order_openings(compute_openings(
     start_date, end_date, active_days, start_time_input, inspections_per_day, window_hrs,
     st.session_state.claims_df, now=now_local, latest_end=latest_end_input, include_drafts=True
 ), latest_days_first=FILL_LATEST_FIRST)
-
-# --- TOOLS ---
-if st.session_state.claims_df is not None:
-    sb.subheader("Tools")
-    if sb.button("🔄 Re-check all addresses", type="secondary",
-                 help="Looks up every address again. Pins you placed or confirmed are kept."):
-        cdf = st.session_state.claims_df
-        if "geo_quality" not in cdf.columns:
-            cdf["geo_quality"] = GEO_UNKNOWN
-        redo_idx = cdf.index[~cdf["geo_quality"].isin(GEO_REP_VERIFIED)].tolist()
-        with st.spinner("Re-checking addresses..."):
-            addrs = [(cdf.at[i, "full_address"], cdf.at[i, "state"] if "state" in cdf.columns else "") for i in redo_idx]
-            results = batch_geocode_addresses(addrs)
-            for i, (lat, lon, quality) in zip(redo_idx, results):
-                cdf.at[i, "lat"] = lat
-                cdf.at[i, "lon"] = lon
-                cdf.at[i, "geo_quality"] = quality
-        st.session_state.map_nonce += 1
-        st.rerun()
-
 
 # =====================================================================
 # HEADER
@@ -1018,8 +980,29 @@ if st.session_state.claims_df is not None:
             def start_fixing():
                 st.session_state["pin_fix_mode"] = True
                 st.session_state["main_view"] = "Map"
-            st.button("📍 Fix locations now", type="primary", on_click=start_fixing,
-                      help="Opens the map below with Fix pin locations turned on, starting with these claims.")
+            fb1, fb2 = st.columns([1.3, 1])
+            fb1.button("📍 Fix locations now", type="primary", on_click=start_fixing, use_container_width=True,
+                       help="Opens the map below with Fix pin locations turned on, starting with these claims.")
+            if fb2.button("Look up again", use_container_width=True,
+                          help="Runs the address lookup again for these claims. Helps when the lookup service "
+                               "was slow or down during import. Pins you placed or confirmed aren't touched."):
+                cdf = st.session_state.claims_df
+                redo_idx = cdf.index[cdf["geo_quality"].isin(GEO_NEEDS_REVIEW)].tolist()
+                with st.spinner(f"Looking up {len(redo_idx)} address(es) again..."):
+                    addrs = [(cdf.at[i, "full_address"], cdf.at[i, "state"] if "state" in cdf.columns else "")
+                             for i in redo_idx]
+                    results = batch_geocode_addresses(addrs)
+                improved = 0
+                for i, (lat, lon, quality) in zip(redo_idx, results):
+                    if quality not in GEO_NEEDS_REVIEW:
+                        improved += 1
+                    if lat is not None:
+                        cdf.at[i, "lat"], cdf.at[i, "lon"], cdf.at[i, "geo_quality"] = lat, lon, quality
+                st.session_state.map_nonce += 1
+                st.session_state.editor_version += 1
+                st.toast(f"Found better locations for {improved} claim(s)." if improved else
+                         "No better matches found. Fix these on the map.")
+                st.rerun()
 
     if st.session_state.get("draft_notice"):
         st.info(st.session_state.pop("draft_notice"))
