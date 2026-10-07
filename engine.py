@@ -5,7 +5,8 @@ import requests
 import pandas as pd
 import numpy as np
 import streamlit as st
-from collections import Counter
+import math
+from collections import Counter, defaultdict
 from datetime import datetime, date, timedelta, timezone
 from typing import List, Dict, Any, Optional, Tuple
 from urllib.parse import quote
@@ -1028,18 +1029,25 @@ def day_window(day: date, day_start_time: Any, inspections_per_day: int, window_
     return start, max(start, end)
 
 
-def get_busy_intervals(claims_df: Optional[pd.DataFrame], exclude_claim_id: Any = None) -> List[Dict[str, Any]]:
-    """Booked inspections as {start, end, claim_id, label}, optionally leaving one claim out."""
+def get_busy_intervals(claims_df: Optional[pd.DataFrame], exclude_claim_id: Any = None,
+                       include_drafts: bool = False) -> List[Dict[str, Any]]:
+    """
+    Booked inspections as {start, end, claim_id, label, draft}, optionally leaving one
+    claim out. Confirmed inspections only, unless include_drafts (unconfirmed drafts
+    hold their time for suggestions, but a confirmed booking can replace them).
+    """
     busy = []
     if claims_df is None or claims_df.empty or "status" not in claims_df.columns:
         return busy
-    for _, r in claims_df[claims_df["status"] == "Scheduled"].iterrows():
+    statuses = ["Scheduled", "Draft"] if include_drafts else ["Scheduled"]
+    for _, r in claims_df[claims_df["status"].isin(statuses)].iterrows():
         if exclude_claim_id is not None and str(r["claim_id"]) == str(exclude_claim_id):
             continue
         s, e = parse_wallclock(r.get("start_time")), parse_wallclock(r.get("end_time"))
         if s and e and e > s:
             busy.append({"start": s, "end": e, "claim_id": str(r["claim_id"]),
-                         "label": f"{r['claim_id']} - {r.get('insured_name', '')}"})
+                         "label": f"{r['claim_id']} - {r.get('insured_name', '')}",
+                         "draft": r["status"] == "Draft"})
     return busy
 
 
@@ -1083,14 +1091,15 @@ def _slot_dict(s_dt: datetime, e_dt: datetime) -> Dict[str, Any]:
 def compute_openings(start_date: date, end_date: date, active_days: List[str], day_start_time: Any,
                      inspections_per_day: int, window_hrs: float, claims_df: Optional[pd.DataFrame],
                      now: Optional[datetime] = None, exclude_claim_id: Any = None,
-                     latest_end: Any = None, duration_hrs: Optional[float] = None) -> List[Dict[str, Any]]:
+                     latest_end: Any = None, duration_hrs: Optional[float] = None,
+                     include_drafts: bool = False) -> List[Dict[str, Any]]:
     """
     Suggested openings: inside each free gap, back-to-back blocks of the default window
     length, starting at the earliest free time. Example: day 8:00-3:30, 2.5 h windows,
     an inspection shortened to 8:00-9:30 -> openings at 9:30 and 12:00.
     Same shape as generate_available_slots, so the rest of the app can use either.
     """
-    busy = get_busy_intervals(claims_df, exclude_claim_id)
+    busy = get_busy_intervals(claims_df, exclude_claim_id, include_drafts)
     duration = timedelta(hours=duration_hrs or window_hrs)
     openings = []
     day = start_date
@@ -1145,6 +1154,277 @@ def is_slot_conflicting(slot: Dict[str, Any], claims_df: pd.DataFrame, current_c
     return False
 
 
+# --- DRAFT SCHEDULE PLANNER ---
+# Builds unconfirmed "Draft" appointments for unscheduled claims, around every
+# confirmed appointment. Confirmed appointments never move. Running it again
+# replaces only drafts.
+
+_WEEKDAY_PLURAL = {"Mon": "Mondays", "Tue": "Tuesdays", "Wed": "Wednesdays", "Thu": "Thursdays",
+                   "Fri": "Fridays", "Sat": "Saturdays", "Sun": "Sundays"}
+
+
+def _miles(a: Tuple[float, float], b: Tuple[float, float]) -> float:
+    """Straight-line distance in miles (fast; used for grouping)."""
+    lat1, lon1, lat2, lon2 = map(math.radians, (a[0], a[1], b[0], b[1]))
+    h = math.sin((lat2 - lat1) / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin((lon2 - lon1) / 2) ** 2
+    return 3958.8 * 2 * math.asin(min(1.0, math.sqrt(h)))
+
+
+def _loc(row: pd.Series) -> Optional[Tuple[float, float]]:
+    try:
+        if pd.notna(row["lat"]) and pd.notna(row["lon"]):
+            return float(row["lat"]), float(row["lon"])
+    except (KeyError, TypeError, ValueError):
+        pass
+    return None
+
+
+def _inspection_days(S: Dict[str, Any], active_days: Optional[List[str]] = None,
+                     end_date: Optional[date] = None) -> List[date]:
+    days, d = [], S["start_date"]
+    end_date = end_date or S["end_date"]
+    active = active_days if active_days is not None else S["active_days"]
+    while d <= end_date:
+        if _DAY_ABBR[d.weekday()] in active:
+            days.append(d)
+        d += timedelta(days=1)
+    return days
+
+
+def _count_openings(claims_df: pd.DataFrame, S: Dict[str, Any], now: Optional[datetime], **overrides) -> int:
+    p = dict(S, **overrides)
+    return len(compute_openings(p["start_date"], p["end_date"], p["active_days"], p["day_start"],
+                                p["per_day"], p["window_hrs"], claims_df, now=now,
+                                latest_end=p.get("latest_end")))
+
+
+def plan_candidates(claims_df: pd.DataFrame) -> pd.DataFrame:
+    """Claims the planner places: unscheduled ones, plus current drafts (they get re-planned)."""
+    return claims_df[claims_df["status"].isin(["Unscheduled", "Draft"])]
+
+
+def capacity_report(claims_df: pd.DataFrame, S: Dict[str, Any], now: Optional[datetime]) -> Dict[str, Any]:
+    """
+    Compares claims to place with the openings your settings allow (around confirmed
+    appointments). When they don't fit, lists specific fixes with the openings each adds.
+    """
+    n_claims = len(plan_candidates(claims_df))
+    base = _count_openings(claims_df, S, now)
+    report = {"claims": n_claims, "openings": base, "shortfall": max(0, n_claims - base), "suggestions": []}
+    if report["shortfall"] == 0:
+        return report
+    need = report["shortfall"]
+    sugg = []
+
+    # Add a day of the week that isn't an inspection day yet
+    for wd in ["Sat", "Sun", "Mon", "Tue", "Wed", "Thu", "Fri"]:
+        if wd not in S["active_days"]:
+            extra = _count_openings(claims_df, S, now, active_days=[wd])
+            if extra:
+                sugg.append((f"Add {_WEEKDAY_PLURAL[wd]}", extra))
+
+    # Extend the end date
+    for k in range(1, 22):
+        new_end = S["end_date"] + timedelta(days=k)
+        extra = _count_openings(claims_df, S, now, end_date=new_end) - base
+        if extra >= need:
+            sugg.append((f"Extend the end date by {k} day{'s' if k > 1 else ''} (to {new_end.strftime('%b %d')})", extra))
+            break
+
+    # One more inspection per day (still within the latest-end limit)
+    extra = _count_openings(claims_df, S, now, per_day=S["per_day"] + 1) - base
+    if extra > 0:
+        sugg.append(("Add 1 inspection per day", extra))
+
+    # Shorter windows in the same working hours
+    hours = S["per_day"] * S["window_hrs"]
+    best = None
+    w = S["window_hrs"] - 0.25
+    while w >= 1.5 - 1e-9:   # shorter than 1.5 hours isn't realistic for an on-site inspection
+        per = int(math.floor(hours / w + 1e-9))
+        if per > S["per_day"]:
+            extra = _count_openings(claims_df, S, now, per_day=per, window_hrs=w) - base
+            if extra > 0 and (best is None or extra > best[2]):
+                best = (w, per, extra)
+            if extra >= need:
+                best = (w, per, extra)
+                break
+        w -= 0.25
+    if best:
+        sugg.append((f"Shorten windows to {best[0]:g} hours ({best[1]} per day in the same working hours)", best[2]))
+
+    sugg.append(("Switch some claims to live video, which needs 1 hour each", None))
+    report["suggestions"] = sugg
+    return report
+
+
+def plan_draft_schedule(claims_df: pd.DataFrame, S: Dict[str, Any], hotel_coords: Optional[Tuple[float, float]],
+                        now: Optional[datetime], latest_first: bool = False, progress=None
+                        ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Returns (drafts, summary). drafts: [{claim_id, start, end}] for claims to mark as Draft.
+
+    1. Openings: free time on each inspection day around CONFIRMED appointments only
+       (current drafts are being replaced), in blocks of the window length.
+    2. Ranked claims first: priority 1, 2, 3... go to the earliest days in the fill order.
+    3. Unranked on-site claims are grouped by area, one day at a time: each day grows
+       around its confirmed stops (or a new seed claim) by adding the nearest claim.
+    4. Live video claims and claims without a pin fill the remaining openings.
+    5. Each day is ordered as a route: every opening gets the claim with the shortest
+       drive from the previous stop (or the hotel), using real drive times.
+    """
+    def step(frac, text):
+        if progress:
+            progress(frac, text)
+
+    step(0.05, "Finding open time around your confirmed appointments...")
+    confirmed = get_busy_intervals(claims_df)
+    days = _inspection_days(S)
+    if latest_first:
+        days = list(reversed(days))
+
+    window = timedelta(hours=S["window_hrs"])
+    day_slots: Dict[date, List[datetime]] = {}
+    for d in days:
+        slots = []
+        for g0, g1 in compute_day_gaps(d, S["day_start"], S["per_day"], S["window_hrs"], confirmed, now, S.get("latest_end")):
+            t = g0
+            while t + window <= g1:
+                slots.append(t)
+                t += window
+        day_slots[d] = slots
+
+    # Confirmed on-site stops per day, as routing anchors
+    anchors: Dict[date, List[Tuple[datetime, datetime, Tuple[float, float]]]] = defaultdict(list)
+    for _, r in claims_df[claims_df["status"] == "Scheduled"].iterrows():
+        s, e_ = parse_wallclock(r.get("start_time")), parse_wallclock(r.get("end_time"))
+        loc = _loc(r)
+        if s and e_ and loc and not is_video(r.get("activity_type")):
+            anchors[s.date()].append((s, e_, loc))
+
+    step(0.2, "Grouping claims by area...")
+    items = []
+    for _, r in plan_candidates(claims_df).iterrows():
+        rank = normalize_priority(r.get("priority"))
+        items.append({"cid": str(r["claim_id"]), "rank": rank if rank is not None else math.inf,
+                      "video": is_video(r.get("activity_type")), "loc": _loc(r)})
+
+    cap = {d: len(day_slots[d]) for d in days}
+    members: Dict[date, List[Dict[str, Any]]] = {d: [] for d in days}
+
+    def place(it):
+        for d in days:
+            if cap[d] > 0:
+                members[d].append(it)
+                cap[d] -= 1
+                return True
+        return False
+
+    ranked = sorted([i for i in items if i["rank"] != math.inf], key=lambda i: i["rank"])
+    unranked_site = [i for i in items if i["rank"] == math.inf and not i["video"] and i["loc"]]
+    leftovers = [i for i in items if i["rank"] == math.inf and (i["video"] or not i["loc"])]
+    unplaced = [i for i in ranked if not place(i)]
+
+    # Area grouping for unranked on-site claims
+    pool = list(unranked_site)
+    center = hotel_coords
+    if not center and pool:
+        center = (sum(i["loc"][0] for i in pool) / len(pool), sum(i["loc"][1] for i in pool) / len(pool))
+    for d in days:
+        while cap[d] > 0 and pool:
+            pts = [m["loc"] for m in members[d] if m["loc"] and not m["video"]] + [a[2] for a in anchors[d]]
+            if pts:
+                c = (sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts))
+                pick = min(pool, key=lambda i: _miles(i["loc"], c))
+            else:
+                # Start a new area: sweep around the hotel, so each new day picks up where the last left off
+                pick = min(pool, key=lambda i: math.atan2(i["loc"][0] - center[0], i["loc"][1] - center[1]))
+            members[d].append(pick)
+            cap[d] -= 1
+            pool.remove(pick)
+    unplaced += pool
+    unplaced += [i for i in leftovers if not place(i)]
+
+    # Order each day as a route and assign times
+    step(0.45, "Ordering each day and checking drive times...")
+    drafts = []
+    for n, d in enumerate(days, start=1):
+        step(0.45 + 0.5 * n / max(len(days), 1), f"Ordering {d.strftime('%a %b %d')}...")
+        todo_site = [m for m in members[d] if m["loc"] and not m["video"]]
+        todo_other = [m for m in members[d] if not (m["loc"] and not m["video"])]
+        for t in day_slots[d]:
+            if not todo_site and not todo_other:
+                break
+            if todo_site:
+                prev = None
+                past_stops = [a for a in anchors[d] if a[1] <= t]
+                past_drafts = [x for x in drafts if x["_date"] == d and x["_end"] <= t and x["_loc"]]
+                cands = [(a[1], a[2]) for a in past_stops] + [(x["_end"], x["_loc"]) for x in past_drafts]
+                if cands:
+                    prev = max(cands, key=lambda c: c[0])[1]
+                elif hotel_coords:
+                    prev = hotel_coords
+                if prev:
+                    pick = min(todo_site, key=lambda m: get_osrm_route(prev[0], prev[1], m["loc"][0], m["loc"][1])[1])
+                else:
+                    pick = todo_site[0]
+                todo_site.remove(pick)
+            else:
+                pick = todo_other.pop(0)
+            end_t = t + (timedelta(hours=VIDEO_DEFAULT_HRS) if pick["video"] else window)
+            drafts.append({"claim_id": pick["cid"], "start": t.isoformat(), "end": end_t.isoformat(),
+                           "_date": d, "_end": end_t, "_loc": None if pick["video"] else pick["loc"]})
+
+    step(1.0, "Done")
+    days_used = len({x["_date"] for x in drafts})
+    for x in drafts:
+        for k in ("_date", "_end", "_loc"):
+            x.pop(k, None)
+    summary = {"placed": len(drafts), "days": days_used, "unplaced": [i["cid"] for i in unplaced],
+               "openings": sum(len(s) for s in day_slots.values()), "claims": len(items)}
+    return drafts, summary
+
+
+def best_spot_for_draft(claims_df: pd.DataFrame, claim_id: Any, S: Dict[str, Any],
+                        hotel_coords: Optional[Tuple[float, float]], now: Optional[datetime],
+                        latest_first: bool = False) -> Optional[Dict[str, Any]]:
+    """
+    A new home for a draft that a confirmed booking just replaced: the open spot
+    (around confirmed appointments and other drafts) closest to that day's other stops.
+    """
+    row = claims_df[claims_df["claim_id"].astype(str) == str(claim_id)]
+    if row.empty:
+        return None
+    row = row.iloc[0]
+    video = is_video(row.get("activity_type"))
+    openings = order_openings(
+        compute_openings(S["start_date"], S["end_date"], S["active_days"], S["day_start"], S["per_day"],
+                         S["window_hrs"], claims_df, now=now, exclude_claim_id=claim_id,
+                         latest_end=S.get("latest_end"),
+                         duration_hrs=VIDEO_DEFAULT_HRS if video else None, include_drafts=True),
+        latest_days_first=latest_first)
+    if not openings:
+        return None
+    loc = _loc(row)
+    if video or not loc:
+        return openings[0]
+
+    stops_by_day: Dict[str, List[Tuple[float, float]]] = defaultdict(list)
+    for _, r in claims_df[claims_df["status"].isin(["Scheduled", "Draft"])].iterrows():
+        if str(r["claim_id"]) == str(claim_id) or is_video(r.get("activity_type")):
+            continue
+        s, l_ = parse_wallclock(r.get("start_time")), _loc(r)
+        if s and l_:
+            stops_by_day[s.strftime("%Y-%m-%d")].append(l_)
+
+    def score(pos_o):
+        pos, o = pos_o
+        stops = stops_by_day.get(o["date_str"]) or ([hotel_coords] if hotel_coords else [])
+        dist = min((_miles(loc, s) for s in stops), default=0.0)
+        return (round(dist, 1), pos)
+    return min(enumerate(openings), key=score)[1]
+
+
 # --- RECOMMENDATION ENGINE ---
 
 def find_previous_stop(claims_df: pd.DataFrame, slot: Dict[str, Any]) -> Optional[pd.Series]:
@@ -1154,7 +1434,7 @@ def find_previous_stop(claims_df: pd.DataFrame, slot: Dict[str, Any]) -> Optiona
     """
     slot_start = parse_wallclock(slot["start"])
     same_day = claims_df[
-        (claims_df["status"] == "Scheduled") &
+        (claims_df["status"].isin(["Scheduled", "Draft"])) &
         (claims_df["scheduled_date"].astype(str) == slot["date_str"])
     ]
     if "activity_type" in same_day.columns:   # live video inspections don't move the rep
@@ -1171,7 +1451,7 @@ def find_next_stop(claims_df: pd.DataFrame, slot: Dict[str, Any]) -> Optional[pd
     """The scheduled claim that starts soonest at or after the opening ends, on the same day."""
     slot_end = parse_wallclock(slot["end"])
     same_day = claims_df[
-        (claims_df["status"] == "Scheduled") &
+        (claims_df["status"].isin(["Scheduled", "Draft"])) &
         (claims_df["scheduled_date"].astype(str) == slot["date_str"])
     ]
     if "activity_type" in same_day.columns:
