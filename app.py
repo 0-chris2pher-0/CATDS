@@ -384,19 +384,27 @@ def render_slot_picker(claim_id, claims_df, now, settings, current=None, default
     def tfmt(dt):
         return dt.strftime("%I:%M %p").lstrip("0")
 
-    # Free time for each inspection day in the date range
-    gaps_by_day = {}
+    # For each inspection day:
+    #   gaps_by_day      = truly free time (no confirmed inspection and no draft), shown as "Open"
+    #   bookable_by_day  = time free of CONFIRMED inspections. Drafts are placeholders, so a
+    #                      booking can go over one (the draft then moves to its next best spot).
+    gaps_by_day, bookable_by_day = {}, {}
     d = S["start_date"]
     while d <= S["end_date"]:
         if d.strftime("%a") in S["active_days"]:
             gaps_by_day[d.isoformat()] = compute_day_gaps(d, S["day_start"], S["per_day"], S["window_hrs"],
                                                           busy_all, now, S["latest_end"])
+            bookable_by_day[d.isoformat()] = compute_day_gaps(d, S["day_start"], S["per_day"], S["window_hrs"],
+                                                              busy, now, S["latest_end"])
         d += timedelta(days=1)
+    drafts_by_day = defaultdict(list)
+    for b in drafts_busy:
+        drafts_by_day[b["start"].strftime("%Y-%m-%d")].append(b)
     openings_by_day = defaultdict(list)
     for o in openings:
         openings_by_day[o["date_str"]].append(o)
 
-    days_with_time = [ds for ds, g in gaps_by_day.items() if g]
+    days_with_time = [ds for ds, g in bookable_by_day.items() if g]
     if not days_with_time:
         st.info("No open time left in this date range. Extend the end date or adjust the day settings in the sidebar.")
         return None
@@ -407,8 +415,12 @@ def render_slot_picker(claim_id, claims_df, now, settings, current=None, default
             n_s, n_e = parse_wallclock(nxt["start"]), parse_wallclock(nxt["end"])
             st.markdown(f"**Next opening:** {n_s.strftime('%a %b %d')}, {tfmt(n_s)} - {tfmt(n_e)}")
             return nxt
-        st.info("No full-length openings left, but there is shorter open time. "
-                "Turn on **Pick a day and time** to book a shorter inspection.")
+        if drafts_busy:
+            st.info("Your open time is filled with drafts. Turn on **Pick a day and time** to book over a "
+                    "draft; the draft moves to its next best spot.")
+        else:
+            st.info("No full-length openings left, but there is shorter open time. "
+                    "Turn on **Pick a day and time** to book a shorter inspection.")
         return None
 
     day_key, time_key, dur_key, month_key = (f"pick_day_{cid}", f"pick_time_{cid}",
@@ -417,7 +429,9 @@ def render_slot_picker(claim_id, claims_df, now, settings, current=None, default
     def first_free_start(ds):
         if openings_by_day.get(ds):
             return parse_wallclock(openings_by_day[ds][0]["start"])
-        return gaps_by_day[ds][0][0]
+        if gaps_by_day.get(ds):
+            return gaps_by_day[ds][0][0]
+        return bookable_by_day[ds][0][0]   # only drafted time left: start of the first drafted block
 
     if st.session_state.get(day_key) not in days_with_time:
         st.session_state[day_key] = openings[0]["date_str"] if openings else days_with_time[0]
@@ -466,12 +480,17 @@ def render_slot_picker(claim_id, claims_df, now, settings, current=None, default
                 ds = d.isoformat()
                 if ds not in gaps_by_day:
                     state, tip, can_pick = "off", "Not an inspection day", False
-                elif not gaps_by_day[ds]:
-                    state, tip, can_pick = "full", "No open time left", False
+                elif not bookable_by_day[ds]:
+                    state, tip, can_pick = "full", "Fully booked with confirmed inspections", False
                 else:
                     n_open = len(openings_by_day.get(ds, []))
                     state = "open" if n_open >= 2 else "few"
-                    tip = "Open " + ", ".join(f"{tfmt(a)}-{tfmt(b)}" for a, b in gaps_by_day[ds])
+                    parts = []
+                    if gaps_by_day[ds]:
+                        parts.append("Open " + ", ".join(f"{tfmt(a)}-{tfmt(b)}" for a, b in gaps_by_day[ds]))
+                    if drafts_by_day.get(ds):
+                        parts.append(f"{len(drafts_by_day[ds])} draft(s) you can book over")
+                    tip = ". ".join(parts)
                     can_pick = True
                 col.button(str(d.day), key=f"pd_{state}_{cid}_{ds}", help=tip, disabled=not can_pick,
                            use_container_width=True, type="primary" if ds == sel_day else "secondary",
@@ -497,14 +516,18 @@ def render_slot_picker(claim_id, claims_df, now, settings, current=None, default
         for _, when, what in sorted(rows, key=lambda r: r[0])
     ))
 
-    # Quick starts: the beginning of each open block
-    quick = sorted({parse_wallclock(o["start"]) for o in openings_by_day.get(sel_day, [])} |
+    # Quick starts: the beginning of each open block, plus each draft's time (booking there
+    # replaces the draft, which then moves to its next best spot)
+    open_starts = ({parse_wallclock(o["start"]) for o in openings_by_day.get(sel_day, [])} |
                    {a for a, _ in gaps_by_day[sel_day]})
+    draft_starts = {b["start"] for b in drafts_by_day.get(sel_day, []) if b["start"] > now} - open_starts
+    quick = sorted([(t, False) for t in open_starts] + [(t, True) for t in draft_starts])
     if quick:
-        st.caption("Quick start times")
+        st.caption("Quick start times" + (" (times marked draft replace that draft)" if draft_starts else ""))
         for i in range(0, len(quick), 3):
-            for col, t in zip(st.columns(3), quick[i:i + 3]):
-                col.button(tfmt(t), key=f"pt_open_{cid}_{t.isoformat()}", use_container_width=True,
+            for col, (t, is_draft) in zip(st.columns(3), quick[i:i + 3]):
+                col.button(tfmt(t) + (" · draft" if is_draft else ""), key=f"pt_open_{cid}_{t.isoformat()}",
+                           use_container_width=True,
                            type="primary" if st.session_state[time_key] == t.time() else "secondary",
                            on_click=_set_state, args=(time_key, t.time()))
 
