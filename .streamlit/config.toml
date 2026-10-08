@@ -1,15 +1,15 @@
-# Two themes. Users switch between them in the app menu (⋮ > Settings).
-# Field = light, built for daylight and phones outdoors.
-# Console = dark, built for planning at the hotel.
+# Two themes. Viewers switch between them in Streamlit's own menu.
+# primaryColor drives main buttons and selected states (toggles, sliders,
+# checkboxes, the Calendar/Map switch).
 
 [theme.light]
-primaryColor = "#1D4E89"
-backgroundColor = "#F4F6F9"
-secondaryBackgroundColor = "#E9EEF3"
-textColor = "#14222F"
+primaryColor = "#E01719"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F6F6F6"
+textColor = "#46494D"
 
 [theme.dark]
-primaryColor = "#0891B2"
-backgroundColor = "#0A0F14"
-secondaryBackgroundColor = "#111A22"
-textColor = "#D7E1EA"
+primaryColor = "#E01719"
+backgroundColor = "#003557"
+secondaryBackgroundColor = "#46494D"
+textColor = "#FFFFFF"
