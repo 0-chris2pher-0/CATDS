@@ -57,88 +57,115 @@ st.set_page_config(page_title="CAT Dynamic Scheduling", page_icon="🌀", layout
 
 # =====================================================================
 # STYLE
-# Palette: storm navy for the header and primary actions, blue-gray
-# workspace, white work surfaces. Status colors match the map pins:
-# red = unscheduled, blue = scheduled, gray = ignored, amber = next up.
+#   Red: main action buttons and selected states only, used sparingly.
+#   Dark red: hover/pressed on red buttons.
+#   Navy: header and scheduled inspections.  Gray scale: text and borders.
+#   Teal: links and clickable items only.  Gold: small non-interactive accents.
+#   No red for errors, no red text on dark backgrounds, no see-through red.
 # =====================================================================
-INK = "#0F1E2E"
-STEEL = "#1D4E89"
-SLATE = "#52637A"
-LINE = "#DCE3EA"
-AMBER = "#E8A317"
-RED = "#D63E2A"
-SCHEDULED_BLUE = "#2F6DB5"
-IGNORED_GRAY = "#94A3B8"
-ISSUE_ORANGE = "#F07C1B"
-DRAFT_BLUE = "#9DB4CC"
+BRAND_RED = "#E01719"
+BRAND_DARK_RED = "#AF1214"
+NAVY = "#003557"
+TEAL = "#007395"
+TEAL_40 = "#99C7D5"
+TEAL_20 = "#CCE3EA"
+GRAY = "#46494D"
+GRAY_80 = "#6B6D71"
+GRAY_60 = "#909294"
+GRAY_40 = "#B5B6B8"
+GRAY_20 = "#DADBDB"
+GRAY_5 = "#F6F6F6"
+GOLD = "#F5C318"
 
-# The theme is switched in the app menu (⋮ > Settings), using the two themes
-# defined in .streamlit/config.toml. Streamlit restyles its own widgets; this
-# CSS restyles the custom pieces (header, stats, cards) to match.
+# Names used throughout the app, mapped to brand colors
+INK = GRAY
+STEEL = NAVY
+SLATE = GRAY_80
+LINE = GRAY_20
+AMBER = GOLD            # "next inspection" accent
+RED = BRAND_RED              # Unscheduled = needs action
+SCHEDULED_BLUE = NAVY
+IGNORED_GRAY = GRAY_20
+ISSUE_ORANGE = GOLD     # location issues
+DRAFT_BLUE = GRAY_40
+
+# Light or dark comes from the viewer's Streamlit setting, using the two themes
+# in .streamlit/config.toml. Streamlit restyles its own widgets; this CSS restyles
+# the custom pieces to match.
 try:
     THEME_MODE = st.context.theme.base or "light"
 except Exception:
     THEME_MODE = "light"
-CONSOLE = THEME_MODE == "dark"
+CONSOLE = THEME_MODE == "dark"   # dark theme flag (kept name for the rest of the app)
 
-# Console (dark) palette
-C_BG = "#0A0F14"
-C_PANEL = "#111A22"
-C_LINE = "#1E2A36"
-C_TEXT = "#D7E1EA"
-C_MUTED = "#7F92A6"
-C_SIGNAL = "#3FD0E0"
-
-MONO = "'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace"
-SANS = "'IBM Plex Sans', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif"
+SANS = "'Segoe UI', 'Helvetica Neue', Arial, sans-serif"
 
 st.markdown(f"""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
-
 .stApp, .stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp p, .stApp label, .stApp li,
 .stApp button, .stApp input, .stApp textarea {{ font-family: {SANS}; }}
-.stApp code {{ font-family: {MONO}; }}
 [data-testid="stDecoration"] {{ display: none; }}
 .block-container {{ padding-top: 2rem; padding-bottom: 4rem; }}
 
 .stApp h3 {{ font-size: 1.15rem; font-weight: 600; letter-spacing: -0.01em; }}
-.stApp hr {{ border: none; border-top: 1px solid rgba(128, 140, 155, 0.28); margin: 1.5rem 0 1.25rem; }}
-[data-testid="stSidebar"] h2 {{ font-size: 1.05rem; font-weight: 600; }}
-[data-testid="stSidebar"] h3 {{ font-size: 0.95rem; font-weight: 600; }}
+.stApp hr {{ border: none; border-top: 1px solid {GRAY_20}; margin: 1.5rem 0 1.25rem; }}
+[data-testid="stSidebar"] h2, [data-testid="stSidebar"] h3 {{ font-size: 1rem; font-weight: 600; }}
+.stMarkdown a {{ color: {TEAL}; }}
 
+/* Buttons: red fill for main actions (Dark Red on hover); neutral outline for the rest */
 .stApp .stButton button, .stApp .stDownloadButton button, .stApp .stLinkButton a {{
-    border-radius: 8px; font-weight: 500;
+    border-radius: 6px; font-weight: 600;
 }}
-.stTabs [data-baseweb="tab"] {{ font-weight: 500; font-size: 0.95rem; }}
+.stApp [data-testid="stBaseButton-primary"] {{
+    background: {BRAND_RED}; border-color: {BRAND_RED}; color: #FFFFFF;
+}}
+.stApp [data-testid="stBaseButton-primary"]:hover {{
+    background: {BRAND_DARK_RED}; border-color: {BRAND_DARK_RED}; color: #FFFFFF;
+}}
+.stApp [data-testid="stBaseButton-primary"]:active {{ background: #5E0A0B; border-color: #5E0A0B; }}
+.stApp [data-testid="stBaseButton-secondary"] {{
+    background: #FFFFFF; border: 1px solid {GRAY_40}; color: {GRAY};
+}}
+.stApp [data-testid="stBaseButton-secondary"]:hover {{
+    background: {GRAY_5}; border-color: {GRAY_80}; color: {GRAY};
+}}
+.stApp :is(button, a):focus-visible {{ outline: 2px solid {BRAND_RED}; outline-offset: 2px; }}
 
-/* Header strip: the one bold element on the page */
-.cat-header {{
-    background: {INK}; color: #FFFFFF;
-    border-radius: 12px; padding: 1.1rem 1.4rem 1rem; margin-bottom: 1.25rem;
-    border-bottom: 3px solid {AMBER};
+/* Calendar / Map switch: selected = red fill, white text */
+.stApp [data-testid="stBaseButton-segmented_controlActive"] {{
+    background: {BRAND_RED}; border-color: {BRAND_RED}; color: #FFFFFF;
 }}
-.cat-header-title {{ font-size: 1.55rem; font-weight: 600; letter-spacing: -0.015em; line-height: 1.2; }}
+.stApp [data-testid="stBaseButton-segmented_control"] {{ color: {GRAY}; }}
+
+/* Header strip: navy with a red rule */
+.cat-header {{
+    background: {NAVY};
+    color: #FFFFFF;
+    border-radius: 10px;
+    padding: 1.1rem 1.4rem 1rem;
+    margin-bottom: 1.25rem;
+    border-bottom: 4px solid {BRAND_RED};
+}}
+.cat-header-title {{ font-size: 1.6rem; font-weight: 700; line-height: 1.2; }}
 .cat-header-meta {{
     display: flex; flex-wrap: wrap; gap: 0.35rem 1.5rem;
-    margin-top: 0.4rem; font-size: 0.88rem; color: #B9C6D3;
+    margin-top: 0.4rem; font-size: 0.9rem; color: {GRAY_20};
 }}
-.cat-header-meta b {{ color: #FFFFFF; font-weight: 500; }}
+.cat-header-meta b {{ color: #FFFFFF; font-weight: 600; }}
 
-/* Status stats: color bar = the status color used on the map and calendar.
-   Colors are inherited so the cards work in both themes. */
+/* Status stats: the bar color matches the status */
 .cat-stats {{
-    display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
     gap: 0.75rem; margin: 0.25rem 0 0.5rem;
 }}
 .cat-stat {{
-    background: rgba(128, 140, 155, 0.06);
-    border: 1px solid rgba(128, 140, 155, 0.25);
+    background: #FFFFFF;
+    border: 1px solid {GRAY_20};
     border-left: 5px solid var(--c);
-    border-radius: 10px; padding: 0.7rem 1rem;
+    border-radius: 8px; padding: 0.7rem 1rem;
 }}
-.cat-stat-value {{ font-size: 1.7rem; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1.2; }}
-.cat-stat-label {{ font-size: 0.85rem; opacity: 0.72; }}
+.cat-stat-value {{ font-size: 1.7rem; font-weight: 700; color: {GRAY}; font-variant-numeric: tabular-nums; line-height: 1.2; }}
+.cat-stat-label {{ font-size: 0.85rem; color: {GRAY_80}; }}
 
 /* Month slot picker: keep the 7-day grid side by side, even on phones */
 [class*="st-key-slotpicker"] [data-testid="stHorizontalBlock"] {{ flex-wrap: nowrap !important; gap: 0.25rem !important; }}
@@ -147,63 +174,49 @@ st.markdown(f"""
 }}
 [class*="st-key-slotpicker"] button {{ padding: 0.2rem 0 !important; min-height: 2.1rem; font-variant-numeric: tabular-nums; }}
 [class*="st-key-slotpicker"] .stCaption, [class*="st-key-slotpicker"] [data-testid="stCaptionContainer"] {{ text-align: center; }}
-[class*="st-key-pd_open"] [data-testid="stBaseButton-secondary"] {{ background: rgba(34, 160, 90, 0.16); border-color: rgba(34, 160, 90, 0.5); }}
-[class*="st-key-pd_few"] [data-testid="stBaseButton-secondary"] {{ background: rgba(232, 163, 23, 0.18); border-color: rgba(232, 163, 23, 0.55); }}
-[class*="st-key-pd_full"] button {{ background: repeating-linear-gradient(45deg, rgba(128, 140, 155, 0.16) 0 4px, transparent 4px 8px) !important; }}
+[class*="st-key-pd_open"] [data-testid="stBaseButton-secondary"] {{ background: {TEAL_20}; border-color: {TEAL}; }}
+[class*="st-key-pd_few"] [data-testid="stBaseButton-secondary"] {{ background: #FFFFFF; border: 2px solid {GOLD}; }}
+[class*="st-key-pd_full"] button {{ background: repeating-linear-gradient(45deg, {GRAY_20} 0 4px, transparent 4px 8px) !important; }}
 [class*="st-key-pd_off"] button {{ opacity: 0.35; }}
-[class*="st-key-pt_open"] [data-testid="stBaseButton-secondary"] {{ border-color: rgba(34, 160, 90, 0.55); }}
+[class*="st-key-pt_open"] [data-testid="stBaseButton-secondary"] {{ border-color: {TEAL}; }}
 
 /* Next-up and selected-block cards */
-.cat-card {{ border-left: 4px solid {AMBER}; padding: 0.1rem 0 0.1rem 0.85rem; margin-bottom: 0.6rem; }}
-.cat-card.selected {{ border-left-color: {SCHEDULED_BLUE}; }}
-.cat-card-kicker {{ font-size: 0.82rem; opacity: 0.72; }}
-.cat-card-title {{ font-size: 1.05rem; font-weight: 600; margin: 0.1rem 0; }}
-.cat-card-sub {{ font-size: 0.9rem; opacity: 0.8; }}
+.cat-card {{ border-left: 4px solid {GOLD}; padding: 0.1rem 0 0.1rem 0.85rem; margin-bottom: 0.6rem; }}
+.cat-card.selected {{ border-left-color: {NAVY}; }}
+.cat-card-kicker {{ font-size: 0.82rem; color: {GRAY_80}; }}
+.cat-card-title {{ font-size: 1.05rem; font-weight: 600; margin: 0.1rem 0; color: {GRAY}; }}
+.cat-card-sub {{ font-size: 0.9rem; color: {GRAY_80}; }}
+
+@media (prefers-reduced-motion: reduce) {{
+    *, *::before, *::after {{ transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; }}
+}}
 </style>
 """, unsafe_allow_html=True)
 
 if CONSOLE:
-    # Console theme: dark command strip with a faint grid, instrument-style stats
-    # in mono numerals, and one glow (on the next inspection). Nothing else moves.
+    # Dark theme: navy page, gray panels, white text. Red appears only as filled
+    # buttons with white text (no red text on dark backgrounds).
     st.markdown(f"""
 <style>
-.cat-header {{
-    background-color: {C_PANEL};
-    background-image:
-        linear-gradient(rgba(63, 208, 224, 0.06) 1px, transparent 1px),
-        linear-gradient(90deg, rgba(63, 208, 224, 0.06) 1px, transparent 1px);
-    background-size: 22px 22px;
-    border: 1px solid {C_LINE};
-    border-bottom: 2px solid {C_SIGNAL};
+.stMarkdown a {{ color: {TEAL_40}; }}
+.stApp [data-testid="stBaseButton-secondary"] {{
+    background: transparent; border: 1px solid {GRAY_60}; color: #FFFFFF;
 }}
-.cat-header-title {{ color: {C_TEXT}; }}
-.cat-header-meta {{ font-family: {MONO}; font-size: 0.82rem; color: {C_MUTED}; }}
-.cat-header-meta b {{ color: {C_SIGNAL}; font-weight: 500; }}
-
-.cat-stat {{
-    background: {C_PANEL};
-    border: 1px solid {C_LINE};
-    border-left: 3px solid var(--c);
-    box-shadow: -6px 0 18px -10px var(--c);
+.stApp [data-testid="stBaseButton-secondary"]:hover {{
+    background: rgba(255, 255, 255, 0.08); border-color: {GRAY_20}; color: #FFFFFF;
 }}
-.cat-stat-value {{ font-family: {MONO}; font-weight: 500; color: {C_TEXT}; }}
-.cat-stat-label {{ color: {C_MUTED}; opacity: 1; }}
-
-.cat-card-kicker, .cat-card-sub {{ font-family: {MONO}; font-size: 0.8rem; color: {C_MUTED}; opacity: 1; }}
-.cat-card-title {{ color: {C_TEXT}; }}
-.cat-card:not(.selected) {{
-    border-left-color: {AMBER};
-    box-shadow: -8px 0 22px -12px {AMBER};
-    animation: cat-next-glow 2.4s ease-out 1;
-}}
-@keyframes cat-next-glow {{
-    0%   {{ box-shadow: -8px 0 34px -6px {AMBER}; }}
-    100% {{ box-shadow: -8px 0 22px -12px {AMBER}; }}
-}}
-@media (prefers-reduced-motion: reduce) {{ .cat-card {{ animation: none !important; }} }}
-
-.stApp hr {{ border-top-color: {C_LINE}; }}
-[data-testid="stSidebar"] {{ border-right: 1px solid {C_LINE}; }}
+.stApp [data-testid="stBaseButton-segmented_control"] {{ color: #FFFFFF; }}
+.cat-header {{ background: {GRAY}; }}
+.cat-stat {{ background: rgba(255, 255, 255, 0.06); border-color: {GRAY_80}; }}
+.cat-stat-value {{ color: #FFFFFF; }}
+.cat-stat-label, .cat-card-kicker, .cat-card-sub {{ color: {GRAY_20}; }}
+.cat-card-title {{ color: #FFFFFF; }}
+.cat-card.selected {{ border-left-color: #FFFFFF; }}
+.stApp hr {{ border-top-color: {GRAY_80}; }}
+[class*="st-key-pd_open"] [data-testid="stBaseButton-secondary"] {{ background: {TEAL}; border-color: {TEAL_40}; }}
+[class*="st-key-pd_few"] [data-testid="stBaseButton-secondary"] {{ background: transparent; border: 2px solid {GOLD}; }}
+[class*="st-key-pd_full"] button {{ background: repeating-linear-gradient(45deg, {GRAY_80} 0 4px, transparent 4px 8px) !important; }}
+[class*="st-key-pt_open"] [data-testid="stBaseButton-secondary"] {{ border-color: {TEAL_40}; }}
 </style>
 """, unsafe_allow_html=True)
 
@@ -948,7 +961,7 @@ if st.session_state.claims_df is not None:
     # --- STATUS STATS ---
     scheduled_count = int((df["status"] == "Scheduled").sum())
     stats = [
-        ("Total claims", len(df), INK),
+        ("Total claims", len(df), GRAY),
         ("Unscheduled", int((df["status"] == "Unscheduled").sum()), RED),
         ("Scheduled", scheduled_count, SCHEDULED_BLUE),
         ("Drafts", int((df["status"] == "Draft").sum()), DRAFT_BLUE),
@@ -1098,31 +1111,33 @@ if st.session_state.claims_df is not None:
                 event.update({
                     "title": f"Draft · [{cid}] {row['insured_name']}{nxt_txt}",
                     "classNames": ["draft-event"],
-                    "backgroundColor": "#2A3A4C" if CONSOLE else "#E6EEF8",
-                    "borderColor": DRAFT_BLUE if CONSOLE else SCHEDULED_BLUE,
-                    "textColor": "#C9D6E4" if CONSOLE else "#1D3A5F",
+                    "backgroundColor": NAVY if CONSOLE else "#FFFFFF",
+                    "borderColor": "#FFFFFF" if CONSOLE else NAVY,
+                    "textColor": "#FFFFFF" if CONSOLE else NAVY,
                 })
             elif row["_end_dt"] <= now_local:
                 event.update({
                     "classNames": ["past-event"],
-                    "backgroundColor": "#3A4654" if CONSOLE else "#A3AFBF",
-                    "borderColor": "#566373" if CONSOLE else "#7B8797",
-                    "textColor": "#C3CFDB" if CONSOLE else "#1F2937",
+                    "backgroundColor": GRAY_80 if CONSOLE else GRAY_20,
+                    "borderColor": GRAY_60 if CONSOLE else GRAY_40,
+                    "textColor": "#FFFFFF" if CONSOLE else GRAY,
                 })
             elif cid == next_id:
                 event.update({
                     "title": f"⏭️ {event['title']}",
                     "classNames": ["next-event"],
-                    "backgroundColor": AMBER,
-                    "borderColor": "#B7800F",
-                    "textColor": "#111827",
+                    "backgroundColor": GOLD,
+                    "borderColor": GOLD,
+                    "textColor": GRAY,
                 })
             elif is_video(row.get("activity_type")):
                 # Live video: a lighter shade of the inspection blue
-                event.update({"title": f"📹 {event['title']}", "backgroundColor": "#8DB0DC",
-                              "borderColor": SCHEDULED_BLUE, "textColor": "#0F1E2E"})
+                # Live video: a light tint, so it reads as lighter than an on-site inspection
+                event.update({"title": f"📹 {event['title']}", "backgroundColor": TEAL_20,
+                              "borderColor": TEAL, "textColor": NAVY})
             else:
-                event.update({"backgroundColor": SCHEDULED_BLUE, "borderColor": STEEL})
+                event.update({"backgroundColor": TEAL if CONSOLE else NAVY,
+                              "borderColor": TEAL if CONSOLE else NAVY, "textColor": "#FFFFFF"})
             calendar_events.append(event)
 
         # --- SHADING: dates outside the inspection date range ---
@@ -1136,24 +1151,11 @@ if st.session_state.claims_df is not None:
                     "end": d_to.isoformat() if all_day else f"{d_to.isoformat()}T00:00:00",
                     "allDay": all_day,
                     "display": "background",
-                    "backgroundColor": IGNORED_GRAY,
+                    "backgroundColor": GRAY_60,
                 })
 
         shade_range(start_date - timedelta(days=28), start_date)
         shade_range(end_date + timedelta(days=1), end_date + timedelta(days=60))
-
-        # --- OPEN TIME: light green behind the free parts of each working day ---
-        cal_busy = get_busy_intervals(df)
-        d = start_date
-        while d <= end_date:
-            if d.strftime("%a") in active_days:
-                for g0, g1 in compute_day_gaps(d, start_time_input, inspections_per_day, window_hrs,
-                                               cal_busy, now_local, latest_end_input):
-                    calendar_events.append({
-                        "start": g0.isoformat(), "end": g1.isoformat(),
-                        "display": "background", "backgroundColor": "#22A05A",
-                    })
-            d += timedelta(days=1)
 
         # --- VISIBLE HOURS ---
         # Show until 7 PM by default, but extend to fit the inspection windows
@@ -1219,69 +1221,62 @@ if st.session_state.claims_df is not None:
         }
 
         calendar_css = f"""
-            @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&display=swap');
             .fc {{
-                font-family: 'IBM Plex Sans', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
-                --fc-border-color: {LINE};
+                font-family: {SANS};
+                color: {GRAY};
+                --fc-border-color: {GRAY_20};
                 --fc-button-bg-color: #FFFFFF;
-                --fc-button-border-color: {LINE};
-                --fc-button-text-color: {INK};
-                --fc-button-hover-bg-color: #EEF2F6;
-                --fc-button-hover-border-color: #C9D3DD;
-                --fc-button-active-bg-color: {STEEL};
-                --fc-button-active-border-color: {STEEL};
-                --fc-today-bg-color: rgba(232, 163, 23, 0.07);
-                --fc-now-indicator-color: {RED};
-                --fc-non-business-color: rgba(148, 163, 184, 0.22);
-                --fc-neutral-bg-color: #F4F6F9;
+                --fc-button-border-color: {GRAY_40};
+                --fc-button-text-color: {GRAY};
+                --fc-button-hover-bg-color: {GRAY_5};
+                --fc-button-hover-border-color: {GRAY_80};
+                --fc-button-active-bg-color: {BRAND_RED};
+                --fc-button-active-border-color: {BRAND_RED};
+                --fc-today-bg-color: {GRAY_5};
+                --fc-now-indicator-color: {BRAND_RED};
+                --fc-non-business-color: rgba(181, 182, 184, 0.28);
+                --fc-neutral-bg-color: {GRAY_5};
             }}
-            .fc .fc-toolbar-title {{ font-size: 1.05rem; font-weight: 600; color: {INK}; }}
-            .fc .fc-button {{ font-size: 0.82rem; font-weight: 500; border-radius: 7px; box-shadow: none !important; text-transform: capitalize; }}
+            .fc .fc-toolbar-title {{ font-size: 1.05rem; font-weight: 700; color: {NAVY}; }}
+            .fc .fc-button {{ font-size: 0.82rem; font-weight: 600; border-radius: 6px; box-shadow: none !important; text-transform: capitalize; }}
             .fc .fc-button-primary:not(:disabled).fc-button-active {{ color: #FFFFFF; }}
-            .fc .fc-col-header-cell-cushion {{ color: {SLATE}; font-weight: 600; font-size: 0.82rem; text-decoration: none; }}
-            .fc .fc-timegrid-slot-label-cushion {{ color: {SLATE}; font-size: 0.78rem; }}
-            .fc .fc-daygrid-day-number {{ color: {SLATE}; text-decoration: none; }}
-            .fc-event {{ border-radius: 6px; font-size: 0.8rem; }}
+            .fc .fc-col-header-cell-cushion {{ color: {GRAY_80}; font-weight: 600; font-size: 0.82rem; text-decoration: none; }}
+            .fc .fc-timegrid-slot-label-cushion {{ color: {GRAY_80}; font-size: 0.78rem; }}
+            .fc .fc-daygrid-day-number {{ color: {GRAY_80}; text-decoration: none; }}
+            .fc-event {{ border-radius: 5px; font-size: 0.8rem; }}
             .fc-event.past-event {{
                 background-image: repeating-linear-gradient(
                     45deg, rgba(255,255,255,0.55) 0 5px, transparent 5px 10px) !important;
-                opacity: 0.85;
             }}
             .fc-event.past-event .fc-event-title {{ text-decoration: line-through; }}
-            .fc-event.next-event {{ box-shadow: 0 0 0 3px rgba(232, 163, 23, 0.45); font-weight: 600; }}
+            .fc-event.next-event {{ font-weight: 700; }}
             .fc-event.draft-event {{ border-style: dashed !important; border-width: 2px !important; font-style: italic; }}
         """
         if CONSOLE:
             calendar_css += f"""
-            @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&display=swap');
-            html, body {{ background: {C_BG}; }}
+            html, body {{ background: {NAVY}; }}
             .fc {{
-                color: {C_TEXT};
-                background: {C_BG};
-                --fc-page-bg-color: {C_BG};
-                --fc-neutral-bg-color: {C_PANEL};
-                --fc-border-color: {C_LINE};
-                --fc-button-bg-color: {C_PANEL};
-                --fc-button-border-color: {C_LINE};
-                --fc-button-text-color: {C_TEXT};
-                --fc-button-hover-bg-color: #18242F;
-                --fc-button-hover-border-color: #2A3A4A;
-                --fc-button-active-bg-color: #0891B2;
-                --fc-button-active-border-color: {C_SIGNAL};
-                --fc-today-bg-color: rgba(63, 208, 224, 0.06);
-                --fc-now-indicator-color: {C_SIGNAL};
-                --fc-non-business-color: rgba(0, 0, 0, 0.35);
-                --fc-list-event-hover-bg-color: {C_PANEL};
+                color: #FFFFFF;
+                background: {NAVY};
+                --fc-page-bg-color: {NAVY};
+                --fc-neutral-bg-color: {GRAY};
+                --fc-border-color: {GRAY_80};
+                --fc-button-bg-color: {GRAY};
+                --fc-button-border-color: {GRAY_60};
+                --fc-button-text-color: #FFFFFF;
+                --fc-button-hover-bg-color: {GRAY_80};
+                --fc-button-hover-border-color: {GRAY_20};
+                --fc-today-bg-color: rgba(255, 255, 255, 0.06);
+                --fc-now-indicator-color: #FFFFFF;
+                --fc-non-business-color: rgba(0, 0, 0, 0.25);
             }}
-            .fc .fc-toolbar-title {{ color: {C_TEXT}; font-family: {MONO}; font-weight: 500; font-size: 0.98rem; }}
+            .fc .fc-toolbar-title {{ color: #FFFFFF; }}
             .fc .fc-col-header-cell-cushion, .fc .fc-timegrid-slot-label-cushion,
-            .fc .fc-daygrid-day-number {{ color: {C_MUTED}; font-family: {MONO}; }}
-            .fc-event {{ font-family: {MONO}; font-size: 0.76rem; }}
+            .fc .fc-daygrid-day-number {{ color: {GRAY_20}; }}
             .fc-event.past-event {{
                 background-image: repeating-linear-gradient(
-                    45deg, rgba(255,255,255,0.10) 0 5px, transparent 5px 10px) !important;
+                    45deg, rgba(255,255,255,0.12) 0 5px, transparent 5px 10px) !important;
             }}
-            .fc-event.next-event {{ box-shadow: 0 0 14px rgba(232, 163, 23, 0.55); }}
             """
 
         cal_event = calendar(
@@ -1456,7 +1451,7 @@ if st.session_state.claims_df is not None:
                 location=[lat, lon],
                 popup=folium.Popup(
                     f"<b>{esc(row['claim_id'])}</b><br>{esc(row['insured_name'])}<br>{esc(row['full_address'])}"
-                    f"<br><span style='color:#52637A'>Location: {esc(row['geo_quality'])}</span><br>{links_html}",
+                    f"<br><span style='color:#6B6D71'>Location: {esc(row['geo_quality'])}</span><br>{links_html}",
                     max_width=280
                 ),
                 tooltip=f"{row['claim_id']} - {row['insured_name']}" + (" (location needs checking)" if needs_review else ""),
