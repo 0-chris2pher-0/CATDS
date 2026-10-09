@@ -1,16 +1,33 @@
 # Two themes. Viewers switch between them in Streamlit's own menu.
-# primaryColor drives selection states (table selection, checkboxes, toggles,
-# sliders, chosen filter tags): teal. Main action buttons and the Calendar/Map
-# switch are red, set in the app's CSS.
+
+# primaryColor is a neutral gray so the claims table stays white with a light gray
+
+# highlight for selected/hovered cells (Streamlit tints the table with this color).
+
+# It also colors checkboxes, toggles, sliders and filter tags. Main action buttons
+
+# and the Calendar/Map switch are red, set in the app's CSS.
+
+ 
 
 [theme.light]
-primaryColor = "#007395"
+
+primaryColor = "#6B6D71"
+
 backgroundColor = "#FFFFFF"
+
 secondaryBackgroundColor = "#F6F6F6"
+
 textColor = "#46494D"
 
+ 
+
 [theme.dark]
-primaryColor = "#99C7D5"
+
+primaryColor = "#B5B6B8"
+
 backgroundColor = "#003557"
+
 secondaryBackgroundColor = "#46494D"
+
 textColor = "#FFFFFF"
