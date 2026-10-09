@@ -347,6 +347,18 @@ def remove_block(bid):
     st.session_state.editor_version += 1
 
 
+def remove_claim(cid):
+    """
+    Deletes a claim from the pool and the schedule. Nothing is remembered: if it's
+    reassigned back later, it comes in as a new claim on the next updated list.
+    """
+    cdf = st.session_state.claims_df
+    st.session_state.claims_df = cdf[cdf["claim_id"].astype(str) != str(cid)].reset_index(drop=True)
+    st.session_state.export_ids = st.session_state.get("export_ids", set()) - {str(cid)}
+    st.session_state.editor_version += 1
+    st.session_state.map_nonce += 1
+
+
 def confirm_draft(cid):
     """Confirms a draft at its current time and records the initial contact."""
     m = st.session_state.claims_df["claim_id"].astype(str) == str(cid)
@@ -1038,9 +1050,11 @@ if review_queue and st.session_state.claims_df is not None:
                 st.rerun()
             remove_label = "Remove from pool and schedule" if row["status"] == "Scheduled" else "Remove from pool"
             if b2.button(remove_label, type="primary", use_container_width=True, key=f"rv_remove_{cid}"):
-                st.session_state.claims_df = cdf[cdf["claim_id"].astype(str) != cid].reset_index(drop=True)
+                was_scheduled = row["status"] == "Scheduled"
+                remove_claim(cid)
                 finish_review_item()
-                st.toast(f"Removed {cid}")
+                st.toast(f"Removed {cid}"
+                         + (". Remember to delete it from Outlook if you exported it." if was_scheduled else ""))
                 st.rerun()
 
         else:
@@ -1088,6 +1102,11 @@ if st.session_state.claims_df is not None:
             cdf[text_col] = ""
         cdf[text_col] = cdf[text_col].apply(clean_text).astype(object)
     cdf["phone"] = cdf["phone"].apply(normalize_phone)
+    # Older saved files may have Ignored/Removed claims: bring them back as Unscheduled,
+    # so nothing is silently lost (they can be removed for good from Manage a claim)
+    _old = cdf["status"].isin(["Ignored", "Removed"])
+    if _old.any():
+        cdf.loc[_old, "status"] = "Unscheduled"
     cdf["geo_quality"] = cdf["geo_quality"].fillna(GEO_UNKNOWN).astype(str)
     cdf["lat"] = pd.to_numeric(cdf["lat"], errors="coerce")
     cdf["lon"] = pd.to_numeric(cdf["lon"], errors="coerce")
@@ -1106,7 +1125,6 @@ if st.session_state.claims_df is not None:
         ("Unscheduled", int((df["status"] == "Unscheduled").sum()), RED),
         ("Scheduled", scheduled_count, SCHEDULED_BLUE),
         ("Drafts", int((df["status"] == "Draft").sum()), DRAFT_BLUE),
-        ("Ignored", int((df["status"] == "Ignored").sum()), IGNORED_GRAY),
         ("Location issues", int(review_mask.sum()), ISSUE_ORANGE),
     ]
     st.markdown(
@@ -1511,6 +1529,12 @@ if st.session_state.claims_df is not None:
             c_rows = df[(df["claim_id"].astype(str) == clicked_id) & (df["status"].isin(["Scheduled", "Draft"]))]
             if not c_rows.empty:
                 c_row = c_rows.iloc[0]
+                # Select it in Manage a claim (once per click, so choosing another claim
+                # in the dropdown afterward isn't overridden)
+                click_sig = (clicked_id, clicked.get("start"))
+                if st.session_state.get("last_cal_click") != click_sig:
+                    st.session_state["last_cal_click"] = click_sig
+                    st.session_state["selected_claim_id"] = clicked_id
                 with st.container(border=True):
                     st.markdown(f"""
 <div class="cat-card selected">
@@ -1524,9 +1548,7 @@ if st.session_state.claims_df is not None:
                                      help="The insured agreed. Confirms the appointment and records the initial contact."):
                             confirm_draft(clicked_id)
                             st.rerun()
-                    if st.button("Manage this claim", key=f"cal_manage_{clicked_id}"):
-                        st.session_state["selected_claim_id"] = clicked_id
-                        st.rerun()
+                    st.caption("Selected in Manage a claim below.")
 
         # --- DRAG / RESIZE A BLOCK ---
         # The calendar keeps returning its last event on every rerun, so only
@@ -1589,7 +1611,7 @@ if st.session_state.claims_df is not None:
             fix_row = mdf[mdf["claim_id"].astype(str) == fix_id].iloc[0]
             st.caption(f"{fix_row['full_address']}")
 
-        valid_coords_df = mdf[(mdf["status"] != "Ignored") & (mdf["lat"].notna()) & (mdf["lon"].notna())]
+        valid_coords_df = mdf[(mdf["status"] != "Blocked") & (mdf["lat"].notna()) & (mdf["lon"].notna())]
         hidden_pins = 0
 
         if fix_row is not None and pd.notna(fix_row["lat"]) and pd.notna(fix_row["lon"]):
@@ -1634,7 +1656,7 @@ if st.session_state.claims_df is not None:
 
         bounds = []
         for _, row in mdf.iterrows():
-            if row["status"] == "Ignored" or pd.isna(row["lat"]) or pd.isna(row["lon"]):
+            if row["status"] == "Blocked" or pd.isna(row["lat"]) or pd.isna(row["lon"]):
                 continue
 
             lat = float(row["lat"])
@@ -1772,7 +1794,7 @@ if st.session_state.claims_df is not None:
         if "export_ids" not in st.session_state:
             st.session_state.export_ids = set()
 
-        show_status = st.multiselect("Show statuses", ["Unscheduled", "Draft", "Scheduled", "Ignored"],
+        show_status = st.multiselect("Show statuses", ["Unscheduled", "Draft", "Scheduled"],
                                      default=["Unscheduled", "Draft", "Scheduled"])
         view = df[df["status"].isin(show_status)]
 
@@ -1823,9 +1845,9 @@ if st.session_state.claims_df is not None:
                 "Priority": st.column_config.NumberColumn("Priority", help="1 = highest. Leave blank for unranked claims.",
                                                           min_value=1, step=1, format="%d"),
                 "Status": st.column_config.SelectboxColumn(
-                    "Status", options=["Unscheduled", "Draft", "Scheduled", "Ignored"], required=True,
+                    "Status", options=["Unscheduled", "Draft", "Scheduled"], required=True,
                     help="Schedule a claim from Manage a claim, so it gets a real time. "
-                         "Changing a Draft to Scheduled confirms it."),
+                         "Changing a Draft to Scheduled confirms it. To remove a claim, use Manage a claim."),
                 "Type of Contact": st.column_config.TextColumn(
                     "Type of Contact", help="Initial contact, once a contact date and time are recorded."),
                 "Date Contact Completed": st.column_config.TextColumn(
@@ -1863,7 +1885,7 @@ if st.session_state.claims_df is not None:
                 changes_made = True
 
             if new["Status"] != old["Status"]:
-                if new["Status"] in ("Unscheduled", "Ignored"):
+                if new["Status"] == "Unscheduled":
                     cdf.at[row_idx, "status"] = new["Status"]
                     cdf.at[row_idx, "start_time"] = None
                     cdf.at[row_idx, "end_time"] = None
@@ -2013,6 +2035,24 @@ if st.session_state.claims_df is not None:
                         st.rerun()
                 claim_length = VIDEO_DEFAULT_HRS if is_video(current_claim.get("activity_type")) else None
 
+                # --- Remove a claim (withdrawn, reassigned, duplicate) ---
+                with st.expander("Remove claim", expanded=False):
+                    st.caption("Deletes this claim from your pool and schedule, including its contact details "
+                               "and notes. This can't be undone. If it's reassigned back to you later, it will "
+                               "come in as a new claim on your next updated list.")
+                    if current_claim["status"] == "Scheduled":
+                        st.warning(f"This cancels the inspection on {fmt_dt(parse_wallclock(current_claim['start_time']))}. "
+                                   "If you already exported it to Outlook, delete that appointment in Outlook too.")
+                    elif current_claim["status"] == "Draft":
+                        st.caption("Its draft time will be cleared.")
+                    sure = st.checkbox(f"Yes, remove {selected_claim_id}", key=f"rm_sure_{selected_claim_id}")
+                    if st.button("Remove claim", key=f"rm_btn_{selected_claim_id}", disabled=not sure):
+                        was_scheduled = current_claim["status"] == "Scheduled"
+                        remove_claim(selected_claim_id)
+                        st.toast(f"Removed {selected_claim_id}"
+                                 + (". Remember to delete it from Outlook if you exported it." if was_scheduled else ""))
+                        st.rerun()
+
                 st.markdown("---")
 
                 if current_claim["status"] == "Scheduled":
@@ -2063,7 +2103,7 @@ if st.session_state.claims_df is not None:
                         st.session_state.editor_version += 1
                         st.rerun()
 
-                elif current_claim["status"] in ["Unscheduled", "Ignored"]:
+                elif current_claim["status"] == "Unscheduled":
                     chosen_slot = render_slot_picker(selected_claim_id, st.session_state.claims_df,
                                                      now_local, schedule_settings, default_hrs=claim_length)
                     if chosen_slot:
