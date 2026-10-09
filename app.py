@@ -18,6 +18,8 @@ from engine import (
     day_window,
     make_slot,
     order_openings,
+    per_day_for,
+    active_days_from,
     find_overlap,
     get_recommendations_for_slot,
     export_claims_to_ics,
@@ -178,6 +180,7 @@ st.markdown(f"""
 [class*="st-key-pd_few"] [data-testid="stBaseButton-secondary"] {{ background: #FFFFFF; border: 2px solid {GOLD}; }}
 [class*="st-key-pd_full"] button {{ background: repeating-linear-gradient(45deg, {GRAY_20} 0 4px, transparent 4px 8px) !important; }}
 [class*="st-key-pd_off"] button {{ opacity: 0.35; }}
+[class*="st-key-pd_dayoff"] [data-testid="stBaseButton-secondary"] {{ border: 1px dashed {GRAY_60}; color: {GRAY_80}; }}
 [class*="st-key-pt_open"] [data-testid="stBaseButton-secondary"] {{ border-color: {TEAL}; }}
 
 /* Next-up and selected-block cards */
@@ -305,6 +308,41 @@ def displace_drafts(slot, booked_ids):
         st.session_state["draft_notice"] = " ".join(notes)
 
 
+def create_block(start_dt, end_dt, label):
+    """
+    Adds blocked time (a rep's own non-inspection time). It can't overlap a confirmed
+    inspection or another block; drafts under it move to their next best spot.
+    Returns an error message, or None when it worked.
+    """
+    if end_dt <= start_dt:
+        return "The end time needs to be after the start time."
+    cdf = st.session_state.claims_df
+    clash = find_overlap(start_dt, end_dt, get_busy_intervals(cdf))
+    if clash:
+        return (f"That overlaps {clash['label']} ({clash['start'].strftime('%I:%M %p').lstrip('0')} - "
+                f"{clash['end'].strftime('%I:%M %p').lstrip('0')}). Move it first, or pick another time.")
+    import uuid
+    bid = f"BLOCK-{uuid.uuid4().hex[:6].upper()}"
+    label = (label or "").strip() or "Blocked"
+    row = {c: "" for c in cdf.columns}
+    row.update({"claim_id": bid, "insured_name": label, "display_label": f"{bid} - {label}",
+                "full_address": "", "status": "Blocked", "geo_quality": "Blocked time",
+                "lat": float("nan"), "lon": float("nan"), "priority": float("nan"),
+                "start_time": start_dt.isoformat(), "end_time": end_dt.isoformat(),
+                "scheduled_date": start_dt.strftime("%Y-%m-%d"), "inspection_time": start_dt.strftime("%H:%M")})
+    st.session_state.claims_df = pd.concat([cdf, pd.DataFrame([row])], ignore_index=True)
+    st.session_state.editor_version += 1
+    displace_drafts({"start": start_dt.isoformat(), "end": end_dt.isoformat(),
+                     "date_str": start_dt.strftime("%Y-%m-%d")}, booked_ids={bid})
+    return None
+
+
+def remove_block(bid):
+    cdf = st.session_state.claims_df
+    st.session_state.claims_df = cdf[cdf["claim_id"].astype(str) != str(bid)].reset_index(drop=True)
+    st.session_state.editor_version += 1
+
+
 def confirm_draft(cid):
     """Confirms a draft at its current time and records the initial contact."""
     m = st.session_state.claims_df["claim_id"].astype(str) == str(cid)
@@ -397,6 +435,18 @@ def render_slot_picker(claim_id, claims_df, now, settings, current=None, default
             bookable_by_day[d.isoformat()] = compute_day_gaps(d, S["day_start"], S["per_day"], S["window_hrs"],
                                                               busy, now, S["latest_end"])
         d += timedelta(days=1)
+    # Days off inside the deployment dates: bookable by hand, from the day start to the
+    # latest-end time. They never get suggestions or drafts.
+    off_days = set()
+    d = S["start_date"]
+    while d <= S["end_date"]:
+        if d.strftime("%a") not in S["active_days"]:
+            ds_ = d.isoformat()
+            off_days.add(ds_)
+            manual = {d.strftime("%a"): 24}
+            gaps_by_day[ds_] = compute_day_gaps(d, S["day_start"], manual, S["window_hrs"], busy_all, now, S["latest_end"])
+            bookable_by_day[ds_] = compute_day_gaps(d, S["day_start"], manual, S["window_hrs"], busy, now, S["latest_end"])
+        d += timedelta(days=1)
     drafts_by_day = defaultdict(list)
     for b in drafts_busy:
         drafts_by_day[b["start"].strftime("%Y-%m-%d")].append(b)
@@ -479,7 +529,11 @@ def render_slot_picker(claim_id, claims_df, now, settings, current=None, default
                     continue
                 ds = d.isoformat()
                 if ds not in gaps_by_day:
-                    state, tip, can_pick = "off", "Not an inspection day", False
+                    state, tip, can_pick = "off", "Outside your deployment dates", False
+                elif ds in off_days:
+                    state = "dayoff"
+                    tip = "Day off: book by hand if needed" if bookable_by_day[ds] else "No time left"
+                    can_pick = bool(bookable_by_day[ds])
                 elif not bookable_by_day[ds]:
                     state, tip, can_pick = "full", "Fully booked with confirmed inspections", False
                 else:
@@ -496,16 +550,22 @@ def render_slot_picker(claim_id, claims_df, now, settings, current=None, default
                            use_container_width=True, type="primary" if ds == sel_day else "secondary",
                            on_click=pick_day, args=(ds,))
 
-        st.caption("Green: room for 2+ inspections. Amber: room for 1 or less. Hatched: no open time. "
-                   "Faded: not an inspection day.")
+        st.caption("Teal: room for 2+ inspections. Gold outline: room for 1 or less. Dashed: a day off "
+                   "(book by hand). Hatched: no time left. Faded: outside your deployment dates.")
 
     # ---- The selected day ----
     day_d = date.fromisoformat(sel_day)
-    ws, we = day_window(day_d, S["day_start"], S["per_day"], S["window_hrs"], S["latest_end"])
-    st.markdown(f"**{day_d.strftime('%A, %b %d')}** ({tfmt(ws)} - {tfmt(we)} working hours)")
+    if sel_day in off_days:
+        ws, we = day_window(day_d, S["day_start"], {day_d.strftime("%a"): 24}, S["window_hrs"], S["latest_end"])
+        st.markdown(f"**{day_d.strftime('%A, %b %d')}** (a day off in your settings, so it's never suggested; "
+                    "you can still book it by hand)")
+    else:
+        ws, we = day_window(day_d, S["day_start"], S["per_day"], S["window_hrs"], S["latest_end"])
+        st.markdown(f"**{day_d.strftime('%A, %b %d')}** ({tfmt(ws)} - {tfmt(we)} working hours)")
 
     rows = [(b["start"], f"{tfmt(b['start'])} - {tfmt(b['end'])}",
-             f"Draft (unconfirmed): {b['label']}" if b.get("draft") else f"Booked: {b['label']}")
+             f"Draft (unconfirmed): {b['label']}" if b.get("draft") else
+             (f"🚫 {b['label'][0].upper()}{b['label'][1:]}" if b.get("block") else f"Booked: {b['label']}"))
             for b in busy_all if b["start"].date() == day_d]
     if current and current[0] and current[0].date() == day_d:
         rows.append((current[0], f"{tfmt(current[0])} - {tfmt(current[1])}", "This claim's current time"))
@@ -697,11 +757,6 @@ with sb.expander("Deployment parameters", expanded=not st.session_state.get("hot
     start_date = col_d1.date_input("Start date", date.today(), key="start_date")
     end_date = col_d2.date_input("End date", date.today() + timedelta(days=5), key="end_date")
 
-    active_days = st.multiselect(
-        "Inspection days", ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
-        default=["Mon", "Tue", "Wed", "Thu", "Fri"], key="active_days"
-    )
-
     # All schedule times are local to the deployment; this zone is used for the
     # Outlook export and for knowing which inspections are already in the past.
     detected_tz, detected_source = detect_deployment_timezone(st.session_state.claims_df, hotel_address)
@@ -720,10 +775,26 @@ with sb.expander("Deployment parameters", expanded=not st.session_state.get("hot
         "Day start time", _times30, index=_times30.index(datetime.strptime("08:00", "%H:%M").time()),
         format_func=fmt_time12, key="day_start_time"
     )
-    inspections_per_day = st.slider(
-        "Inspections per day", 1, 8, 3, key="per_day",
-        help="Sets the length of your working day: day start time + this many windows."
+    # Inspections per day, set for each day of the week (0 = day off). Suggestions and the
+    # planner follow these; days off and evenings can still be booked by hand.
+    _week = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    if "per_day_counts" not in st.session_state:
+        st.session_state.per_day_counts = {"Mon": 3, "Tue": 3, "Wed": 3, "Thu": 3, "Fri": 3, "Sat": 0, "Sun": 0}
+    st.caption("Inspections per day (0 = day off)")
+    _per_day_edit = st.data_editor(
+        pd.DataFrame([st.session_state.per_day_counts], columns=_week),
+        key="per_day_editor", hide_index=True, use_container_width=True,
+        column_config={d: st.column_config.NumberColumn(d, min_value=0, max_value=8, step=1, format="%d",
+                                                        required=True, width="small") for d in _week},
     )
+    inspections_per_day = {}
+    for d in _week:
+        try:
+            inspections_per_day[d] = max(0, min(8, int(_per_day_edit.iloc[0][d])))
+        except (TypeError, ValueError):
+            inspections_per_day[d] = st.session_state.per_day_counts.get(d, 0)
+    st.session_state.per_day_counts = inspections_per_day
+    active_days = active_days_from(inspections_per_day)
     window_hrs = st.number_input(
         "Window length (hours)", min_value=0.25, max_value=8.00, value=2.50, step=0.25, key="window_hrs",
         help="Starts at the inspection time and covers inspection, estimate, payment and travel. "
@@ -984,7 +1055,7 @@ if st.session_state.claims_df is not None:
     # --- STATUS STATS ---
     scheduled_count = int((df["status"] == "Scheduled").sum())
     stats = [
-        ("Total claims", len(df), GRAY),
+        ("Total claims", int((df["status"] != "Blocked").sum()), GRAY),
         ("Unscheduled", int((df["status"] == "Unscheduled").sum()), RED),
         ("Scheduled", scheduled_count, SCHEDULED_BLUE),
         ("Drafts", int((df["status"] == "Draft").sum()), DRAFT_BLUE),
@@ -1071,7 +1142,7 @@ if st.session_state.claims_df is not None:
     # CALENDAR
     # -----------------------------------------------------------------
     if main_view == "Calendar":
-        scheduled_claims = df[df["status"].isin(["Scheduled", "Draft"])].copy()
+        scheduled_claims = df[df["status"].isin(["Scheduled", "Draft", "Blocked"])].copy()
         scheduled_claims["_start_dt"] = [parse_wallclock(v) for v in scheduled_claims["start_time"]]
         scheduled_claims["_end_dt"] = [parse_wallclock(v) for v in scheduled_claims["end_time"]]
         # Boolean Series (not a plain list): with zero scheduled claims, an empty list
@@ -1126,7 +1197,15 @@ if st.session_state.claims_df is not None:
                 # Inspections can't be dragged or resized over each other
                 "overlap": False,
             }
-            if row["status"] == "Draft":
+            if row["status"] == "Blocked":
+                event.update({
+                    "title": f"🚫 Blocked: {row['insured_name']}",
+                    "classNames": ["block-event"],
+                    "backgroundColor": GRAY_80 if CONSOLE else GRAY_20,
+                    "borderColor": GRAY_60 if CONSOLE else GRAY_40,
+                    "textColor": "#FFFFFF" if CONSOLE else GRAY,
+                })
+            elif row["status"] == "Draft":
                 nxt_txt = ""
                 if cid in drive_next:
                     long_drive = drive_next[cid] > window_hrs * 60 / 3
@@ -1163,23 +1242,6 @@ if st.session_state.claims_df is not None:
                               "borderColor": TEAL if CONSOLE else NAVY, "textColor": "#FFFFFF"})
             calendar_events.append(event)
 
-        # --- SHADING: dates outside the inspection date range ---
-        # (Inactive weekdays and off-hours are shaded by businessHours below.)
-        def shade_range(d_from, d_to):
-            if d_from >= d_to:
-                return
-            for all_day in (True, False):  # all-day version for month view, timed for week/day views
-                calendar_events.append({
-                    "start": d_from.isoformat() if all_day else f"{d_from.isoformat()}T00:00:00",
-                    "end": d_to.isoformat() if all_day else f"{d_to.isoformat()}T00:00:00",
-                    "allDay": all_day,
-                    "display": "background",
-                    "backgroundColor": GRAY_60,
-                })
-
-        shade_range(start_date - timedelta(days=28), start_date)
-        shade_range(end_date + timedelta(days=1), end_date + timedelta(days=60))
-
         # --- VISIBLE HOURS ---
         # Show until 7 PM by default, but extend to fit the inspection windows
         # and any inspection that runs later (or starts earlier) than that.
@@ -1189,7 +1251,7 @@ if st.session_state.claims_df is not None:
             return dt.hour * 60 + dt.minute
 
         day_start_dt = datetime.combine(start_date, start_time_input)
-        day_end_dt = day_start_dt + timedelta(hours=inspections_per_day * window_hrs)
+        day_end_dt = day_start_dt + timedelta(hours=max(inspections_per_day.values() or [0]) * window_hrs)
         window_end_min = minutes_of_day(day_end_dt, start_date)
 
         latest_min = max([19 * 60, window_end_min] +
@@ -1227,20 +1289,17 @@ if st.session_state.claims_df is not None:
             # 12-hour times
             "eventTimeFormat": {"hour": "numeric", "minute": "2-digit", "meridiem": "short"},
             "slotLabelFormat": {"hour": "numeric", "minute": "2-digit", "meridiem": "short"},
-            # Gray shading outside your usual working hours and on non-inspection days
-            "businessHours": {
-                "daysOfWeek": [js_day[d] for d in active_days],
-                "startTime": start_time_input.strftime("%H:%M"),
-                "endTime": day_window(start_date, start_time_input, inspections_per_day, window_hrs,
-                                      latest_end_input)[1].strftime("%H:%M"),
-            },
-            # Inspections can be dragged on inspection days from the day start into the
-            # evening (insureds are often available late), but not onto days off.
-            "eventConstraint": {
-                "daysOfWeek": [js_day[d] for d in active_days],
-                "startTime": start_time_input.strftime("%H:%M"),
-                "endTime": "24:00",
-            },
+            # Gray shading outside each day's usual hours (days off are all gray). It's a
+            # guide only: inspections can be booked or dragged anywhere inside the dates.
+            "businessHours": [
+                {"daysOfWeek": [js_day[d]], "startTime": start_time_input.strftime("%H:%M"),
+                 "endTime": min(datetime.combine(date.today(), start_time_input)
+                                + timedelta(hours=inspections_per_day[d] * window_hrs),
+                                datetime.combine(date.today(), latest_end_input)).strftime("%H:%M")}
+                for d in active_days
+            ],
+            # The deployment dates are hard limits: nothing can be booked or dragged outside them
+            "validRange": {"start": start_date.isoformat(), "end": (end_date + timedelta(days=1)).isoformat()},
         }
 
         calendar_css = f"""
@@ -1274,6 +1333,9 @@ if st.session_state.claims_df is not None:
             .fc-event.past-event .fc-event-title {{ text-decoration: line-through; }}
             .fc-event.next-event {{ font-weight: 700; }}
             .fc-event.draft-event {{ border-style: dashed !important; border-width: 2px !important; font-style: italic; }}
+            .fc-event.block-event {{
+                background-image: repeating-linear-gradient(135deg, rgba(0,0,0,0.06) 0 6px, transparent 6px 12px) !important;
+            }}
         """
         if CONSOLE:
             calendar_css += f"""
@@ -1302,19 +1364,78 @@ if st.session_state.claims_df is not None:
             }}
             """
 
+        with st.expander("🚫 Block off time"):
+            st.caption("For team calls, appointments or time off. Nothing gets suggested or drafted there. "
+                       "Tip: you can also drag across empty time on the calendar.")
+            _t15 = time_options(15)
+            bk1, bk2, bk3 = st.columns(3)
+            blk_day = bk1.date_input("Date", value=max(start_date, min(now_local.date(), end_date)),
+                                     min_value=start_date, max_value=end_date, key="blk_day")
+            blk_start = bk2.selectbox("From", _t15, index=_t15.index(datetime.strptime("12:00", "%H:%M").time()),
+                                      format_func=fmt_time12, key="blk_start")
+            blk_end = bk3.selectbox("To", _t15, index=_t15.index(datetime.strptime("13:00", "%H:%M").time()),
+                                    format_func=fmt_time12, key="blk_end")
+            blk_label = st.text_input("Label", placeholder="Team call, lunch, time off...", key="blk_label")
+            if st.button("Block this time", type="primary", key="blk_add"):
+                err = create_block(datetime.combine(blk_day, blk_start), datetime.combine(blk_day, blk_end), blk_label)
+                if err:
+                    st.error(err)
+                else:
+                    st.toast("Time blocked")
+                    st.rerun()
+
         cal_event = calendar(
             events=calendar_events,
             options=calendar_options,
             custom_css=calendar_css,
             # Only click and drag/resize. The default also reports "eventsSet" on every
             # render, which reruns the whole app and keeps rebuilding the map.
-            callbacks=["eventClick", "eventChange"],
+            # (plus "select": drag across empty time to block it off)
+            callbacks=["eventClick", "eventChange", "select"],
             key="claims_calendar"
         ) or {}
 
         # --- CLICK A BLOCK: directions + manage ---
         clicked = (cal_event.get("eventClick") or {}).get("event") or {}
         clicked_id = str(clicked.get("id") or "")
+        blk_rows = df[(df["claim_id"].astype(str) == clicked_id) & (df["status"] == "Blocked")] if clicked_id else df.iloc[0:0]
+        if not blk_rows.empty:
+            b = blk_rows.iloc[0]
+            b_s, b_e = parse_wallclock(b["start_time"]), parse_wallclock(b["end_time"])
+            with st.container(border=True):
+                st.markdown(f"**🚫 Blocked: {esc(b['insured_name'])}**  \n"
+                            f"{fmt_dt(b_s)} to {b_e.strftime('%I:%M %p').lstrip('0') if b_e else ''}")
+                st.caption("Drag it on the calendar to move it, or drag its bottom edge to change the length.")
+                if st.button("Remove this block", key=f"rm_{clicked_id}"):
+                    remove_block(clicked_id)
+                    st.rerun()
+            clicked_id = ""
+
+        sel = cal_event.get("select") or {}
+        if sel.get("start"):
+            sel_sig = (sel.get("start"), sel.get("end"))
+            if st.session_state.get("handled_select") != sel_sig:
+                s0, s1 = parse_wallclock(sel.get("start")), parse_wallclock(sel.get("end"))
+                if sel.get("allDay") and s0:   # month view: block that day's usual hours
+                    s0 = datetime.combine(s0.date(), start_time_input)
+                    s1 = datetime.combine(s0.date(), latest_end_input)
+                if s0 and s1:
+                    with st.container(border=True):
+                        st.markdown(f"**Block off {fmt_dt(s0)} to {s1.strftime('%I:%M %p').lstrip('0')}?**")
+                        sel_label = st.text_input("Label", placeholder="Team call, lunch, time off...", key="sel_blk_label")
+                        sb1, sb2 = st.columns(2)
+                        if sb1.button("Block this time", type="primary", key="sel_blk_add", use_container_width=True):
+                            err = create_block(s0, s1, sel_label)
+                            if err:
+                                st.error(err)
+                            else:
+                                st.session_state["handled_select"] = sel_sig
+                                st.toast("Time blocked")
+                                st.rerun()
+                        if sb2.button("Cancel", key="sel_blk_cancel", use_container_width=True):
+                            st.session_state["handled_select"] = sel_sig
+                            st.rerun()
+
         if clicked_id:
             c_rows = df[(df["claim_id"].astype(str) == clicked_id) & (df["status"].isin(["Scheduled", "Draft"]))]
             if not c_rows.empty:
@@ -1758,7 +1879,7 @@ if st.session_state.claims_df is not None:
 
     with col_right:
         st.subheader("Manage a claim")
-        claim_options = df["display_label"].tolist()
+        claim_options = df.loc[df["status"] != "Blocked", "display_label"].tolist()
 
         if "managed_claim_select" not in st.session_state or st.session_state["managed_claim_select"] not in claim_options:
             st.session_state["managed_claim_select"] = claim_options[0]
@@ -1889,8 +2010,10 @@ if st.session_state.claims_df is not None:
         with pc1:
             st.markdown("**Plan my schedule**")
             st.caption("Builds draft appointments for your unscheduled claims: priorities first, then grouped "
-                       "by area and ordered as routes. Confirmed appointments never move. Confirm each draft "
-                       "after the insured agrees. Can take up to a minute for large lists.")
+                       "by area and ordered as routes. Confirmed appointments and blocked time never move. "
+                       "Confirm each draft after the insured agrees. Can take up to a minute for large lists.")
+            st.caption("💡 Add any blocked time you already know about (team calls, appointments, time off) "
+                       "before planning, so drafts are built around it.")
         plan_clicked = pc2.button("Re-plan drafts" if n_drafts else "Plan my schedule", type="primary",
                                   use_container_width=True, disabled=cap["claims"] == 0)
         clear_clicked = pc3.button("Clear drafts", use_container_width=True, disabled=n_drafts == 0,
