@@ -1,15 +1,16 @@
 # Two themes. Viewers switch between them in Streamlit's own menu.
-# primaryColor drives main buttons and selected states (toggles, sliders,
-# checkboxes, the Calendar/Map switch).
+# primaryColor drives selection states (table selection, checkboxes, toggles,
+# sliders, chosen filter tags): teal. Main action buttons and the Calendar/Map
+# switch are red, set in the app's CSS.
 
 [theme.light]
-primaryColor = "#E01719"
+primaryColor = "#007395"
 backgroundColor = "#FFFFFF"
 secondaryBackgroundColor = "#F6F6F6"
 textColor = "#46494D"
 
 [theme.dark]
-primaryColor = "#E01719"
+primaryColor = "#99C7D5"
 backgroundColor = "#003557"
 secondaryBackgroundColor = "#46494D"
 textColor = "#FFFFFF"
