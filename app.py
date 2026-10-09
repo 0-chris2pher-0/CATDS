@@ -1405,9 +1405,9 @@ if st.session_state.claims_df is not None:
 
         calendar_options = {
             "headerToolbar": {"left": "prev,next today", "center": "title",
-                              "right": "timeGridDay,timeGridWeek,dayGridFourWeeks,dayGridMonth"},
-            # A 4-week view: the easiest place to drag an appointment across weeks or months
-            "views": {"dayGridFourWeeks": {"type": "dayGrid", "duration": {"weeks": 4}, "buttonText": "4 weeks"}},
+                              "right": "timeGridDay,timeGridWeek,dayGridFiveWeeks,dayGridMonth"},
+            # A 5-week view: the easiest place to drag an appointment across weeks or months
+            "views": {"dayGridFiveWeeks": {"type": "dayGrid", "duration": {"weeks": 5}, "buttonText": "5 weeks"}},
             "initialView": "timeGridWeek",
             "initialDate": st.session_state.get("cal_focus_date", start_date.strftime("%Y-%m-%d")),
             "slotMinTime": hhmm(slot_min_min),
