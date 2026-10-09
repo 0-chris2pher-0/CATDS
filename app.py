@@ -49,6 +49,7 @@ from engine import (
     parse_date_time_12h,
     build_export_table,
     plan_draft_schedule,
+    inspection_date_checks,
     capacity_report,
     best_spot_for_draft,
     get_osrm_route,
@@ -258,6 +259,9 @@ def book_claim_into_slot(claim_mask, slot):
     """
     cdf = st.session_state.claims_df
     for i in cdf.index[claim_mask]:
+        note_outlook_change(cdf.at[i, "claim_id"],
+                            "moved" if cdf.at[i, "status"] in ("Scheduled", "Inspected") else "added",
+                            f"{cdf.at[i, 'claim_id']} - {cdf.at[i, 'insured_name']}")
         if "first_booked_at" not in cdf.columns:
             cdf["first_booked_at"] = ""
         if not clean_text(cdf.at[i, "first_booked_at"]):
@@ -271,6 +275,29 @@ def book_claim_into_slot(claim_mask, slot):
     st.session_state.claims_df.loc[claim_mask, "inspection_time"] = parse_wallclock(slot["start"]).strftime("%H:%M")
     st.session_state.editor_version += 1
     displace_drafts(slot, booked_ids={str(c) for c in cdf.loc[claim_mask, "claim_id"]})
+
+
+def note_outlook_change(cid, kind, label=None):
+    """
+    Tracks confirmed-appointment changes since the last Outlook export.
+    kind: 'added', 'moved' or 'cancelled'. Cancelled ones must be deleted in Outlook by hand.
+    """
+    ch = st.session_state.setdefault("outlook_changes", {})
+    labels = st.session_state.setdefault("outlook_labels", {})
+    cid = str(cid)
+    if label:
+        labels[cid] = label
+    prev = ch.get(cid)
+    if kind == "cancelled" and prev == "added":
+        ch.pop(cid, None)          # added and cancelled since the last export: nothing to do in Outlook
+    elif kind == "moved" and prev == "added":
+        pass                        # still a new appointment for Outlook
+    else:
+        ch[cid] = kind
+
+
+def clear_outlook_changes():
+    st.session_state["outlook_changes"] = {}
 
 
 def set_claim_times(cid, status, slot=None):
@@ -351,6 +378,11 @@ def remove_claim(cid):
     reassigned back later, it comes in as a new claim on the next updated list.
     """
     cdf = st.session_state.claims_df
+    gone = cdf[cdf["claim_id"].astype(str) == str(cid)]
+    if not gone.empty and gone.iloc[0]["status"] == "Scheduled":
+        g = gone.iloc[0]
+        s_ = parse_wallclock(g.get("start_time"))
+        note_outlook_change(cid, "cancelled", f"{cid} - {g['insured_name']}" + (f" ({fmt_dt(s_)})" if s_ else ""))
     st.session_state.claims_df = cdf[cdf["claim_id"].astype(str) != str(cid)].reset_index(drop=True)
     st.session_state.export_ids = st.session_state.get("export_ids", set()) - {str(cid)}
     st.session_state.editor_version += 1
@@ -990,6 +1022,11 @@ if uploaded_file is not None:
             with st.spinner("Reading the claims list and looking up addresses..."):
                 st.session_state.claims_df = process_imported_table(read_claims_file(uploaded_file))
                 st.session_state.processed_upload_sig = upload_sig
+                # Compare the claim platform's Inspection Date with the (new) calendar
+                checks = inspection_date_checks(st.session_state.claims_df, now_local.date())
+                if checks:
+                    st.session_state.review_queue = checks
+                    st.session_state.review_total = len(checks)
                 st.rerun()
         except Exception as e:
             st.error(f"Couldn't read that file: {e}")
@@ -1034,8 +1071,17 @@ if uploaded_file is not None:
                             for field in ("phone", "email"):
                                 if fill.get(field):
                                     st.session_state.claims_df.loc[fmask, field] = fill[field]
+                        # Keep each claim's latest Inspection Date from the claim platform
+                        _cdf = st.session_state.claims_df
+                        if "platform_inspection_date" not in _cdf.columns:
+                            _cdf["platform_inspection_date"] = ""
+                        for _cid, _pd in plan.get("platform_dates", {}).items():
+                            _cdf.loc[_cdf["claim_id"].astype(str) == _cid, "platform_inspection_date"] = _pd
+                        in_list = set(plan.get("platform_dates", {}).keys())
+                        date_items = [i for i in inspection_date_checks(_cdf, now_local.date()) if i["claim_id"] in in_list]
                         queue = ([{"type": "address", **c} for c in plan["address_changes"]] +
-                                 [{"type": "missing", "claim_id": cid} for cid in plan["missing"]])
+                                 [{"type": "missing", "claim_id": cid} for cid in plan["missing"]] +
+                                 date_items)
                         st.session_state.review_queue = queue
                         st.session_state.review_total = len(queue)
                         st.session_state.processed_upload_sig = upload_sig
@@ -1075,9 +1121,96 @@ if review_queue and st.session_state.claims_df is not None:
         sched_note = f"It's scheduled for **{fmt_dt(s_dt)}**." if s_dt else "It's scheduled."
 
     with st.container(border=True):
-        st.caption(f"Reviewing updated list: {position} of {st.session_state.get('review_total', len(review_queue))}")
+        st.caption(f"Reviewing your imported list: {position} of {st.session_state.get('review_total', len(review_queue))}")
 
-        if item["type"] == "missing":
+        if item["type"] in ("past_date", "date_mismatch", "not_on_calendar"):
+            p_day = date.fromisoformat(item["platform_date"])
+            p_txt = p_day.strftime("%a %m/%d")
+            mask = cdf["claim_id"].astype(str) == cid
+
+            def mark_inspected(c_id, day_):
+                m_ = st.session_state.claims_df["claim_id"].astype(str) == c_id
+                r_ = st.session_state.claims_df[m_].iloc[0]
+                s_ = parse_wallclock(r_.get("start_time"))
+                if s_ and s_.date() == day_:
+                    slot_ = {"start": r_["start_time"], "end": r_["end_time"], "date_str": day_.isoformat()}
+                else:   # time unknown: place it at the day's start, one window long
+                    slot_ = make_slot(datetime.combine(day_, start_time_input), window_hrs)
+                set_claim_times(c_id, "Inspected", slot_)
+                if not clean_text(st.session_state.claims_df.loc[m_, "first_booked_at"].iloc[0]):
+                    st.session_state.claims_df.loc[m_, "first_booked_at"] = slot_["start"]
+
+            if item["type"] == "past_date":
+                st.markdown(f"The claim platform shows **{cid} - {row['insured_name']}** was inspected on "
+                            f"**{p_txt}**. {sched_note}")
+                st.caption("Mark it as inspected to move it to your inspected claims. If its time isn't on your "
+                           "calendar, it's recorded at your day start time.")
+                b1, b2 = st.columns(2)
+                if b1.button("Mark as inspected", type="primary", use_container_width=True, key=f"rv_insp_{cid}"):
+                    mark_inspected(cid, p_day)
+                    finish_review_item()
+                    st.rerun()
+                if b2.button("Leave as is", use_container_width=True, key=f"rv_leave_{cid}"):
+                    finish_review_item()
+                    st.rerun()
+                more_past = [i for i in st.session_state.review_queue if i.get("type") == "past_date"]
+                if len(more_past) > 1 and st.button(f"Mark all {len(more_past)} past-dated claims as inspected",
+                                                    key="rv_insp_all", use_container_width=True):
+                    for i in more_past:
+                        if (st.session_state.claims_df["claim_id"].astype(str) == i["claim_id"]).any():
+                            mark_inspected(i["claim_id"], date.fromisoformat(i["platform_date"]))
+                    st.session_state.review_queue = [i for i in st.session_state.review_queue if i.get("type") != "past_date"]
+                    st.session_state.editor_version += 1
+                    st.session_state.map_nonce += 1
+                    st.rerun()
+
+            elif item["type"] == "date_mismatch":
+                a_start = parse_wallclock(item["app_start"])
+                a_end = parse_wallclock(row.get("end_time"))
+                st.markdown(f"The claim platform shows **{cid} - {row['insured_name']}** inspecting on **{p_txt}**, "
+                            f"but your calendar has it on **{fmt_dt(a_start)}**.")
+                new_start = datetime.combine(p_day, a_start.time())
+                dur_hrs = ((a_end - a_start).total_seconds() / 3600) if a_end else window_hrs
+                clash = find_overlap(new_start, new_start + timedelta(hours=dur_hrs),
+                                     get_busy_intervals(cdf, exclude_claim_id=cid))
+                b1, b2, b3 = st.columns(3)
+                if b1.button("Keep my calendar", use_container_width=True, key=f"rv_keepcal_{cid}"):
+                    finish_review_item()
+                    st.rerun()
+                if b2.button(f"Move to {p_day.strftime('%m/%d')}", type="primary", use_container_width=True,
+                             key=f"rv_move_{cid}", disabled=bool(clash),
+                             help=None if not clash else f"That time overlaps {clash['label']}. Pick a new time instead."):
+                    book_claim_into_slot(mask, make_slot(new_start, dur_hrs))
+                    finish_review_item()
+                    st.toast(f"Moved {cid} to {fmt_dt(new_start)}")
+                    st.rerun()
+                if b3.button("Pick a new time", use_container_width=True, key=f"rv_pick_{cid}"):
+                    st.session_state["selected_claim_id"] = cid
+                    st.session_state[f"pick_cal_{cid}"] = True
+                    st.session_state[f"pick_day_{cid}"] = p_day.isoformat()
+                    finish_review_item()
+                    st.toast("Pick a time in Manage a claim")
+                    st.rerun()
+                if clash:
+                    st.caption(f"Keeping your time on {p_txt} would overlap {clash['label']}, so pick a new time instead.")
+
+            else:   # not_on_calendar
+                st.markdown(f"The claim platform shows an inspection for **{cid} - {row['insured_name']}** on "
+                            f"**{p_txt}**, but it isn't confirmed on your calendar.")
+                b1, b2 = st.columns(2)
+                if b1.button(f"Pick a time on {p_day.strftime('%m/%d')}", type="primary", use_container_width=True,
+                             key=f"rv_pick_{cid}"):
+                    st.session_state["selected_claim_id"] = cid
+                    st.session_state[f"pick_cal_{cid}"] = True
+                    st.session_state[f"pick_day_{cid}"] = p_day.isoformat()
+                    finish_review_item()
+                    st.toast("Pick a time in Manage a claim")
+                    st.rerun()
+                if b2.button("Ignore", use_container_width=True, key=f"rv_ignore_date_{cid}"):
+                    finish_review_item()
+                    st.rerun()
+
+        elif item["type"] == "missing":
             st.markdown(f"**{cid} - {row['insured_name']}** isn't in the new list. "
                         f"It may have been closed or reassigned. {sched_note}")
             st.caption(row["full_address"])
@@ -1140,6 +1273,14 @@ if st.session_state.claims_df is not None:
             cdf[text_col] = ""
         cdf[text_col] = cdf[text_col].apply(clean_text).astype(object)
     cdf["phone"] = cdf["phone"].apply(normalize_phone)
+    if "platform_inspection_date" not in cdf.columns:
+        cdf["platform_inspection_date"] = ""
+    # A confirmed inspection becomes Inspected once its end time passes
+    _ends = cdf["end_time"].apply(parse_wallclock)
+    _done = (cdf["status"] == "Scheduled") & _ends.apply(lambda e_: e_ is not None and e_ <= now_local)
+    if _done.any():
+        cdf.loc[_done, "status"] = "Inspected"
+
     # Older saved files may have Ignored/Removed claims: bring them back as Unscheduled,
     # so nothing is silently lost (they can be removed for good from Manage a claim)
     _old = cdf["status"].isin(["Ignored", "Removed"])
@@ -1162,6 +1303,7 @@ if st.session_state.claims_df is not None:
         ("Total claims", int((df["status"] != "Blocked").sum()), GRAY),
         ("Unscheduled", int((df["status"] == "Unscheduled").sum()), RED),
         ("Scheduled", scheduled_count, SCHEDULED_BLUE),
+        ("Inspected", int((df["status"] == "Inspected").sum()), GRAY_80),
         ("Drafts", int((df["status"] == "Draft").sum()), DRAFT_BLUE),
         ("Location issues", int(review_mask.sum()), ISSUE_ORANGE),
     ]
@@ -1218,13 +1360,37 @@ if st.session_state.claims_df is not None:
 
     st.markdown("---")
 
+    _changes = st.session_state.get("outlook_changes", {})
+    if _changes:
+        _labels = st.session_state.get("outlook_labels", {})
+        n_add = sum(1 for v in _changes.values() if v == "added")
+        n_mov = sum(1 for v in _changes.values() if v == "moved")
+        cancelled = [_labels.get(c, c) for c, v in _changes.items() if v == "cancelled"]
+        parts = []
+        if n_add:
+            parts.append(f"{n_add} added")
+        if n_mov:
+            parts.append(f"{n_mov} moved")
+        msg = f"**Outlook is out of date:** {len(_changes)} change(s) since your last export"
+        msg += f" ({', '.join(parts)})." if parts else "."
+        if n_add or n_mov:
+            msg += " Export again to update it."
+        if cancelled:
+            msg += ("  \nDelete these from Outlook yourself, since an export can't remove appointments: "
+                    + "; ".join(cancelled) + ".")
+        oc1, oc2 = st.columns([5, 1], vertical_alignment="center")
+        oc1.info(msg)
+        oc2.button("Dismiss", key="dismiss_outlook", on_click=clear_outlook_changes,
+                   help="Clears this reminder without exporting.")
+
     if scheduled_count > 0:
         ics_data = export_claims_to_ics(df, ics_tz)
         st.download_button(
             label=f"📅 Export {scheduled_count} inspection(s) to Outlook ({tz_display} time)",
             data=ics_data,
             file_name="cat_inspection_schedule.ics",
-            mime="text/calendar"
+            mime="text/calendar",
+            on_click=clear_outlook_changes
         )
         st.markdown(" ")
 
@@ -1244,7 +1410,7 @@ if st.session_state.claims_df is not None:
     # CALENDAR
     # -----------------------------------------------------------------
     if main_view == "Calendar":
-        scheduled_claims = df[df["status"].isin(["Scheduled", "Draft", "Blocked"])].copy()
+        scheduled_claims = df[df["status"].isin(["Scheduled", "Inspected", "Draft", "Blocked"])].copy()
         scheduled_claims["_start_dt"] = [parse_wallclock(v) for v in scheduled_claims["start_time"]]
         scheduled_claims["_end_dt"] = [parse_wallclock(v) for v in scheduled_claims["end_time"]]
         # Boolean Series (not a plain list): with zero scheduled claims, an empty list
@@ -1330,6 +1496,8 @@ if st.session_state.claims_df is not None:
                 # inspections or blocked time (drafts can be overlapped, then re-planned)
                 "overlap": True,
             }
+            if row["status"] == "Inspected":
+                event["title"] = f"✓ {event['title']}"
             if row["status"] == "Blocked":
                 event.update({
                     "title": f"🚫 Blocked: {row['insured_name']}",
@@ -1405,9 +1573,9 @@ if st.session_state.claims_df is not None:
 
         calendar_options = {
             "headerToolbar": {"left": "prev,next today", "center": "title",
-                              "right": "timeGridDay,timeGridWeek,dayGridFiveWeeks,dayGridMonth"},
-            # A 5-week view: the easiest place to drag an appointment across weeks or months
-            "views": {"dayGridFiveWeeks": {"type": "dayGrid", "duration": {"weeks": 5}, "buttonText": "5 weeks"}},
+                              "right": "timeGridDay,timeGridWeek,dayGridFourWeeks,dayGridMonth"},
+            # A 4-week view: the easiest place to drag an appointment across weeks or months
+            "views": {"dayGridFourWeeks": {"type": "dayGrid", "duration": {"weeks": 4}, "buttonText": "4 weeks"}},
             "initialView": "timeGridWeek",
             "initialDate": st.session_state.get("cal_focus_date", start_date.strftime("%Y-%m-%d")),
             "slotMinTime": hhmm(slot_min_min),
@@ -1590,7 +1758,7 @@ if st.session_state.claims_df is not None:
                             st.rerun()
 
         if clicked_id:
-            c_rows = df[(df["claim_id"].astype(str) == clicked_id) & (df["status"].isin(["Scheduled", "Draft"]))]
+            c_rows = df[(df["claim_id"].astype(str) == clicked_id) & (df["status"].isin(["Scheduled", "Inspected", "Draft"]))]
             if not c_rows.empty:
                 c_row = c_rows.iloc[0]
                 # Select it in Manage a claim (once per click, so choosing another claim
@@ -1644,6 +1812,13 @@ if st.session_state.claims_df is not None:
                 st.session_state.claims_df.loc[c_mask, "end_time"] = new_end.isoformat()
                 st.session_state.claims_df.loc[c_mask, "scheduled_date"] = new_start.strftime("%Y-%m-%d")
                 st.session_state.claims_df.loc[c_mask, "inspection_time"] = new_start.strftime("%H:%M")
+                # Moving an inspected or confirmed appointment: it's scheduled again (it turns back to
+                # Inspected on its own if the new time has already passed), and Outlook needs an update
+                _prev = st.session_state.claims_df.loc[c_mask, "status"]
+                if _prev.isin(["Scheduled", "Inspected"]).any():
+                    st.session_state.claims_df.loc[c_mask & st.session_state.claims_df["status"].eq("Inspected"),
+                                                   "status"] = "Scheduled"
+                    note_outlook_change(cid, "moved")
                 st.session_state.editor_version += 1
                 st.toast(f"Moved {cid} to {fmt_dt(new_start)}")
                 st.rerun()
@@ -1728,7 +1903,7 @@ if st.session_state.claims_df is not None:
             layer.add_to(m)
 
         day_colors = ["blue", "green", "purple", "darkblue", "darkred", "cadetblue", "darkgreen", "pink"]
-        scheduled_dates = sorted([d for d in mdf[mdf["status"].isin(["Scheduled", "Draft"])]["scheduled_date"].unique() if d])
+        scheduled_dates = sorted([d for d in mdf[mdf["status"].isin(["Scheduled", "Inspected", "Draft"])]["scheduled_date"].unique() if d])
         date_color_map = {d: day_colors[i % len(day_colors)] for i, d in enumerate(scheduled_dates)}
 
         bounds = []
@@ -1750,6 +1925,9 @@ if st.session_state.claims_df is not None:
             elif row["status"] == "Unscheduled":
                 marker_color = "red"
                 icon_type = "exclamation-sign" if needs_review else ""
+            elif row["status"] == "Inspected":
+                marker_color = "lightgray"
+                icon_type = "exclamation-sign" if needs_review else "ok"
             else:
                 marker_color = date_color_map.get(row.get("scheduled_date"), "blue")
                 icon_type = "exclamation-sign" if needs_review else (
@@ -1871,8 +2049,8 @@ if st.session_state.claims_df is not None:
         if "export_ids" not in st.session_state:
             st.session_state.export_ids = set()
 
-        show_status = st.multiselect("Show statuses", ["Unscheduled", "Draft", "Scheduled"],
-                                     default=["Unscheduled", "Draft", "Scheduled"])
+        show_status = st.multiselect("Show statuses", ["Unscheduled", "Draft", "Scheduled", "Inspected"],
+                                     default=["Unscheduled", "Draft", "Scheduled", "Inspected"])
         view = df[df["status"].isin(show_status)]
 
         # Table shown to the rep: friendly columns, using the claim platform's header names
@@ -1883,7 +2061,7 @@ if st.session_state.claims_df is not None:
         rows = {}
         for i, r in view.iterrows():
             contact_dt = parse_wallclock(r.get("first_booked_at"))
-            act_dt = parse_wallclock(r.get("start_time")) if r["status"] == "Scheduled" else None
+            act_dt = parse_wallclock(r.get("start_time")) if r["status"] in ("Scheduled", "Inspected") else None
             c_date, c_time, c_ap = split_12h(contact_dt)
             a_date, a_time, a_ap = split_12h(act_dt)
             rows[i] = {
@@ -1922,9 +2100,10 @@ if st.session_state.claims_df is not None:
                 "Priority": st.column_config.NumberColumn("Priority", help="1 = highest. Leave blank for unranked claims.",
                                                           min_value=1, step=1, format="%d"),
                 "Status": st.column_config.SelectboxColumn(
-                    "Status", options=["Unscheduled", "Draft", "Scheduled"], required=True,
-                    help="Schedule a claim from Manage a claim, so it gets a real time. "
-                         "Changing a Draft to Scheduled confirms it. To remove a claim, use Manage a claim."),
+                    "Status", options=["Unscheduled", "Draft", "Scheduled", "Inspected"], required=True,
+                    help="Schedule a claim from Manage a claim, so it gets a real time. Changing a Draft to "
+                         "Scheduled confirms it. A scheduled claim can be marked Inspected. To remove a claim, "
+                         "use Manage a claim."),
                 "Type of Contact": st.column_config.TextColumn(
                     "Type of Contact", help="Initial contact, once a contact date and time are recorded."),
                 "Date Contact Completed": st.column_config.TextColumn(
@@ -1962,7 +2141,12 @@ if st.session_state.claims_df is not None:
                 changes_made = True
 
             if new["Status"] != old["Status"]:
-                if new["Status"] == "Unscheduled":
+                if new["Status"] == "Inspected" and old["Status"] == "Scheduled":
+                    cdf.at[row_idx, "status"] = "Inspected"
+                    changes_made = True
+                elif new["Status"] == "Unscheduled":
+                    if old["Status"] == "Scheduled":
+                        note_outlook_change(cid, "cancelled", f"{cid} - {old['Insured']}")
                     cdf.at[row_idx, "status"] = new["Status"]
                     cdf.at[row_idx, "start_time"] = None
                     cdf.at[row_idx, "end_time"] = None
@@ -2151,11 +2335,32 @@ if st.session_state.claims_df is not None:
                             st.rerun()
 
                     if st.button("Remove from schedule"):
+                        note_outlook_change(selected_claim_id, "cancelled",
+                                            f"{selected_claim_id} - {current_claim['insured_name']} "
+                                            f"({fmt_dt(parse_wallclock(current_claim['start_time']))})")
                         st.session_state.claims_df.loc[claim_mask, "status"] = "Unscheduled"
                         st.session_state.claims_df.loc[claim_mask, "start_time"] = None
                         st.session_state.claims_df.loc[claim_mask, "end_time"] = None
                         st.session_state.claims_df.loc[claim_mask, "scheduled_date"] = ""
                         st.session_state.claims_df.loc[claim_mask, "inspection_time"] = ""
+                        st.session_state.editor_version += 1
+                        st.rerun()
+
+                elif current_claim["status"] == "Inspected":
+                    i_start = parse_wallclock(current_claim["start_time"])
+                    st.markdown(f"**Inspected:** {fmt_dt(i_start) or 'date not recorded'}")
+                    st.caption("If this inspection didn't actually happen, for example a reschedule that wasn't moved, "
+                               "pick a new time below and it goes back to Scheduled.")
+                    re_slot = render_slot_picker(
+                        selected_claim_id, st.session_state.claims_df, now_local, schedule_settings,
+                        current=(i_start, parse_wallclock(current_claim["end_time"])), default_hrs=claim_length
+                    )
+                    if re_slot and st.button("🔁 Reschedule to this time", type="primary", key=f"resched_{selected_claim_id}"):
+                        book_claim_into_slot(claim_mask, re_slot)
+                        st.rerun()
+                    if st.button("Mark as not inspected", key=f"uninsp_{selected_claim_id}",
+                                 help="Clears its time and puts it back in your unscheduled claims."):
+                        set_claim_times(selected_claim_id, "Unscheduled")
                         st.session_state.editor_version += 1
                         st.rerun()
 
