@@ -194,9 +194,6 @@ st.markdown(f"""
 .cat-card-title {{ font-size: 1.05rem; font-weight: 600; margin: 0.1rem 0; color: {GRAY}; }}
 .cat-card-sub {{ font-size: 0.9rem; color: {GRAY_80}; }}
 
-@media (prefers-reduced-motion: reduce) {{
-    *, *::before, *::after {{ transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; }}
-}}
 </style>
 """, unsafe_allow_html=True)
 
@@ -310,6 +307,7 @@ def displace_drafts(slot, booked_ids):
             notes.append(f"Draft {cid} had no open spot left, so it's back to Unscheduled.")
     if notes:
         st.session_state["draft_notice"] = " ".join(notes)
+        st.toast("A draft moved to make room. You can re-plan to optimize.")
 
 
 def create_block(start_dt, end_dt, label):
@@ -357,6 +355,46 @@ def remove_claim(cid):
     st.session_state.export_ids = st.session_state.get("export_ids", set()) - {str(cid)}
     st.session_state.editor_version += 1
     st.session_state.map_nonce += 1
+
+
+def run_planner():
+    """Rebuilds all unconfirmed drafts around confirmed inspections and blocked time."""
+    df_ = st.session_state.claims_df
+    bar = st.progress(0.0, text="Starting...")
+    drafts, summary = plan_draft_schedule(df_, schedule_settings, hotel_coords, now_local,
+                                          latest_first=FILL_LATEST_FIRST,
+                                          progress=lambda f, t: bar.progress(min(max(f, 0.0), 1.0), text=t))
+    bar.empty()
+    for cid_ in df_.loc[df_["status"] == "Draft", "claim_id"].astype(str).tolist():
+        set_claim_times(cid_, "Unscheduled")
+    for dft in drafts:
+        set_claim_times(dft["claim_id"], "Draft", {"start": dft["start"], "end": dft["end"],
+                                                   "date_str": dft["start"][:10]})
+    st.session_state["plan_summary"] = summary
+    st.session_state.pop("draft_notice", None)
+    st.session_state.editor_version += 1
+    st.session_state.map_nonce += 1
+
+
+def render_draft_notice(where):
+    """
+    After a confirmed booking or block moves a draft: say where it went, and offer a
+    full re-plan to optimize all remaining drafts (or keep things as they are).
+    """
+    note = st.session_state.get("draft_notice")
+    if not note:
+        return
+    with st.container(border=True):
+        st.markdown(f"**Draft moved.** {note}")
+        st.caption("Only that draft moved, so the rest of your plan stays put. Re-planning rebuilds all "
+                   "unconfirmed drafts around your confirmed appointments for the best routes.")
+        n1, n2 = st.columns(2)
+        if n1.button("Re-plan drafts to optimize", type="primary", use_container_width=True, key=f"dn_replan_{where}"):
+            run_planner()
+            st.rerun()
+        if n2.button("Keep as is", use_container_width=True, key=f"dn_keep_{where}"):
+            st.session_state.pop("draft_notice", None)
+            st.rerun()
 
 
 def confirm_draft(cid):
@@ -1176,8 +1214,7 @@ if st.session_state.claims_df is not None:
                          "No better matches found. Fix these on the map.")
                 st.rerun()
 
-    if st.session_state.get("draft_notice"):
-        st.info(st.session_state.pop("draft_notice"))
+    render_draft_notice("top")
 
     st.markdown("---")
 
@@ -1272,6 +1309,15 @@ if st.session_state.claims_df is not None:
                 if lb:
                     leave_note[str(f["claim_id"])] = lb.strftime("%I:%M %p").lstrip("0")
 
+        # Drafts that overlap another appointment (allowed, flagged until confirmed or re-planned)
+        overlapping_drafts = set()
+        _iv = [(str(r["claim_id"]), r["status"], r["_start_dt"], r["_end_dt"]) for _, r in scheduled_claims.iterrows()]
+        for a_id, a_st, a_s, a_e in _iv:
+            if a_st != "Draft":
+                continue
+            if any(b_id != a_id and max(a_s, b_s) < min(a_e, b_e) for b_id, _, b_s, b_e in _iv):
+                overlapping_drafts.add(a_id)
+
         calendar_events = []
         for _, row in scheduled_claims.iterrows():
             cid = str(row["claim_id"])
@@ -1280,8 +1326,9 @@ if st.session_state.claims_df is not None:
                 "title": f"[{cid}] {row['insured_name']}",
                 "start": row["_start_dt"].isoformat(),
                 "end": row["_end_dt"].isoformat(),
-                # Inspections can't be dragged or resized over each other
-                "overlap": False,
+                # The calendar allows any drop; the app then rejects drops onto confirmed
+                # inspections or blocked time (drafts can be overlapped, then re-planned)
+                "overlap": True,
             }
             if row["status"] == "Blocked":
                 event.update({
@@ -1328,6 +1375,8 @@ if st.session_state.claims_df is not None:
                               "borderColor": TEAL if CONSOLE else NAVY, "textColor": "#FFFFFF"})
             if cid in leave_note:
                 event["title"] = f"{event['title']} · Leave {leave_note[cid]}"
+            if row["status"] == "Draft" and cid in overlapping_drafts:
+                event["title"] = f"⚠️ {event['title']}"
             calendar_events.append(event)
 
         # --- VISIBLE HOURS ---
@@ -1355,11 +1404,17 @@ if st.session_state.claims_df is not None:
         js_day = {"Sun": 0, "Mon": 1, "Tue": 2, "Wed": 3, "Thu": 4, "Fri": 5, "Sat": 6}
 
         calendar_options = {
-            "headerToolbar": {"left": "prev,next today", "center": "title", "right": "timeGridWeek,timeGridDay,dayGridMonth"},
+            "headerToolbar": {"left": "prev,next today", "center": "title",
+                              "right": "timeGridDay,timeGridWeek,dayGridFourWeeks,dayGridMonth"},
+            # A 4-week view: the easiest place to drag an appointment across weeks or months
+            "views": {"dayGridFourWeeks": {"type": "dayGrid", "duration": {"weeks": 4}, "buttonText": "4 weeks"}},
             "initialView": "timeGridWeek",
-            "initialDate": start_date.strftime("%Y-%m-%d"),
+            "initialDate": st.session_state.get("cal_focus_date", start_date.strftime("%Y-%m-%d")),
             "slotMinTime": hhmm(slot_min_min),
             "slotMaxTime": hhmm(slot_max_min),
+            # Compact: a fixed height, with time rows squeezed to fit. Longer days scroll inside
+            # the calendar instead of making the whole page taller.
+            "height": 860 if st.session_state.get("cal_large") else 540,
             "expandRows": True,
             "allDaySlot": False,
             "editable": True,
@@ -1412,6 +1467,8 @@ if st.session_state.claims_df is not None:
             .fc .fc-timegrid-slot-label-cushion {{ color: {GRAY_80}; font-size: 0.78rem; }}
             .fc .fc-daygrid-day-number {{ color: {GRAY_80}; text-decoration: none; }}
             .fc-event {{ border-radius: 5px; font-size: 0.8rem; }}
+            .fc .fc-toolbar.fc-header-toolbar {{ margin-bottom: 0.5em; }}
+            .fc .fc-timegrid-slot {{ height: 1.25em; }}
             .fc-event.past-event {{
                 background-image: repeating-linear-gradient(
                     45deg, rgba(255,255,255,0.55) 0 5px, transparent 5px 10px) !important;
@@ -1450,6 +1507,13 @@ if st.session_state.claims_df is not None:
             }}
             """
 
+        lc1, lc2 = st.columns([1, 3], vertical_alignment="center")
+        lc1.toggle("⤢ Large calendar", key="cal_large", help="A taller calendar for dragging appointments around.")
+        if overlapping_drafts:
+            lc2.caption(f"⚠️ {len(overlapping_drafts)} draft(s) overlap another appointment. Confirming an appointment "
+                        "moves the drafts it overlaps; Re-plan drafts sorts out the rest.")
+        if st.session_state.get("cal_notice"):
+            st.warning(st.session_state.pop("cal_notice"))
         if leave_note:
             st.caption(f"Each day's first inspection shows when to leave the hotel, with a {LEAVE_BUFFER_MIN}-minute "
                        "buffer. Drive times don't include traffic, so check your map app before you leave.")
@@ -1481,7 +1545,7 @@ if st.session_state.claims_df is not None:
             # render, which reruns the whole app and keeps rebuilding the map.
             # (plus "select": drag across empty time to block it off)
             callbacks=["eventClick", "eventChange", "select"],
-            key="claims_calendar"
+            key=f"claims_calendar_{st.session_state.get('cal_nonce', 0)}"
         ) or {}
 
         # --- CLICK A BLOCK: directions + manage ---
@@ -1561,6 +1625,19 @@ if st.session_state.claims_df is not None:
                 cid = str(changed_event["id"])
                 new_start = parse_wallclock(changed_event["start"])
                 new_end = parse_wallclock(changed_event.get("end")) or (new_start + timedelta(hours=window_hrs))
+
+                # Drops onto a confirmed inspection or blocked time aren't allowed: put it back
+                clash = find_overlap(new_start, new_end,
+                                     get_busy_intervals(st.session_state.claims_df, exclude_claim_id=cid))
+                if clash:
+                    st.session_state["cal_notice"] = (
+                        f"{cid} wasn't moved: {fmt_dt(new_start)} overlaps {clash['label']} "
+                        f"({clash['start'].strftime('%I:%M %p').lstrip('0')} - "
+                        f"{clash['end'].strftime('%I:%M %p').lstrip('0')}).")
+                    st.session_state["cal_nonce"] = st.session_state.get("cal_nonce", 0) + 1   # redraw, undoing the drag
+                    st.session_state["cal_focus_date"] = new_start.strftime("%Y-%m-%d")
+                    st.rerun()
+                st.session_state["cal_focus_date"] = new_start.strftime("%Y-%m-%d")
 
                 c_mask = st.session_state.claims_df["claim_id"].astype(str) == cid
                 st.session_state.claims_df.loc[c_mask, "start_time"] = new_start.isoformat()
@@ -1989,6 +2066,8 @@ if st.session_state.claims_df is not None:
             key="managed_claim_select"
         )
 
+        render_draft_notice("manage")
+
         if selected_label:
             selected_claim_id = selected_label.split(" - ")[0].strip()
             claim_mask = st.session_state.claims_df["claim_id"].astype(str) == selected_claim_id
@@ -2140,19 +2219,7 @@ if st.session_state.claims_df is not None:
             st.caption(f"{cap['claims']} claim(s) to place, {cap['openings']} openings available.")
 
         if plan_clicked:
-            bar = st.progress(0.0, text="Starting...")
-            drafts, summary = plan_draft_schedule(df, schedule_settings, hotel_coords, now_local,
-                                                  latest_first=FILL_LATEST_FIRST,
-                                                  progress=lambda f, t: bar.progress(min(max(f, 0.0), 1.0), text=t))
-            bar.empty()
-            for cid in df.loc[df["status"] == "Draft", "claim_id"].astype(str).tolist():
-                set_claim_times(cid, "Unscheduled")
-            for dft in drafts:
-                set_claim_times(dft["claim_id"], "Draft", {"start": dft["start"], "end": dft["end"],
-                                                           "date_str": dft["start"][:10]})
-            st.session_state["plan_summary"] = summary
-            st.session_state.editor_version += 1
-            st.session_state.map_nonce += 1
+            run_planner()
             st.rerun()
         if clear_clicked:
             for cid in df.loc[df["status"] == "Draft", "claim_id"].astype(str).tolist():
