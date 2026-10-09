@@ -20,6 +20,10 @@ from engine import (
     order_openings,
     per_day_for,
     active_days_from,
+    typical_drive_minutes,
+    estimated_return,
+    leave_by,
+    LEAVE_BUFFER_MIN,
     find_overlap,
     get_recommendations_for_slot,
     export_claims_to_ics,
@@ -544,6 +548,8 @@ def render_slot_picker(claim_id, claims_df, now, settings, current=None, default
                         parts.append("Open " + ", ".join(f"{tfmt(a)}-{tfmt(b)}" for a, b in gaps_by_day[ds]))
                     if drafts_by_day.get(ds):
                         parts.append(f"{len(drafts_by_day[ds])} draft(s) you can book over")
+                    if not openings_by_day.get(ds):
+                        parts.append("At your daily limit: book by hand if needed")
                     tip = ". ".join(parts)
                     can_pick = True
                 col.button(str(d.day), key=f"pd_{state}_{cid}_{ds}", help=tip, disabled=not can_pick,
@@ -575,6 +581,29 @@ def render_slot_picker(claim_id, claims_df, now, settings, current=None, default
         f":green[**{when}** · open]" if what == "Open" else f"{when} · {what}"
         for _, when, what in sorted(rows, key=lambda r: r[0])
     ))
+
+    # Leave-by for the day's first on-site stop, and when you'd be back after the last one
+    hotel_pt, typ = S.get("hotel"), S.get("typical_drive") or 30
+    stops = []
+    if hotel_pt:
+        for _, r in claims_df[claims_df["status"].isin(["Scheduled", "Draft"])].iterrows():
+            s_, e_ = parse_wallclock(r.get("start_time")), parse_wallclock(r.get("end_time"))
+            if (s_ and s_.date() == day_d and str(r["claim_id"]) != cid and pd.notna(r["lat"])
+                    and not is_video(r.get("activity_type"))):
+                stops.append((s_, (float(r["lat"]), float(r["lon"]))))
+    stops.sort(key=lambda x: x[0])
+    if stops:
+        lb = leave_by(stops[0][0], stops[0][1], hotel_pt)
+        ret = estimated_return(stops[-1][0], S["window_hrs"], typ, stops[-1][1], hotel_pt)
+        bits = []
+        if lb:
+            bits.append(f"leave the hotel by {tfmt(lb)} for the first stop")
+        if ret:
+            bits.append(f"you'd be back around {tfmt(ret)} after the last")
+        if bits:
+            line = " and ".join(bits)
+            st.caption(line[0].upper() + line[1:] + ". Drive times don't include traffic, "
+                       "so check your map app before you leave.")
 
     # Quick starts: the beginning of each open block, plus each draft's time (booking there
     # replaces the draft, which then moves to its next best spot)
@@ -642,6 +671,16 @@ def render_slot_picker(claim_id, claims_df, now, settings, current=None, default
 
     if start_dt < ws:
         st.caption(f"Starts before your usual {tfmt(ws)} day start.")
+    # If this would be the day's last on-site stop, show when you'd be back at base
+    me = claims_df[claims_df["claim_id"].astype(str) == cid]
+    if (hotel_pt and not me.empty and pd.notna(me.iloc[0]["lat"]) and not is_video(me.iloc[0].get("activity_type"))
+            and all(s_ < start_dt for s_, _ in stops)):
+        ret_me = estimated_return(start_dt, S["window_hrs"], typ,
+                                  (float(me.iloc[0]["lat"]), float(me.iloc[0]["lon"])), hotel_pt)
+        if ret_me:
+            limit_dt = datetime.combine(day_d, S["latest_end"])
+            note = f"As your last stop, you'd be back at base around {tfmt(ret_me)}"
+            st.caption(note + (f", past your {tfmt(limit_dt)} limit." if ret_me > limit_dt else "."))
     replaced = [b for b in drafts_busy if max(start_dt, b["start"]) < min(end_dt, b["end"])]
     if replaced:
         st.info("This replaces the draft for " + ", ".join(b["label"] for b in replaced) +
@@ -772,15 +811,16 @@ with sb.expander("Deployment parameters", expanded=not st.session_state.get("hot
 
     st.markdown("**Daily schedule**")
     start_time_input = st.selectbox(
-        "Day start time", _times30, index=_times30.index(datetime.strptime("08:00", "%H:%M").time()),
-        format_func=fmt_time12, key="day_start_time"
+        "Day starts", _times30, index=_times30.index(datetime.strptime("08:00", "%H:%M").time()),
+        format_func=fmt_time12, key="day_start_time",
+        help="The time of your first inspection. The app tells you when to leave the hotel to make it."
     )
     # Inspections per day, set for each day of the week (0 = day off). Suggestions and the
     # planner follow these; days off and evenings can still be booked by hand.
     _week = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
     if "per_day_counts" not in st.session_state:
         st.session_state.per_day_counts = {d: 3 for d in _week}
-    st.caption("Inspections per day (0 = day off)")
+    st.caption("Inspections per day: the most the app suggests or drafts each day (0 = day off)")
     # Days run down (not across) so the table fits the sidebar without sideways scrolling
     _per_day_edit = st.data_editor(
         pd.DataFrame({"Day": _week, "Inspections": [st.session_state.per_day_counts.get(d, 3) for d in _week]}),
@@ -805,11 +845,11 @@ with sb.expander("Deployment parameters", expanded=not st.session_state.get("hot
              "Suggested openings use this length, but you can book any start time and length."
     )
     latest_end_input = st.selectbox(
-        "Latest end for suggested openings", _times30,
+        "Back at base by", _times30,
         index=_times30.index(datetime.strptime("19:00", "%H:%M").time()),
         format_func=fmt_time12, key="latest_end_time",
-        help="Suggested openings never run past this time. You can still book later by hand "
-             "if the insured is available."
+        help="The latest you want to be back at the hotel. The day's last suggested inspection is "
+             "timed so you're back by then, using the real drive home. You can still book later by hand."
     )
 deployment_tz = detected_tz if tz_choice.startswith("Auto-detect") else US_TIMEZONES[tz_choice]
 tz_display = detected_label if tz_choice.startswith("Auto-detect") else tz_choice
@@ -853,6 +893,9 @@ schedule_settings = {
     "day_start": start_time_input, "per_day": inspections_per_day, "window_hrs": window_hrs,
     "latest_end": latest_end_input,
     "latest_first": FILL_LATEST_FIRST,
+    # How much of each window is usually driving, estimated from the claims themselves
+    "typical_drive": typical_drive_minutes(st.session_state.claims_df),
+    "hotel": hotel_coords,
 }
 all_slots = order_openings(compute_openings(
     start_date, end_date, active_days, start_time_input, inspections_per_day, window_hrs,
@@ -1176,6 +1219,15 @@ if st.session_state.claims_df is not None:
   <div class="cat-card-title">{esc(nr['claim_id'])} - {esc(nr['insured_name'])}</div>
   <div class="cat-card-sub">{fmt_dt(nr['_start_dt'])}<br>{esc(nr['full_address'])}</div>
 </div>""", unsafe_allow_html=True)
+                same_day_before = scheduled_claims[
+                    (scheduled_claims["status"] == "Scheduled") &
+                    (scheduled_claims["_start_dt"].apply(lambda x: x.date()) == nr["_start_dt"].date()) &
+                    (scheduled_claims["_start_dt"] < nr["_start_dt"])]
+                if same_day_before.empty and hotel_coords and pd.notna(nr["lat"]) and not is_video(nr.get("activity_type")):
+                    lb = leave_by(nr["_start_dt"], (float(nr["lat"]), float(nr["lon"])), hotel_coords)
+                    if lb:
+                        st.markdown(f"**Leave the hotel by {lb.strftime('%I:%M %p').lstrip('0')}** "
+                                    f"(includes a {LEAVE_BUFFER_MIN}-minute buffer). Drive times don't include traffic, so check your map app before you leave.")
                 render_nav_buttons(nr["full_address"], nr["lat"], nr["lon"], nr["geo_quality"])
 
         # --- EVENTS: past = hatched, next = amber, others = blue ---
@@ -1189,6 +1241,18 @@ if st.session_state.claims_df is not None:
                 for a, b in zip(stops, stops[1:]):
                     drive_next[str(a["claim_id"])] = get_osrm_route(float(a["lat"]), float(a["lon"]),
                                                                     float(b["lat"]), float(b["lon"]))[1]
+
+        # Leave-by time for each day's first on-site stop (confirmed or draft)
+        leave_note = {}
+        if hotel_coords and not scheduled_claims.empty:
+            onsite = scheduled_claims[(scheduled_claims["status"].isin(["Scheduled", "Draft"])) &
+                                      scheduled_claims["lat"].notna() & scheduled_claims["lon"].notna() &
+                                      ~scheduled_claims["activity_type"].apply(is_video)]
+            for _day, grp in onsite.groupby(onsite["_start_dt"].apply(lambda x: x.date())):
+                f = grp.sort_values("_start_dt").iloc[0]
+                lb = leave_by(f["_start_dt"], (float(f["lat"]), float(f["lon"])), hotel_coords)
+                if lb:
+                    leave_note[str(f["claim_id"])] = lb.strftime("%I:%M %p").lstrip("0")
 
         calendar_events = []
         for _, row in scheduled_claims.iterrows():
@@ -1244,6 +1308,8 @@ if st.session_state.claims_df is not None:
             else:
                 event.update({"backgroundColor": TEAL if CONSOLE else NAVY,
                               "borderColor": TEAL if CONSOLE else NAVY, "textColor": "#FFFFFF"})
+            if cid in leave_note:
+                event["title"] = f"{event['title']} · Leave {leave_note[cid]}"
             calendar_events.append(event)
 
         # --- VISIBLE HOURS ---
@@ -1255,7 +1321,7 @@ if st.session_state.claims_df is not None:
             return dt.hour * 60 + dt.minute
 
         day_start_dt = datetime.combine(start_date, start_time_input)
-        day_end_dt = day_start_dt + timedelta(hours=max(inspections_per_day.values() or [0]) * window_hrs)
+        day_end_dt = datetime.combine(start_date, latest_end_input)
         window_end_min = minutes_of_day(day_end_dt, start_date)
 
         latest_min = max([19 * 60, window_end_min] +
@@ -1297,9 +1363,7 @@ if st.session_state.claims_df is not None:
             # guide only: inspections can be booked or dragged anywhere inside the dates.
             "businessHours": [
                 {"daysOfWeek": [js_day[d]], "startTime": start_time_input.strftime("%H:%M"),
-                 "endTime": min(datetime.combine(date.today(), start_time_input)
-                                + timedelta(hours=inspections_per_day[d] * window_hrs),
-                                datetime.combine(date.today(), latest_end_input)).strftime("%H:%M")}
+                 "endTime": latest_end_input.strftime("%H:%M")}
                 for d in active_days
             ],
             # The deployment dates are hard limits: nothing can be booked or dragged outside them
@@ -1368,6 +1432,9 @@ if st.session_state.claims_df is not None:
             }}
             """
 
+        if leave_note:
+            st.caption(f"Each day's first inspection shows when to leave the hotel, with a {LEAVE_BUFFER_MIN}-minute "
+                       "buffer. Drive times don't include traffic, so check your map app before you leave.")
         with st.expander("🚫 Block off time"):
             st.caption("For team calls, appointments or time off. Nothing gets suggested or drafted there. "
                        "Tip: you can also drag across empty time on the calendar.")
@@ -2066,6 +2133,16 @@ if st.session_state.claims_df is not None:
             if summ.get("needs_check"):
                 st.warning(f"Placed last because their location still needs a check: {', '.join(summ['needs_check'])}. "
                            "Fix their pins, then re-plan for better routes.")
+            for lr in summ.get("late_returns", []):
+                st.warning(f"{lr['date']}: after {lr['claim']} you'd be back at base around {lr['back']}, past your "
+                           f"{lr['limit']} limit. Consider moving it earlier, to another day, or a later limit.")
+            for el in summ.get("early_leaves", []):
+                st.warning(f"{el['date']}: you'd need to leave the hotel by {el['leave']} for {el['claim']}. "
+                           "Consider a later first inspection or a closer first stop.")
+            if summ.get("typical_drive"):
+                st.caption(f"Assuming about {summ['typical_drive']} minutes of each window is driving, based on "
+                           f"how spread out your claims are. Leave times include a {LEAVE_BUFFER_MIN}-minute buffer. "
+                           + "Drive times don't include traffic, so check your map app before you leave.")
             for ld in summ.get("long_drives", []):
                 st.warning(f"{ld['date']}: {ld['mins']}-minute drive from {ld['from']} to {ld['to']} leaves about "
                            f"{ld['left_min'] // 60} hr {ld['left_min'] % 60} min of your {window_hrs:g}-hour window. "
@@ -2116,7 +2193,10 @@ if st.session_state.claims_df is not None:
             hotel_coords=hotel_coords,
             include_statuses=include,
             now_local=now_local,
-            mode=REC_MODE
+            mode=REC_MODE,
+            back_by=latest_end_input,
+            window_hrs=window_hrs,
+            typical_drive=schedule_settings["typical_drive"]
         )
 
         nxt = anchor_info.get("next")
@@ -2155,6 +2235,12 @@ if st.session_state.claims_df is not None:
                                 if rec_row.get("late_for_next"):
                                     drive_txt += (f"  \n:orange[⚠️ {int(rec_row['drive_to_next_mins'])} min drive to "
                                                   f"{nxt['label']}. You may be late.]")
+                        if rec_row.get("back_at_base"):
+                            if rec_row.get("late_back"):
+                                drive_txt += (f"  \n:orange[Back at base around {rec_row['back_at_base']}, past your "
+                                              f"{fmt_time12(latest_end_input)} limit.]")
+                            else:
+                                drive_txt += f" · back at base around {rec_row['back_at_base']}"
                         elif rec_row.get("is_video"):
                             drive_txt = "📹 Live video inspection, no drive needed (books 1 hour)"
                         else:
