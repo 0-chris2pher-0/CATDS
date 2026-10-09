@@ -270,7 +270,7 @@ def build_export_table(claims_df: pd.DataFrame, claim_ids: Optional[List[str]] =
     rows = []
     for _, r in df.iterrows():
         contact_dt = parse_wallclock(r.get("first_booked_at"))
-        activity_dt = parse_wallclock(r.get("start_time")) if r.get("status") == "Scheduled" else None
+        activity_dt = parse_wallclock(r.get("start_time")) if r.get("status") in ("Scheduled", "Inspected") else None
         c_date, c_time, c_ap = split_12h(contact_dt)
         a_date, a_time, a_ap = split_12h(activity_dt)
         rows.append({
@@ -756,6 +756,16 @@ def get_osrm_route(start_lat: float, start_lon: float, end_lat: float, end_lon: 
 
 # --- TABLE INGESTION & PARSING ---
 
+def _parse_any_date(value: Any) -> str:
+    """A date from the claim platform export as 'YYYY-MM-DD', or '' if blank or unreadable."""
+    if _blank(value):
+        return ""
+    try:
+        return pd.to_datetime(str(value).strip(), errors="raise").strftime("%Y-%m-%d")
+    except Exception:
+        return ""
+
+
 def parse_claims_table(df: pd.DataFrame) -> List[Dict[str, Any]]:
     """
     Processes imported CSV/Excel dataframe by detecting formatted claim IDs,
@@ -773,6 +783,7 @@ def parse_claims_table(df: pd.DataFrame) -> List[Dict[str, Any]]:
     priority_col = None
     phone_col = None
     email_col = None
+    inspect_col = next((orig for low, orig in col_map.items() if "inspection" in low and "date" in low), None)
 
     claim_pattern = re.compile(r'^[A-Za-z]{2,5}\d+[\-\_]?\d*$', re.IGNORECASE)
     
@@ -870,6 +881,7 @@ def parse_claims_table(df: pd.DataFrame) -> List[Dict[str, Any]]:
             "contact_note": "",
             "first_booked_at": "",
             "last_exported": "",
+            "platform_inspection_date": _parse_any_date(row[inspect_col]) if inspect_col else "",
             "pre_lat": pre_lat,
             "pre_lon": pre_lon
         })
@@ -919,6 +931,37 @@ def _address_key(address: Any) -> str:
     return re.sub(r"[^A-Z0-9]", "", clean_address_for_geocoding(address).upper())
 
 
+def inspection_date_checks(claims_df: pd.DataFrame, today: date) -> List[Dict[str, Any]]:
+    """
+    Compares each claim's Inspection Date from the claim platform with the app's calendar.
+    Returns review items:
+      past_date        the platform shows a past inspection; the app doesn't have it as inspected
+      date_mismatch    the platform shows a future date; the app has it scheduled on another day
+      not_on_calendar  the platform shows a future date; the app has no confirmed time for it
+    A matching date, a blank date, or an already-inspected claim needs nothing.
+    """
+    items = []
+    if claims_df is None or claims_df.empty or "platform_inspection_date" not in claims_df.columns:
+        return items
+    for _, r in claims_df.iterrows():
+        pdate = clean_text(r.get("platform_inspection_date"))
+        if not pdate or r.get("status") in ("Blocked", "Inspected"):
+            continue
+        try:
+            p = date.fromisoformat(pdate)
+        except ValueError:
+            continue
+        s = parse_wallclock(r.get("start_time")) if r.get("status") == "Scheduled" else None
+        base = {"claim_id": str(r["claim_id"]), "platform_date": pdate}
+        if p < today:
+            items.append({**base, "type": "past_date"})
+        elif s and s.date() != p:
+            items.append({**base, "type": "date_mismatch", "app_start": s.isoformat()})
+        elif not s:
+            items.append({**base, "type": "not_on_calendar"})
+    return items
+
+
 def build_merge_plan(existing_df: pd.DataFrame, new_raw_df: pd.DataFrame) -> Dict[str, Any]:
     """
     Compares an updated claims list to the claims already loaded, by claim number.
@@ -937,6 +980,7 @@ def build_merge_plan(existing_df: pd.DataFrame, new_raw_df: pd.DataFrame) -> Dic
                 if r.get("status") != "Blocked"}   # blocked time isn't a claim
 
     new_rows, changes, unchanged, contact_fills = [], [], 0, []
+    platform_dates = {cid: m.get("platform_inspection_date", "") for cid, m in incoming.items()}
     for cid, m in incoming.items():
         if cid not in existing:
             new_rows.append(m)
@@ -962,6 +1006,7 @@ def build_merge_plan(existing_df: pd.DataFrame, new_raw_df: pd.DataFrame) -> Dic
 
     missing = [cid for cid in existing if cid not in incoming]
     return {"new": new_rows, "address_changes": changes, "missing": missing, "unchanged": unchanged,
+            "platform_dates": platform_dates,
             "contact_fills": contact_fills}
 
 
@@ -1064,7 +1109,8 @@ def get_busy_intervals(claims_df: Optional[pd.DataFrame], exclude_claim_id: Any 
     if claims_df is None or claims_df.empty or "status" not in claims_df.columns:
         return busy
     # Blocked time (a rep's own non-inspection time) is always busy, like a confirmed inspection
-    statuses = ["Scheduled", "Blocked", "Draft"] if include_drafts else ["Scheduled", "Blocked"]
+    statuses = (["Scheduled", "Inspected", "Blocked", "Draft"] if include_drafts
+                else ["Scheduled", "Inspected", "Blocked"])
     for _, r in claims_df[claims_df["status"].isin(statuses)].iterrows():
         if exclude_claim_id is not None and str(r["claim_id"]) == str(exclude_claim_id):
             continue
@@ -1617,7 +1663,7 @@ def find_previous_stop(claims_df: pd.DataFrame, slot: Dict[str, Any]) -> Optiona
     """
     slot_start = parse_wallclock(slot["start"])
     same_day = claims_df[
-        (claims_df["status"].isin(["Scheduled", "Draft"])) &
+        (claims_df["status"].isin(["Scheduled", "Inspected", "Draft"])) &
         (claims_df["scheduled_date"].astype(str) == slot["date_str"])
     ]
     if "activity_type" in same_day.columns:   # live video inspections don't move the rep
@@ -1634,7 +1680,7 @@ def find_next_stop(claims_df: pd.DataFrame, slot: Dict[str, Any]) -> Optional[pd
     """The scheduled claim that starts soonest at or after the opening ends, on the same day."""
     slot_end = parse_wallclock(slot["end"])
     same_day = claims_df[
-        (claims_df["status"].isin(["Scheduled", "Draft"])) &
+        (claims_df["status"].isin(["Scheduled", "Inspected", "Draft"])) &
         (claims_df["scheduled_date"].astype(str) == slot["date_str"])
     ]
     if "activity_type" in same_day.columns:
