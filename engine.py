@@ -933,7 +933,8 @@ def build_merge_plan(existing_df: pd.DataFrame, new_raw_df: pd.DataFrame) -> Dic
     for m in parsed:
         incoming.setdefault(str(m["claim_id"]).strip(), m)   # first row wins on duplicates
 
-    existing = {str(r["claim_id"]).strip(): r for _, r in existing_df.iterrows()}
+    existing = {str(r["claim_id"]).strip(): r for _, r in existing_df.iterrows()
+                if r.get("status") != "Blocked"}   # blocked time isn't a claim
 
     new_rows, changes, unchanged, contact_fills = [], [], 0, []
     for cid, m in incoming.items():
@@ -1015,7 +1016,24 @@ def round_up_to_step(dt: datetime, step_min: int = STEP_MINUTES) -> datetime:
     return dt + timedelta(minutes=step_min - extra) if extra else dt
 
 
-def day_window(day: date, day_start_time: Any, inspections_per_day: int, window_hrs: float,
+def per_day_for(day: date, per_day: Any) -> int:
+    """Inspections for this date. per_day is one number for every day, or {"Mon": 3, ..., "Sun": 0}."""
+    if isinstance(per_day, dict):
+        try:
+            return int(per_day.get(_DAY_ABBR[day.weekday()], 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+    return int(per_day or 0)
+
+
+def active_days_from(per_day: Any) -> List[str]:
+    """Days of the week with at least one inspection."""
+    if isinstance(per_day, dict):
+        return [d for d in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"] if int(per_day.get(d, 0) or 0) > 0]
+    return ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"] if per_day else []
+
+
+def day_window(day: date, day_start_time: Any, inspections_per_day: Any, window_hrs: float,
                latest_end: Any = None) -> Tuple[datetime, datetime]:
     """
     The usual working day: start time + inspections per day x window length,
@@ -1023,7 +1041,7 @@ def day_window(day: date, day_start_time: Any, inspections_per_day: int, window_
     Reps can still book later by hand.
     """
     start = datetime.combine(day, day_start_time)
-    end = start + timedelta(hours=inspections_per_day * window_hrs)
+    end = start + timedelta(hours=per_day_for(day, inspections_per_day) * window_hrs)
     if latest_end is not None:
         end = min(end, datetime.combine(day, latest_end))
     return start, max(start, end)
@@ -1039,15 +1057,17 @@ def get_busy_intervals(claims_df: Optional[pd.DataFrame], exclude_claim_id: Any 
     busy = []
     if claims_df is None or claims_df.empty or "status" not in claims_df.columns:
         return busy
-    statuses = ["Scheduled", "Draft"] if include_drafts else ["Scheduled"]
+    # Blocked time (a rep's own non-inspection time) is always busy, like a confirmed inspection
+    statuses = ["Scheduled", "Blocked", "Draft"] if include_drafts else ["Scheduled", "Blocked"]
     for _, r in claims_df[claims_df["status"].isin(statuses)].iterrows():
         if exclude_claim_id is not None and str(r["claim_id"]) == str(exclude_claim_id):
             continue
         s, e = parse_wallclock(r.get("start_time")), parse_wallclock(r.get("end_time"))
         if s and e and e > s:
             busy.append({"start": s, "end": e, "claim_id": str(r["claim_id"]),
-                         "label": f"{r['claim_id']} - {r.get('insured_name', '')}",
-                         "draft": r["status"] == "Draft"})
+                         "label": (f"blocked time ({r.get('insured_name', '')})" if r["status"] == "Blocked"
+                                   else f"{r['claim_id']} - {r.get('insured_name', '')}"),
+                         "draft": r["status"] == "Draft", "block": r["status"] == "Blocked"})
     return busy
 
 
@@ -1216,12 +1236,18 @@ def capacity_report(claims_df: pd.DataFrame, S: Dict[str, Any], now: Optional[da
     need = report["shortfall"]
     sugg = []
 
-    # Add a day of the week that isn't an inspection day yet
+    counts = S["per_day"] if isinstance(S["per_day"], dict) else {d: S["per_day"] for d in _DAY_ABBR.values()}
+    used = [n for n in counts.values() if n]
+    typical = max(set(used), key=used.count) if used else 3
+
+    # Add a day of the week that's currently a day off
     for wd in ["Sat", "Sun", "Mon", "Tue", "Wed", "Thu", "Fri"]:
-        if wd not in S["active_days"]:
-            extra = _count_openings(claims_df, S, now, active_days=[wd])
+        if not counts.get(wd):
+            new_counts = dict(counts, **{wd: typical})
+            extra = _count_openings(claims_df, S, now, per_day=new_counts,
+                                    active_days=active_days_from(new_counts)) - base
             if extra:
-                sugg.append((f"Add {_WEEKDAY_PLURAL[wd]}", extra))
+                sugg.append((f"Add {_WEEKDAY_PLURAL[wd]} ({typical} per day)", extra))
 
     # Extend the end date
     for k in range(1, 22):
@@ -1231,27 +1257,27 @@ def capacity_report(claims_df: pd.DataFrame, S: Dict[str, Any], now: Optional[da
             sugg.append((f"Extend the end date by {k} day{'s' if k > 1 else ''} (to {new_end.strftime('%b %d')})", extra))
             break
 
-    # One more inspection per day (still within the latest-end limit)
-    extra = _count_openings(claims_df, S, now, per_day=S["per_day"] + 1) - base
+    # One more inspection on each inspection day (still within the latest-end limit)
+    plus_one = {d: (n + 1 if n else 0) for d, n in counts.items()}
+    extra = _count_openings(claims_df, S, now, per_day=plus_one) - base
     if extra > 0:
-        sugg.append(("Add 1 inspection per day", extra))
+        sugg.append(("Add 1 inspection on each inspection day", extra))
 
-    # Shorter windows in the same working hours
-    hours = S["per_day"] * S["window_hrs"]
+    # Shorter windows in the same working hours (each day keeps its hours)
     best = None
     w = S["window_hrs"] - 0.25
     while w >= 1.5 - 1e-9:   # shorter than 1.5 hours isn't realistic for an on-site inspection
-        per = int(math.floor(hours / w + 1e-9))
-        if per > S["per_day"]:
-            extra = _count_openings(claims_df, S, now, per_day=per, window_hrs=w) - base
-            if extra > 0 and (best is None or extra > best[2]):
-                best = (w, per, extra)
+        shorter = {d: int(math.floor(n * S["window_hrs"] / w + 1e-9)) for d, n in counts.items()}
+        if shorter != counts:
+            extra = _count_openings(claims_df, S, now, per_day=shorter, window_hrs=w) - base
+            if extra > 0 and (best is None or extra > best[1]):
+                best = (w, extra)
             if extra >= need:
-                best = (w, per, extra)
+                best = (w, extra)
                 break
         w -= 0.25
     if best:
-        sugg.append((f"Shorten windows to {best[0]:g} hours ({best[1]} per day in the same working hours)", best[2]))
+        sugg.append((f"Shorten windows to {best[0]:g} hours (more per day in the same working hours)", best[1]))
 
     sugg.append(("Switch some claims to live video, which needs 1 hour each", None))
     report["suggestions"] = sugg
