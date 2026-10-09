@@ -779,20 +779,24 @@ with sb.expander("Deployment parameters", expanded=not st.session_state.get("hot
     # planner follow these; days off and evenings can still be booked by hand.
     _week = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
     if "per_day_counts" not in st.session_state:
-        st.session_state.per_day_counts = {"Mon": 3, "Tue": 3, "Wed": 3, "Thu": 3, "Fri": 3, "Sat": 0, "Sun": 0}
+        st.session_state.per_day_counts = {d: 3 for d in _week}
     st.caption("Inspections per day (0 = day off)")
+    # Days run down (not across) so the table fits the sidebar without sideways scrolling
     _per_day_edit = st.data_editor(
-        pd.DataFrame([st.session_state.per_day_counts], columns=_week),
-        key="per_day_editor", hide_index=True, use_container_width=True,
-        column_config={d: st.column_config.NumberColumn(d, min_value=0, max_value=8, step=1, format="%d",
-                                                        required=True, width="small") for d in _week},
+        pd.DataFrame({"Day": _week, "Inspections": [st.session_state.per_day_counts.get(d, 3) for d in _week]}),
+        key="per_day_editor_rows", hide_index=True, use_container_width=True, disabled=["Day"],
+        column_config={
+            "Day": st.column_config.TextColumn("Day"),
+            "Inspections": st.column_config.NumberColumn("Inspections", min_value=0, max_value=8, step=1,
+                                                         format="%d", required=True),
+        },
     )
     inspections_per_day = {}
-    for d in _week:
+    for d, n in zip(_per_day_edit["Day"], _per_day_edit["Inspections"]):
         try:
-            inspections_per_day[d] = max(0, min(8, int(_per_day_edit.iloc[0][d])))
+            inspections_per_day[d] = max(0, min(8, int(n)))
         except (TypeError, ValueError):
-            inspections_per_day[d] = st.session_state.per_day_counts.get(d, 0)
+            inspections_per_day[d] = st.session_state.per_day_counts.get(d, 3)
     st.session_state.per_day_counts = inspections_per_day
     active_days = active_days_from(inspections_per_day)
     window_hrs = st.number_input(
