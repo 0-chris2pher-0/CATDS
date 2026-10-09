@@ -1041,9 +1041,15 @@ def day_window(day: date, day_start_time: Any, inspections_per_day: Any, window_
     Reps can still book later by hand.
     """
     start = datetime.combine(day, day_start_time)
-    end = start + timedelta(hours=per_day_for(day, inspections_per_day) * window_hrs)
+    n = per_day_for(day, inspections_per_day)
+    if n <= 0:
+        return start, start                      # day off: no suggested time
     if latest_end is not None:
-        end = min(end, datetime.combine(day, latest_end))
+        # The whole day is available for timing (day start to back-at-base); the
+        # per-day number limits HOW MANY get suggested, not WHEN. Blocks shape the timing.
+        end = datetime.combine(day, latest_end)
+    else:
+        end = start + timedelta(hours=n * window_hrs)
     return start, max(start, end)
 
 
@@ -1112,24 +1118,31 @@ def compute_openings(start_date: date, end_date: date, active_days: List[str], d
                      inspections_per_day: int, window_hrs: float, claims_df: Optional[pd.DataFrame],
                      now: Optional[datetime] = None, exclude_claim_id: Any = None,
                      latest_end: Any = None, duration_hrs: Optional[float] = None,
-                     include_drafts: bool = False) -> List[Dict[str, Any]]:
+                     include_drafts: bool = False, cap_to_limit: bool = False) -> List[Dict[str, Any]]:
     """
-    Suggested openings: inside each free gap, back-to-back blocks of the default window
-    length, starting at the earliest free time. Example: day 8:00-3:30, 2.5 h windows,
-    an inspection shortened to 8:00-9:30 -> openings at 9:30 and 12:00.
-    Same shape as generate_available_slots, so the rest of the app can use either.
+    Suggested openings: inside each free gap of the day (day start to back-at-base),
+    back-to-back blocks of the default window length from the earliest free time.
+    The per-day number is a LIMIT: a day that already has that many inspections booked
+    (confirmed, plus drafts when include_drafts) gets no openings. Otherwise every free
+    opening is offered as a choice; cap_to_limit keeps only as many as the day has room
+    for (used for counting capacity).
     """
     busy = get_busy_intervals(claims_df, exclude_claim_id, include_drafts)
+    booked_per_day = Counter(b["start"].date() for b in busy if not b.get("block"))
     duration = timedelta(hours=duration_hrs or window_hrs)
     openings = []
     day = start_date
     while day <= end_date:
         if _DAY_ABBR[day.weekday()] in active_days:
-            for g0, g1 in compute_day_gaps(day, day_start_time, inspections_per_day, window_hrs, busy, now, latest_end):
-                t = g0
-                while t + duration <= g1:
-                    openings.append(_slot_dict(t, t + duration))
-                    t += duration
+            room = per_day_for(day, inspections_per_day) - booked_per_day.get(day, 0)
+            day_open = []
+            if room > 0:
+                for g0, g1 in compute_day_gaps(day, day_start_time, inspections_per_day, window_hrs, busy, now, latest_end):
+                    t = g0
+                    while t + duration <= g1:
+                        day_open.append(_slot_dict(t, t + duration))
+                        t += duration
+            openings.extend(day_open[:room] if cap_to_limit else day_open)
         day += timedelta(days=1)
     return openings
 
@@ -1215,7 +1228,46 @@ def _count_openings(claims_df: pd.DataFrame, S: Dict[str, Any], now: Optional[da
     p = dict(S, **overrides)
     return len(compute_openings(p["start_date"], p["end_date"], p["active_days"], p["day_start"],
                                 p["per_day"], p["window_hrs"], claims_df, now=now,
-                                latest_end=p.get("latest_end")))
+                                latest_end=p.get("latest_end"), cap_to_limit=True))
+
+
+LEAVE_BUFFER_MIN = 15   # cushion before the first inspection: being on time matters to the insured
+
+
+def typical_drive_minutes(claims_df: Optional[pd.DataFrame]) -> int:
+    """
+    How much of each window is usually driving, estimated from the claims themselves:
+    the median straight-line distance from each claim to its nearest neighbor, at about
+    2 minutes per mile (roads aren't straight). 30 minutes when there's too little to go on.
+    """
+    if claims_df is None or claims_df.empty or "lat" not in claims_df.columns:
+        return 30
+    pts = [(float(a), float(b)) for a, b, s in zip(claims_df["lat"], claims_df["lon"], claims_df["status"])
+           if s != "Blocked" and pd.notna(a) and pd.notna(b)]
+    if len(pts) < 4:
+        return 30
+    nearest = sorted(min(_miles(p, q) for j, q in enumerate(pts) if j != i) for i, p in enumerate(pts))
+    minutes = nearest[len(nearest) // 2] * 2.0
+    return int(max(10, min(60, round(minutes / 5.0) * 5)))
+
+
+def estimated_return(start: datetime, window_hrs: float, typical_min: int,
+                     loc: Optional[Tuple[float, float]], hotel: Optional[Tuple[float, float]]) -> Optional[datetime]:
+    """Back at base after this stop: start + time on site (window minus typical drive) + drive home."""
+    if not loc or not hotel:
+        return None
+    on_site = timedelta(hours=window_hrs) - timedelta(minutes=typical_min)
+    drive_home = get_osrm_route(loc[0], loc[1], hotel[0], hotel[1])[1]
+    return start + on_site + timedelta(minutes=drive_home)
+
+
+def leave_by(first_start: datetime, loc: Optional[Tuple[float, float]],
+             hotel: Optional[Tuple[float, float]]) -> Optional[datetime]:
+    """When to leave base for the day's first inspection: start - drive - a 15-minute buffer."""
+    if not loc or not hotel:
+        return None
+    drive = get_osrm_route(hotel[0], hotel[1], loc[0], loc[1])[1]
+    return first_start - timedelta(minutes=drive + LEAVE_BUFFER_MIN)
 
 
 def plan_candidates(claims_df: pd.DataFrame) -> pd.DataFrame:
@@ -1339,7 +1391,9 @@ def plan_draft_schedule(claims_df: pd.DataFrame, S: Dict[str, Any], hotel_coords
                       "video": is_video(r.get("activity_type")), "loc": _loc(r),
                       "check": str(r.get("geo_quality", "")) in GEO_NEEDS_REVIEW})
 
-    cap = {d: len(day_slots[d]) for d in days}
+    # Room per day: the day's limit minus confirmed inspections already booked that day
+    confirmed_count = Counter(b["start"].date() for b in confirmed if not b.get("block"))
+    cap = {d: max(0, min(len(day_slots[d]), per_day_for(d, S["per_day"]) - confirmed_count.get(d, 0))) for d in days}
     members: Dict[date, List[Dict[str, Any]]] = {d: [] for d in days}
 
     def place(it):
@@ -1436,6 +1490,56 @@ def plan_draft_schedule(claims_df: pd.DataFrame, S: Dict[str, Any], hotel_coords
                            "_date": d, "_start": t, "_end": end_t, "_loc": None if pick["video"] else pick["loc"],
                            "_check": pick["check"]})
 
+    # Back at base by: if a day's last on-site stop would get the rep back too late, try
+    # swapping it with an earlier unranked stop that day (same window lengths) so a claim
+    # closer to the hotel ends the day. Flag it when no swap helps.
+    typical = S.get("typical_drive") or typical_drive_minutes(claims_df)
+    limit_t = S.get("latest_end")
+    late_returns = []
+    rank_of = {i["cid"]: i["rank"] for i in items}
+    if hotel_coords and limit_t:
+        for d in days:
+            day_d = sorted([x for x in drafts if x["_date"] == d and x["_loc"]], key=lambda x: x["_start"])
+            if not day_d:
+                continue
+            limit_dt = datetime.combine(d, limit_t)
+            last = day_d[-1]
+
+            def back(x, start):
+                return estimated_return(start, S["window_hrs"], typical, x["_loc"], hotel_coords)
+            if back(last, last["_start"]) and back(last, last["_start"]) > limit_dt:
+                best = None
+                for other in day_d[:-1]:
+                    if rank_of.get(other["claim_id"], math.inf) != math.inf:
+                        continue   # priorities keep their early times
+                    late_new = back(other, last["_start"])
+                    if late_new and late_new <= limit_dt and (best is None or late_new < best[1]):
+                        best = (other, late_new)
+                if best:
+                    other = best[0]
+                    for k in ("claim_id", "_loc", "_check"):
+                        other[k], last[k] = last[k], other[k]
+                ret = back(last, last["_start"])
+                if ret and ret > limit_dt:
+                    late_returns.append({"date": d.strftime("%a %b %d"), "claim": last["claim_id"],
+                                         "back": ret.strftime("%I:%M %p").lstrip("0"),
+                                         "limit": limit_dt.strftime("%I:%M %p").lstrip("0")})
+
+    # Early starts: flag days where the leave-by time is before 6:30 AM
+    early_leaves = []
+    if hotel_coords:
+        for d in days:
+            firsts = sorted([x for x in drafts if x["_date"] == d and x["_loc"]], key=lambda x: x["_start"])
+            anchors_d = sorted(anchors[d], key=lambda a: a[0])
+            first = None
+            if firsts and (not anchors_d or firsts[0]["_start"] < anchors_d[0][0]):
+                first = (firsts[0]["_start"], firsts[0]["_loc"], firsts[0]["claim_id"])
+            if first:
+                lb = leave_by(first[0], first[1], hotel_coords)
+                if lb and lb.time() < datetime.strptime("06:30", "%H:%M").time():
+                    early_leaves.append({"date": d.strftime("%a %b %d"), "claim": first[2],
+                                         "leave": lb.strftime("%I:%M %p").lstrip("0")})
+
     # Long drives: a drive that uses more than a third of the window leaves less time to
     # inspect (the window includes travel). Flag them, don't block them.
     long_drives = []
@@ -1459,7 +1563,8 @@ def plan_draft_schedule(claims_df: pd.DataFrame, S: Dict[str, Any], hotel_coords
             x.pop(k, None)
     summary = {"placed": len(drafts), "days": days_used, "unplaced": [i["cid"] for i in unplaced],
                "openings": sum(len(s) for s in day_slots.values()), "claims": len(items),
-               "needs_check": needs_check, "long_drives": long_drives}
+               "needs_check": needs_check, "long_drives": long_drives,
+               "late_returns": late_returns, "early_leaves": early_leaves, "typical_drive": typical}
     return drafts, summary
 
 
@@ -1548,7 +1653,10 @@ def get_recommendations_for_slot(
     hotel_coords: Optional[Tuple[float, float]] = None,
     include_statuses: Tuple[str, ...] = ("Unscheduled",),
     now_local: Optional[datetime] = None,
-    mode: str = "fast"
+    mode: str = "fast",
+    back_by: Any = None,
+    window_hrs: Optional[float] = None,
+    typical_drive: Optional[int] = None
 ) -> Tuple[Optional[pd.DataFrame], Dict[str, Any]]:
     """
     Recommends claims to fill an opening (slot).
@@ -1664,6 +1772,21 @@ def get_recommendations_for_slot(
         detour_list = [None] * len(candidates)
         to_next_list = [None] * len(candidates)
         late_list = [False] * len(candidates)
+    # Last opening of the day: would this claim get the rep back to base after the limit?
+    late_back, back_txt = [False] * len(candidates), [""] * len(candidates)
+    if back_by is not None and hotel_coords and window_hrs and find_next_stop(claims_df, slot) is None:
+        s_dt = parse_wallclock(slot["start"])
+        limit_dt = datetime.combine(s_dt.date(), back_by)
+        typ = typical_drive or typical_drive_minutes(claims_df)
+        for k, ((_, row), video) in enumerate(zip(candidates.iterrows(), video_flags)):
+            if video or pd.isna(row["lat"]) or pd.isna(row["lon"]):
+                continue
+            ret = estimated_return(s_dt, window_hrs, typ, (float(row["lat"]), float(row["lon"])), hotel_coords)
+            if ret:
+                back_txt[k] = ret.strftime("%I:%M %p").lstrip("0")
+                late_back[k] = ret > limit_dt
+    candidates["back_at_base"] = back_txt
+    candidates["late_back"] = late_back
     candidates["detour_mins"] = detour_list
     candidates["drive_to_next_mins"] = to_next_list
     candidates["late_for_next"] = late_list
@@ -1693,6 +1816,8 @@ def get_recommendations_for_slot(
     # Live video claims fit any opening, so they list after on-site claims of the same
     # rank (ahead of claims still missing a pin)
     candidates["drive_sort_key"] = [1e8 if v else k for v, k in zip(video_flags, candidates["drive_sort_key"])]
+    # Claims that would get the rep back after their limit list after the ones that don't
+    candidates["drive_sort_key"] = [k + 2e7 if lb else k for lb, k in zip(late_back, candidates["drive_sort_key"])]
     # Claims whose location still needs a check list after claims with good locations
     if "geo_quality" in candidates.columns:
         candidates["drive_sort_key"] = [k + 5e7 if (q in GEO_NEEDS_REVIEW and k < 1e8) else k
